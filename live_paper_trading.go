@@ -69,10 +69,10 @@ const (
 	// Если create-транзакция старше — не считаем «только что залистились» (защита от кривых сигналов)
 	MAX_CREATE_TX_AGE = 45 * time.Minute
 
-	// Velocity: OR-логика — достаточно заметного Δprogress или притока SOL (чаще проход, чем 0.4%/0.028)
-	VELOCITY_PAUSE         = 3500 * time.Millisecond // чуть короче 4s — меньше шанс «вылететь» из окна за паузу
-	VELOCITY_MIN_DPROGRESS = 0.0025                   // +0.25% progress за окно
-	VELOCITY_MIN_DREALSOL  = 0.018                    // или +0.018 SOL в кривую за окно
+	// Velocity: OR — Δprogress или ΔrealSol; realSol чувствительнее на ранней кривой (мелкие покупки)
+	VELOCITY_PAUSE         = 3500 * time.Millisecond
+	VELOCITY_MIN_DPROGRESS = 0.0015 // +0.15 «п.п.» progress (realSol/85)
+	VELOCITY_MIN_DREALSOL  = 0.010  // или +0.010 SOL в кривую за окно (типичный мелкий приток)
 
 	// Логи: false = не печатать каждый отсев (только сводка раз в минуту + успешный ВХОД)
 	VERBOSE_REJECT_LOGS = false
@@ -577,7 +577,7 @@ func curveVelocityOK(bc string, snap0 *curveSnap) (snap1 *curveSnap, ok bool, de
 		return nil, false, "нет снимка"
 	}
 	time.Sleep(VELOCITY_PAUSE)
-	s1, err := getCurveSnapshot(bc)
+	s1, err := getCurveSnapshotWithRetry(bc)
 	if err != nil || s1 == nil || s1.PriceUSD <= 0 || s1.Complete {
 		return nil, false, "второй снимок кривой"
 	}
@@ -586,7 +586,8 @@ func curveVelocityOK(bc string, snap0 *curveSnap) (snap1 *curveSnap, ok bool, de
 	if dP < VELOCITY_MIN_DPROGRESS && dSol < VELOCITY_MIN_DREALSOL {
 		return s1, false, fmt.Sprintf("мало притока (Δ%.2f%% / +%.3f SOL за %v)", dP*100, dSol, VELOCITY_PAUSE)
 	}
-	if s1.Progress > SNIPER_CURVE_MAX+0.03 {
+	// Чуть шире запас: за паузу кривая может уехать вверх без «ложного поздно»
+	if s1.Progress > SNIPER_CURVE_MAX+0.045 {
 		return s1, false, fmt.Sprintf("кривая уже %.1f%% — поздно", s1.Progress*100)
 	}
 	return s1, true, fmt.Sprintf("Δ%.2f%% / +%.3f SOL за %v", dP*100, dSol, VELOCITY_PAUSE)
@@ -1397,7 +1398,7 @@ func main() {
 		}
 	}()
 
-	fmt.Printf("\n%s Режим: %s | кривая: %.1f%%–%.1f%% | min SOL: %.2f | velocity: %v (Δ≥%.1f%% или +%.2f SOL) | ончейн-фильтры\n",
+	fmt.Printf("\n%s Режим: %s | кривая: %.1f%%–%.1f%% | min SOL: %.2f | velocity: %v (Δ≥%.2f%% прогресса или +%.3f SOL) | ончейн-фильтры\n",
 		bold("▶"), cyan("SNIPER"), SNIPER_CURVE_MIN*100, SNIPER_CURVE_MAX*100, MIN_REAL_SOL,
 		VELOCITY_PAUSE, VELOCITY_MIN_DPROGRESS*100, VELOCITY_MIN_DREALSOL)
 	fmt.Printf("%s Баланс: %s | Ставка: $%.2f | Макс позиций: %d\n",

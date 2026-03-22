@@ -5,6 +5,7 @@ import (
 	"encoding/base64"
 	"encoding/binary"
 	"encoding/json"
+	"flag"
 	"fmt"
 	"io"
 	"math"
@@ -14,6 +15,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -41,15 +43,15 @@ const (
 	PRICE_TICK = 3 * time.Second
 	MAX_HOLD   = 7 * time.Minute
 
-	// ── Снайпер: paper — смягчённые пороги (чаще тестовые входы; для реала можно ужесточить)
-	SNIPER_CURVE_MIN = 0.010 // ≥1.0% — чуть раньше в «окно»
-	SNIPER_CURVE_MAX = 0.080 // ≤8% — допускаем чуть больший разгон
+	// ── Снайпер: баланс «чаще сигнал» (velocity) vs «меньше мусора» (скам + верх кривой)
+	SNIPER_CURVE_MIN = 0.010 // ≥1.0%
+	SNIPER_CURVE_MAX = 0.075 // ≤7.5% — не догоняем сильно растянутую кривую
 	MIN_REAL_SOL     = 0.15  // минимум ликвидности в SOL
 
-	// Анти-скам (эвристики ончейн; не 100%, но отсекает часть мусора)
-	CREATOR_SOL_MIN   = 0.04  // SOL на кошельке создателя (ниже — одноразовый / бот-сет)
-	CREATOR_SOL_SUSPECT = 80.0 // выше — не обязательно скам, но пропускаем (часто киты/странные паттерны)
-	MAX_NONCURVE_PCT  = 0.12 // доля саплая вне bonding curve у топ-холдеров (не считая кривую)
+	// Анти-скам — чуть строже ончейн-фильтры при ослабленном velocity
+	CREATOR_SOL_MIN     = 0.06 // минимум SOL у создателя (было 0.04)
+	CREATOR_SOL_SUSPECT = 80.0
+	MAX_NONCURVE_PCT    = 0.10 // меньше токенов вне кривой у топов (было 0.12)
 
 	// Выходы: быстрый скальп
 	STOP_LOSS        = 0.90
@@ -67,10 +69,10 @@ const (
 	// Если create-транзакция старше — не считаем «только что залистились» (защита от кривых сигналов)
 	MAX_CREATE_TX_AGE = 45 * time.Minute
 
-	// Velocity: прирост «заполнения» кривой за короткое окно (приток SOL / покупки)
-	VELOCITY_PAUSE         = 4 * time.Second // paper: чуть дольше — чаще ловим приток
-	VELOCITY_MIN_DPROGRESS = 0.004          // +0.4% progress за окно
-	VELOCITY_MIN_DREALSOL  = 0.028          // или +0.028 SOL реально в кривую за окно
+	// Velocity: OR-логика — достаточно заметного Δprogress или притока SOL (чаще проход, чем 0.4%/0.028)
+	VELOCITY_PAUSE         = 3500 * time.Millisecond // чуть короче 4s — меньше шанс «вылететь» из окна за паузу
+	VELOCITY_MIN_DPROGRESS = 0.0025                   // +0.25% progress за окно
+	VELOCITY_MIN_DREALSOL  = 0.018                    // или +0.018 SOL в кривую за окно
 
 	// Логи: false = не печатать каждый отсев (только сводка раз в минуту + успешный ВХОД)
 	VERBOSE_REJECT_LOGS = false
@@ -88,9 +90,20 @@ var ignoredTokenMints = map[string]bool{
 
 // Счётчики отсева (без спама в консоль)
 var (
-	rejectMu            sync.Mutex
-	rejectCounts        = map[string]int64{}
-	rejectPrevSnapshot  map[string]int64 // для дельты за минуту
+	rejectMu           sync.Mutex
+	rejectCounts       = map[string]int64{}
+	rejectPrevSnapshot map[string]int64 // для дельты за минуту
+	// Единый вывод: stats и отсев идут из разных горутин — без мьютекса строки перемешиваются
+	consoleMu sync.Mutex
+)
+
+// Воронка входа (накопительно с запуска) — видно, до какого шага доходят токены
+var (
+	funnelInWindow  int64 // прошли кривую+ликвидность, до velocity
+	funnelPassVel   int64 // прошли velocity
+	funnelPassScam  int64 // прошли анти-скам
+	funnelOpenOK    int64 // open() = true
+	funnelOpenFail  int64 // open() = false (редко: баланс/лимит)
 )
 
 // Подписи ключей в минутной сводке (рус./кратко)
@@ -186,7 +199,32 @@ func printRejectSummary() {
 	if deltaStr == "" {
 		deltaStr = "тихо"
 	}
+	consoleMu.Lock()
+	defer consoleMu.Unlock()
 	fmt.Printf("%s за мин: %s  |  всего: %s\n", gray("📊 отсев"), deltaStr, strings.Join(totalParts, " · "))
+}
+
+func printFunnelLine() {
+	consoleMu.Lock()
+	defer consoleMu.Unlock()
+	iw := atomic.LoadInt64(&funnelInWindow)
+	v := atomic.LoadInt64(&funnelPassVel)
+	sc := atomic.LoadInt64(&funnelPassScam)
+	ok := atomic.LoadInt64(&funnelOpenOK)
+	bad := atomic.LoadInt64(&funnelOpenFail)
+	fmt.Printf("%s воронка (с запуска): в_окне %d → velocity %d → скам %d → вход ok %d",
+		gray("◎"), iw, v, sc, ok)
+	if bad > 0 {
+		fmt.Printf(" · вход fail %d", bad)
+	}
+	fmt.Println()
+	if iw == 0 {
+		fmt.Println(gray("   (если «в_окне»=0 — почти всё отсекается до velocity: no_price / пусто / поздно / low_sol)"))
+	} else if v == 0 {
+		fmt.Println(gray(fmt.Sprintf("   (были в окне кривой, но velocity за %v ещё ни разу не прошёл — узкое место)", VELOCITY_PAUSE)))
+	} else if sc == 0 {
+		fmt.Println(gray("   (velocity был, анти-скам пока не пропустил ни одного)"))
+	}
 }
 
 const PUMP_PROGRAM = "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P"
@@ -1089,7 +1127,6 @@ func (w *Wallet) closePos(mint, reason string, spot float64) {
 
 func (w *Wallet) stats() {
 	w.mu.Lock()
-	defer w.mu.Unlock()
 	wins, total := 0, 0.0
 	for _, t := range w.Closed {
 		total += t.PnL
@@ -1103,28 +1140,75 @@ func (w *Wallet) stats() {
 		wr = float64(wins) / float64(n) * 100
 	}
 	pct := total / w.Start * 100
-	bs := green(fmt.Sprintf("$%.2f", w.Balance))
-	if w.Balance < w.Start {
-		bs = red(fmt.Sprintf("$%.2f", w.Balance))
+	nOpen := len(w.Pos)
+	bal := w.Balance
+	start := w.Start
+	bs := green(fmt.Sprintf("$%.2f", bal))
+	if bal < start {
+		bs = red(fmt.Sprintf("$%.2f", bal))
 	}
 	ps := green(fmt.Sprintf("+$%.2f (+%.1f%%)", total, pct))
 	if total < 0 {
 		ps = red(fmt.Sprintf("$%.2f (%.1f%%)", total, pct))
 	}
+	w.mu.Unlock()
+
+	consoleMu.Lock()
+	defer consoleMu.Unlock()
 	fmt.Println("\n" + bold("┌──────────────────────────────────────────────┐"))
 	fmt.Println(bold("│  PAPER WALLET — РЕАЛЬНЫЕ ДАННЫЕ              │"))
 	fmt.Println(bold("├──────────────────────────────────────────────┤"))
 	fmt.Printf("│  Баланс:   %-33s│\n", bs)
 	fmt.Printf("│  PnL:      %-33s│\n", ps)
-	fmt.Printf("│  Сделок:   %-33s│\n", fmt.Sprintf("%d закрыто | %d открыто", n, len(w.Pos)))
+	fmt.Printf("│  Сделок:   %-33s│\n", fmt.Sprintf("%d закрыто | %d открыто", n, nOpen))
 	fmt.Printf("│  Win/Loss: %-33s│\n",
 		fmt.Sprintf("%s/%s  WR: %.0f%%",
 			green(fmt.Sprintf("%d", wins)),
 			red(fmt.Sprintf("%d", n-wins)), wr))
 	fmt.Println(bold("└──────────────────────────────────────────────┘"))
-	if w.Balance >= 21 {
+	if bal >= 21 {
 		fmt.Println(green("🎉 ЦЕЛЬ $21 БЫЛА БЫ ДОСТИГНУТА!"))
 	}
+}
+
+// runPaperSelfTest — один виртуальный вход и выход (без mainnet), чтобы проверить PnL и комиссии за секунды.
+func runPaperSelfTest() {
+	dw := newWallet()
+	mint := "SelfTestMintSelfTestMintSelfTestMintPuump"
+	tok := NewToken{Mint: mint, BondingCurve: "SelfTestBC111111111111111111111111111111111111", Sig: "selftest"}
+	sym := "$SELF..pump"
+	spot := 0.00012345
+
+	consoleMu.Lock()
+	defer consoleMu.Unlock()
+
+	fmt.Println(bold("\n═══ PAPER SELF-TEST (кошелёк + комиссии, без WebSocket) ═══"))
+	fmt.Printf("Стартовый баланс: $%.2f · ставка как в live: $%.2f\n\n", dw.Start, FIXED_BET)
+
+	if !dw.open(tok, sym, spot) {
+		fmt.Println(red("open() не прошёл — мало баланса или ставка"))
+		return
+	}
+
+	exitSpot := spot * 1.10 // +10% к spot — ожидаем плюс после комиссий
+	dw.closePos(mint, "SELFTEST +10% spot", exitSpot)
+
+	dw.mu.Lock()
+	bal := dw.Balance
+	nClosed := len(dw.Closed)
+	var lastPnL float64
+	if nClosed > 0 {
+		lastPnL = dw.Closed[nClosed-1].PnL
+	}
+	dw.mu.Unlock()
+
+	fmt.Printf("\n%s Итог: баланс $%.2f · последняя сделка PnL %+.2f USD\n", bold("●"), bal, lastPnL)
+	if lastPnL > 0 {
+		fmt.Println(green("✓ Цепочка вход → выход и учёт комиссий работает (плюс ожидаем при +10% spot)."))
+	} else {
+		fmt.Println(yellow("ⓘ PnL после комиссий не в плюсе — так бывает при узкой марже; логика кошелька всё равно отработала."))
+	}
+	fmt.Println(gray("Live: go run live_paper_trading.go (без -selftest) — ждёт реальные create-токены."))
 }
 
 // ════════════════════════════════════════════════════
@@ -1282,6 +1366,14 @@ func dexScreenerURL(mint string) string {
 // ════════════════════════════════════════════════════
 
 func main() {
+	selftest := flag.Bool("selftest", false, "проверка виртуального кошелька и комиссий за секунды (без WebSocket), затем выход")
+	flag.Parse()
+	if *selftest {
+		refreshSolPriceUSD()
+		runPaperSelfTest()
+		os.Exit(0)
+	}
+
 	if !apiReady() {
 		fmt.Println(red("❌ Вставь Helius API ключ в HELIUS_API_KEY"))
 		fmt.Println(yellow("   dev.helius.xyz → Sign Up → Create App"))
@@ -1310,8 +1402,10 @@ func main() {
 		VELOCITY_PAUSE, VELOCITY_MIN_DPROGRESS*100, VELOCITY_MIN_DREALSOL)
 	fmt.Printf("%s Баланс: %s | Ставка: $%.2f | Макс позиций: %d\n",
 		bold("▶"), green(fmt.Sprintf("$%.2f", PAPER_BALANCE)), FIXED_BET, MAX_POSITIONS)
-	fmt.Printf("%s DexScreener — по mint показывается вся история торгов; даты на оси — календарь свечей, не дата «создания ссылки». Свежесть листинга смотри в строке ⏱ (время блока create-тx).\n\n",
+	fmt.Printf("%s DexScreener — по mint показывается вся история торгов; даты на оси — календарь свечей, не дата «создания ссылки». Свежесть листинга смотри в строке ⏱ (время блока create-тx).\n",
 		gray("ⓘ"))
+	fmt.Printf("%s Быстрая проверка кошелька: %s\n\n",
+		gray("ⓘ"), cyan("go run live_paper_trading.go -selftest"))
 
 	wallet := newWallet()
 	tokenCh := make(chan NewToken, 200)
@@ -1390,30 +1484,41 @@ func main() {
 					return
 				}
 
+				atomic.AddInt64(&funnelInWindow, 1)
 				snap1, vOK, vDetail := curveVelocityOK(bc, snap0)
 				if !vOK {
 					logRejectLine("velocity", sym, mint, "velocity: "+vDetail)
 					return
 				}
 
+				atomic.AddInt64(&funnelPassVel, 1)
 				ok, scamMeta := antiScamCheck(mint, bc, creator)
 				if !ok {
 					logRejectLine("scam", sym, mint, "фильтр: "+scamMeta)
 					return
 				}
 
+				atomic.AddInt64(&funnelPassScam, 1)
 				price := snap1.PriceUSD
 				progress := snap1.Progress
 				realSol := snap1.RealSolSOL
 
 				ageInfo := formatCreateAge(createAt)
+				consoleMu.Lock()
 				fmt.Printf("\n%s %-18s | $%.10f | curve %.1f%% | SOL %.2f | %s | %s → ВХОД\n",
 					green("✓"), sym, price, progress*100, realSol, gray(vDetail), gray(scamMeta))
 				fmt.Printf("   %s %s\n", gray("⏱"), cyan(ageInfo))
 				fmt.Printf("   %s %s\n", gray("DEX"), cyan(dexScreenerURL(mint)))
-
-				if wallet.open(tok, sym, price) {
+				opened := wallet.open(tok, sym, price)
+				consoleMu.Unlock()
+				if opened {
+					atomic.AddInt64(&funnelOpenOK, 1)
 					go monitor(wallet, mint, bc, sym)
+				} else {
+					atomic.AddInt64(&funnelOpenFail, 1)
+					consoleMu.Lock()
+					fmt.Println(yellow("⚠ ВХОД отклонён open(): мало баланса или лимит позиций"))
+					consoleMu.Unlock()
 				}
 			}()
 		}
@@ -1432,6 +1537,7 @@ func main() {
 		t := time.NewTicker(1 * time.Minute)
 		for range t.C {
 			printRejectSummary()
+			printFunnelLine()
 		}
 	}()
 

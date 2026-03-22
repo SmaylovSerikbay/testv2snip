@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -29,9 +30,11 @@ import (
 
 const (
 	HELIUS_API_KEY = "1859e3e5-5d82-476e-a121-8d5f57705cf7"
-	PAPER_BALANCE  = 7.0
-	FIXED_BET      = 1.0
-	MAX_POSITIONS  = 1 // снайпер: одна позиция — фокус и меньше шума
+	PAPER_BALANCE = 7.0
+	// Доля баланса на одну сделку: при $7 → ~$1; после плюса ставка считается от нового банка
+	BET_PCT_OF_BALANCE = 1.0 / 7.0
+	MIN_STAKE_USD      = 0.25 // не открываем позицию мельче (пыль / шум)
+	MAX_POSITIONS      = 1    // снайпер: одна позиция — фокус и меньше шума
 
 	// Pump.fun: Global fee_basis_points = 100 → 1% с покупки и с продажи (документация программы)
 	PUMP_FEE_BPS = 100
@@ -43,19 +46,19 @@ const (
 	PRICE_TICK = 3 * time.Second
 	MAX_HOLD   = 7 * time.Minute
 
-	// ── Снайпер: баланс «чаще сигнал» (velocity) vs «меньше мусора» (скам + верх кривой)
-	SNIPER_CURVE_MIN = 0.010 // ≥1.0%
-	SNIPER_CURVE_MAX = 0.075 // ≤7.5% — не догоняем сильно растянутую кривую
-	MIN_REAL_SOL     = 0.15  // минимум ликвидности в SOL
+	// ── Снайпер (paper): шире окно + мягче скам = чаще кандидаты; цель — чаще входы (не гарантия 1/2мин — зависит от сети)
+	SNIPER_CURVE_MIN = 0.007 // ≥0.7%
+	SNIPER_CURVE_MAX = 0.088 // ≤8.8%
+	MIN_REAL_SOL     = 0.12 // минимум SOL в кривой
 
-	// Анти-скам — чуть строже ончейн-фильтры при ослабленном velocity
-	CREATOR_SOL_MIN     = 0.06 // минимум SOL у создателя (было 0.04)
+	// Анти-скам — чуть мягче, чтобы не резать всё на velocity/скаме
+	CREATOR_SOL_MIN     = 0.045
 	CREATOR_SOL_SUSPECT = 80.0
-	MAX_NONCURVE_PCT    = 0.10 // меньше токенов вне кривой у топов (было 0.12)
+	MAX_NONCURVE_PCT    = 0.12
 
 	// Выходы: быстрый скальп
 	STOP_LOSS        = 0.90
-	TAKE_PROFIT      = 1.16 // +16% spot — быстрее фикс
+	TAKE_PROFIT      = 1.35 // +35% spot по цели доходности (бумага)
 	TRAIL_ACTIVATE   = 1.08
 	TRAILING         = 0.07
 	TRAIL_MIN_AGE    = 18 * time.Second
@@ -69,10 +72,10 @@ const (
 	// Если create-транзакция старше — не считаем «только что залистились» (защита от кривых сигналов)
 	MAX_CREATE_TX_AGE = 45 * time.Minute
 
-	// Velocity: OR — Δprogress или ΔrealSol; realSol чувствительнее на ранней кривой (мелкие покупки)
-	VELOCITY_PAUSE         = 3500 * time.Millisecond
-	VELOCITY_MIN_DPROGRESS = 0.0015 // +0.15 «п.п.» progress (realSol/85)
-	VELOCITY_MIN_DREALSOL  = 0.010  // или +0.010 SOL в кривую за окно (типичный мелкий приток)
+	// Velocity: короче пауза + ниже пороги → чаще проход к скаму (риск ложных притоков выше)
+	VELOCITY_PAUSE         = 2200 * time.Millisecond
+	VELOCITY_MIN_DPROGRESS = 0.0008 // ~0.08 п.п. progress
+	VELOCITY_MIN_DREALSOL  = 0.006  // +0.006 SOL за окно
 
 	// Логи: false = не печатать каждый отсев (только сводка раз в минуту + успешный ВХОД)
 	VERBOSE_REJECT_LOGS = false
@@ -227,6 +230,39 @@ func printFunnelLine() {
 	}
 }
 
+func printEntryPace() {
+	recentEntryMu.Lock()
+	times := append([]time.Time(nil), recentEntryTimes...)
+	recentEntryMu.Unlock()
+	consoleMu.Lock()
+	defer consoleMu.Unlock()
+	if len(times) < 2 {
+		fmt.Printf("%s входов пока мало для среднего интервала (нужно ≥2)\n", gray("◎"))
+		return
+	}
+	lastGap := times[len(times)-1].Sub(times[len(times)-2])
+	n := len(times) - 1
+	if n > 25 {
+		n = 25
+	}
+	startIdx := len(times) - 1 - n
+	if startIdx < 0 {
+		startIdx = 0
+	}
+	var sum time.Duration
+	intervals := 0
+	for i := startIdx + 1; i < len(times); i++ {
+		sum += times[i].Sub(times[i-1])
+		intervals++
+	}
+	if intervals <= 0 {
+		return
+	}
+	avg := sum / time.Duration(intervals)
+	fmt.Printf("%s сделки: входов %d · последний интервал %v · средний %v (цель ~2 мин в paper — не гарантия, зависит от сети)\n",
+		gray("◎"), len(times), lastGap.Round(time.Second), avg.Round(time.Second))
+}
+
 const PUMP_PROGRAM = "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P"
 
 // Pump.fun: decimals у монет на кривой = 6 (как в Global / bonding curve)
@@ -300,14 +336,92 @@ type Wallet struct {
 	Start   float64
 	Pos     map[string]*Position
 	Closed  []ClosedTrade
+	// Сводка по типу выхода (учимся на минусах)
+	ExitWin  map[string]int
+	ExitLoss map[string]int
 }
 
 func newWallet() *Wallet {
 	return &Wallet{
-		Balance: PAPER_BALANCE,
-		Start:   PAPER_BALANCE,
-		Pos:     make(map[string]*Position),
+		Balance:  PAPER_BALANCE,
+		Start:    PAPER_BALANCE,
+		Pos:      make(map[string]*Position),
+		ExitWin:  make(map[string]int),
+		ExitLoss: make(map[string]int),
 	}
+}
+
+// bucketExitReason — короткий ярлык для статистики
+func bucketExitReason(reason string) string {
+	switch {
+	case strings.HasPrefix(reason, "ТЕЙК"):
+		return "тейк"
+	case strings.Contains(reason, "СТОП"):
+		return "стоп"
+	case strings.Contains(reason, "ТРЕЙЛИНГ"):
+		return "трейл"
+	case strings.Contains(reason, "БРЕЙК"):
+		return "брейкивн"
+	case strings.Contains(reason, "СКРЕТЧ"):
+		return "скретч"
+	case strings.Contains(reason, "НЕТ ИМПУЛЬСА"):
+		return "нет_импульса"
+	case strings.Contains(reason, "ТАЙМАУТ"):
+		return "таймаут"
+	case strings.Contains(reason, "МИГРАЦИЯ"):
+		return "миграция"
+	case strings.Contains(reason, "УМЕР"):
+		return "нет_данных"
+	default:
+		return "прочее"
+	}
+}
+
+func lossLearningHint(reason string) string {
+	switch bucketExitReason(reason) {
+	case "стоп":
+		return "Часто стоп: ужесточить вход (выше curve min / сильнее velocity) или не ослаблять скам."
+	case "скретч", "нет_импульса":
+		return "Слабый разгон: поднять SNIPER_CURVE_MIN или velocity, чтобы не ловить «пустые» импульсы."
+	case "брейкивн":
+		return "Откат после пика: норм защита капитала; при частых — смотреть TRAIL/вход позже по кривой."
+	case "таймаут", "нет_данных":
+		return "Долго без движения / RPC: проверить сеть; при частых таймаутах уменьшить MAX_HOLD."
+	case "миграция":
+		return "Ушло в Raydium: фикс по правилам; не ошибка стратегии."
+	default:
+		return "Смотри полный Reason в логе выхода и сводку ExitLoss в кошельке."
+	}
+}
+
+// Времена успешных входов — оценка среднего интервала между сделками
+var (
+	recentEntryMu   sync.Mutex
+	recentEntryTimes []time.Time
+)
+
+func recordSuccessfulEntry() {
+	recentEntryMu.Lock()
+	defer recentEntryMu.Unlock()
+	recentEntryTimes = append(recentEntryTimes, time.Now())
+	if len(recentEntryTimes) > 100 {
+		recentEntryTimes = recentEntryTimes[len(recentEntryTimes)-100:]
+	}
+}
+
+// stakeFromBalance — гросс USD на вход: n% от текущего баланса (сложный процент по сделкам).
+func stakeFromBalance(balance float64) float64 {
+	if balance <= 0 {
+		return 0
+	}
+	s := balance * BET_PCT_OF_BALANCE
+	if s < MIN_STAKE_USD {
+		return 0
+	}
+	if s > balance {
+		return balance
+	}
+	return s
 }
 
 // ════════════════════════════════════════════════════
@@ -586,8 +700,8 @@ func curveVelocityOK(bc string, snap0 *curveSnap) (snap1 *curveSnap, ok bool, de
 	if dP < VELOCITY_MIN_DPROGRESS && dSol < VELOCITY_MIN_DREALSOL {
 		return s1, false, fmt.Sprintf("мало притока (Δ%.2f%% / +%.3f SOL за %v)", dP*100, dSol, VELOCITY_PAUSE)
 	}
-	// Чуть шире запас: за паузу кривая может уехать вверх без «ложного поздно»
-	if s1.Progress > SNIPER_CURVE_MAX+0.045 {
+	// Запас после короткой паузы (агрессивный режим — кривая быстрее двигается)
+	if s1.Progress > SNIPER_CURVE_MAX+0.06 {
 		return s1, false, fmt.Sprintf("кривая уже %.1f%% — поздно", s1.Progress*100)
 	}
 	return s1, true, fmt.Sprintf("Δ%.2f%% / +%.3f SOL за %v", dP*100, dSol, VELOCITY_PAUSE)
@@ -1058,7 +1172,10 @@ func (w *Wallet) open(tok NewToken, sym string, spot float64) bool {
 	if len(w.Pos) >= MAX_POSITIONS {
 		return false
 	}
-	capital := math.Min(FIXED_BET, w.Balance)
+	capital := stakeFromBalance(w.Balance)
+	if capital <= 0 {
+		return false
+	}
 	pool := usdToPoolAfterBuy(capital)
 	if pool < 0.02 {
 		return false
@@ -1105,6 +1222,7 @@ func (w *Wallet) closePos(mint, reason string, spot float64) {
 	feesEst := pos.CapitalUSD*pumpFeePct() + pos.Tokens*spot*pumpFeePct() + 2*solanaTxFeeUSD()
 	dur := time.Since(pos.OpenedAt).Round(time.Second)
 
+	bk := bucketExitReason(reason)
 	w.mu.Lock()
 	w.Balance += net
 	w.Closed = append(w.Closed, ClosedTrade{
@@ -1112,6 +1230,11 @@ func (w *Wallet) closePos(mint, reason string, spot float64) {
 		ExitNetUSD: net, FeesUSD: feesEst, PnL: pnl, PnLPct: pct,
 		Reason: reason, Dur: dur,
 	})
+	if pnl < 0 {
+		w.ExitLoss[bk]++
+	} else {
+		w.ExitWin[bk]++
+	}
 	bal := w.Balance
 	w.mu.Unlock()
 
@@ -1124,6 +1247,9 @@ func (w *Wallet) closePos(mint, reason string, spot float64) {
 	fmt.Printf("\n%s ВЫХОД %-18s | %s | нетто $%.2f (~комиссии ~$%.2f) | %-24s | %s | бал: $%.2f\n",
 		icon, pos.Symbol, ps, net, feesEst, reason, dur, bal)
 	fmt.Printf("   %s %s\n", gray("DEX"), cyan(dexScreenerURL(pos.Mint)))
+	if pnl < 0 {
+		fmt.Printf("   %s [%s] %s\n", yellow("ⓘ учёт"), bk, lossLearningHint(reason))
+	}
 }
 
 func (w *Wallet) stats() {
@@ -1144,6 +1270,14 @@ func (w *Wallet) stats() {
 	nOpen := len(w.Pos)
 	bal := w.Balance
 	start := w.Start
+	lossBk := make(map[string]int)
+	winBk := make(map[string]int)
+	for k, v := range w.ExitLoss {
+		lossBk[k] = v
+	}
+	for k, v := range w.ExitWin {
+		winBk[k] = v
+	}
 	bs := green(fmt.Sprintf("$%.2f", bal))
 	if bal < start {
 		bs = red(fmt.Sprintf("$%.2f", bal))
@@ -1166,10 +1300,32 @@ func (w *Wallet) stats() {
 		fmt.Sprintf("%s/%s  WR: %.0f%%",
 			green(fmt.Sprintf("%d", wins)),
 			red(fmt.Sprintf("%d", n-wins)), wr))
+	if len(lossBk) > 0 || len(winBk) > 0 {
+		fmt.Println(bold("├──────────────────────────────────────────────┤"))
+		if len(winBk) > 0 {
+			fmt.Printf("│  Плюсы по выходу: %-26s│\n", gray(formatExitBuckets(winBk)))
+		}
+		if len(lossBk) > 0 {
+			fmt.Printf("│  Минусы по выходу: %-25s│\n", yellow(formatExitBuckets(lossBk)))
+		}
+	}
 	fmt.Println(bold("└──────────────────────────────────────────────┘"))
 	if bal >= 21 {
 		fmt.Println(green("🎉 ЦЕЛЬ $21 БЫЛА БЫ ДОСТИГНУТА!"))
 	}
+}
+
+func formatExitBuckets(m map[string]int) string {
+	var keys []string
+	for k := range m {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	var parts []string
+	for _, k := range keys {
+		parts = append(parts, fmt.Sprintf("%s=%d", k, m[k]))
+	}
+	return strings.Join(parts, " ")
 }
 
 // runPaperSelfTest — один виртуальный вход и выход (без mainnet), чтобы проверить PnL и комиссии за секунды.
@@ -1184,7 +1340,8 @@ func runPaperSelfTest() {
 	defer consoleMu.Unlock()
 
 	fmt.Println(bold("\n═══ PAPER SELF-TEST (кошелёк + комиссии, без WebSocket) ═══"))
-	fmt.Printf("Стартовый баланс: $%.2f · ставка как в live: $%.2f\n\n", dw.Start, FIXED_BET)
+	fmt.Printf("Стартовый баланс: $%.2f · ставка как в live: $%.2f (%.1f%% банка)\n\n",
+		dw.Start, stakeFromBalance(dw.Start), BET_PCT_OF_BALANCE*100)
 
 	if !dw.open(tok, sym, spot) {
 		fmt.Println(red("open() не прошёл — мало баланса или ставка"))
@@ -1401,17 +1558,21 @@ func main() {
 	fmt.Printf("\n%s Режим: %s | кривая: %.1f%%–%.1f%% | min SOL: %.2f | velocity: %v (Δ≥%.2f%% прогресса или +%.3f SOL) | ончейн-фильтры\n",
 		bold("▶"), cyan("SNIPER"), SNIPER_CURVE_MIN*100, SNIPER_CURVE_MAX*100, MIN_REAL_SOL,
 		VELOCITY_PAUSE, VELOCITY_MIN_DPROGRESS*100, VELOCITY_MIN_DREALSOL)
-	fmt.Printf("%s Баланс: %s | Ставка: $%.2f | Макс позиций: %d\n",
-		bold("▶"), green(fmt.Sprintf("$%.2f", PAPER_BALANCE)), FIXED_BET, MAX_POSITIONS)
+	fmt.Printf("%s Баланс: %s | Ставка: %.2f%% от банка (min $%.2f) → сейчас ~$%.2f на сделку | Макс позиций: %d\n",
+		bold("▶"), green(fmt.Sprintf("$%.2f", PAPER_BALANCE)), BET_PCT_OF_BALANCE*100, MIN_STAKE_USD,
+		stakeFromBalance(PAPER_BALANCE), MAX_POSITIONS)
 	fmt.Printf("%s DexScreener — по mint показывается вся история торгов; даты на оси — календарь свечей, не дата «создания ссылки». Свежесть листинга смотри в строке ⏱ (время блока create-тx).\n",
 		gray("ⓘ"))
-	fmt.Printf("%s Быстрая проверка кошелька: %s\n\n",
+	fmt.Printf("%s Быстрая проверка кошелька: %s\n",
 		gray("ⓘ"), cyan("go run live_paper_trading.go -selftest"))
+	fmt.Printf("%s Цель «~1 вход / 2 мин» — ориентир: одна позиция + поток Pump.fun; смотри строку ◎ «средний интервал» раз в минуту.\n\n",
+		gray("ⓘ"))
 
 	wallet := newWallet()
 	tokenCh := make(chan NewToken, 200)
 	var seen sync.Map
-	sem := make(chan struct{}, 3) // макс 3 параллельных запроса
+	// Больше слотов: пока один токен в sleep(velocity), остальные create обрабатываются
+	sem := make(chan struct{}, 12)
 
 	go listenWS(tokenCh)
 
@@ -1514,6 +1675,7 @@ func main() {
 				consoleMu.Unlock()
 				if opened {
 					atomic.AddInt64(&funnelOpenOK, 1)
+					recordSuccessfulEntry()
 					go monitor(wallet, mint, bc, sym)
 				} else {
 					atomic.AddInt64(&funnelOpenFail, 1)
@@ -1539,6 +1701,7 @@ func main() {
 		for range t.C {
 			printRejectSummary()
 			printFunnelLine()
+			printEntryPace()
 		}
 	}()
 

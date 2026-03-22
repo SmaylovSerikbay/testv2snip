@@ -41,10 +41,10 @@ const (
 	PRICE_TICK = 3 * time.Second
 	MAX_HOLD   = 7 * time.Minute
 
-	// ── Снайпер: раньше в кривую, быстрее выход (ловим до разгона) ──
-	SNIPER_CURVE_MIN = 0.012 // ≥1.2% — уже есть поток, но ещё рано
-	SNIPER_CURVE_MAX = 0.065 // ≤6.5% — до «взлёта» толпы
-	MIN_REAL_SOL     = 0.18  // минимум ликвидности в SOL
+	// ── Снайпер: paper — смягчённые пороги (чаще тестовые входы; для реала можно ужесточить)
+	SNIPER_CURVE_MIN = 0.010 // ≥1.0% — чуть раньше в «окно»
+	SNIPER_CURVE_MAX = 0.080 // ≤8% — допускаем чуть больший разгон
+	MIN_REAL_SOL     = 0.15  // минимум ликвидности в SOL
 
 	// Анти-скам (эвристики ончейн; не 100%, но отсекает часть мусора)
 	CREATOR_SOL_MIN   = 0.04  // SOL на кошельке создателя (ниже — одноразовый / бот-сет)
@@ -68,9 +68,9 @@ const (
 	MAX_CREATE_TX_AGE = 45 * time.Minute
 
 	// Velocity: прирост «заполнения» кривой за короткое окно (приток SOL / покупки)
-	VELOCITY_PAUSE          = 3 * time.Second // второй замер; коротко, чтобы не опоздать
-	VELOCITY_MIN_DPROGRESS  = 0.006         // +0.6% progress за окно (≈0.05 SOL к ~85)
-	VELOCITY_MIN_DREALSOL    = 0.04         // или +0.04 SOL реально в кривую за окно
+	VELOCITY_PAUSE         = 4 * time.Second // paper: чуть дольше — чаще ловим приток
+	VELOCITY_MIN_DPROGRESS = 0.004          // +0.4% progress за окно
+	VELOCITY_MIN_DREALSOL  = 0.028          // или +0.028 SOL реально в кривую за окно
 
 	// Логи: false = не печатать каждый отсев (только сводка раз в минуту + успешный ВХОД)
 	VERBOSE_REJECT_LOGS = false
@@ -88,9 +88,32 @@ var ignoredTokenMints = map[string]bool{
 
 // Счётчики отсева (без спама в консоль)
 var (
-	rejectMu     sync.Mutex
-	rejectCounts = map[string]int64{}
+	rejectMu            sync.Mutex
+	rejectCounts        = map[string]int64{}
+	rejectPrevSnapshot  map[string]int64 // для дельты за минуту
 )
+
+// Подписи ключей в минутной сводке (рус./кратко)
+var rejectLabelRU = map[string]string{
+	"no_mint":  "нет_mint",
+	"not_pump": "не_pump",
+	"stale_tx": "старый_tx",
+	"no_price": "нет_цены",
+	"complete": "graduated",
+	"empty":    "пусто",
+	"late":     "поздно",
+	"low_sol":  "мало_SOL",
+	"velocity": "velocity",
+	"scam":     "скам",
+	"pda_err":  "PDA",
+}
+
+func rejectKeyLabel(k string) string {
+	if s, ok := rejectLabelRU[k]; ok {
+		return s
+	}
+	return k
+}
 
 func rejectBump(key string) {
 	rejectMu.Lock()
@@ -116,24 +139,54 @@ func logRejectLine(key, sym, mint, detail string) {
 func printRejectSummary() {
 	rejectMu.Lock()
 	defer rejectMu.Unlock()
-	if len(rejectCounts) == 0 {
-		return
+	if rejectPrevSnapshot == nil {
+		rejectPrevSnapshot = make(map[string]int64)
 	}
 	order := []string{"no_mint", "not_pump", "stale_tx", "no_price", "complete", "empty", "late", "low_sol", "velocity", "scam", "pda_err"}
 	seen := make(map[string]bool, len(order))
-	var parts []string
+
+	var deltaParts []string
+	for _, k := range order {
+		seen[k] = true
+		v := rejectCounts[k]
+		prev := rejectPrevSnapshot[k]
+		if d := v - prev; d > 0 {
+			deltaParts = append(deltaParts, fmt.Sprintf("%s +%d", rejectKeyLabel(k), d))
+		}
+	}
+	for k, v := range rejectCounts {
+		if seen[k] {
+			continue
+		}
+		if d := v - rejectPrevSnapshot[k]; d > 0 {
+			deltaParts = append(deltaParts, fmt.Sprintf("%s +%d", rejectKeyLabel(k), d))
+		}
+	}
+
+	var totalParts []string
 	for _, k := range order {
 		if v := rejectCounts[k]; v > 0 {
-			parts = append(parts, fmt.Sprintf("%s=%d", k, v))
-			seen[k] = true
+			totalParts = append(totalParts, fmt.Sprintf("%s=%d", rejectKeyLabel(k), v))
 		}
 	}
 	for k, v := range rejectCounts {
 		if !seen[k] && v > 0 {
-			parts = append(parts, fmt.Sprintf("%s=%d", k, v))
+			totalParts = append(totalParts, fmt.Sprintf("%s=%d", rejectKeyLabel(k), v))
 		}
 	}
-	fmt.Println(gray("📊 отсев: ") + strings.Join(parts, " · "))
+
+	for k, v := range rejectCounts {
+		rejectPrevSnapshot[k] = v
+	}
+
+	if len(totalParts) == 0 {
+		return
+	}
+	deltaStr := strings.Join(deltaParts, " · ")
+	if deltaStr == "" {
+		deltaStr = "тихо"
+	}
+	fmt.Printf("%s за мин: %s  |  всего: %s\n", gray("📊 отсев"), deltaStr, strings.Join(totalParts, " · "))
 }
 
 const PUMP_PROGRAM = "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P"
@@ -468,6 +521,16 @@ func getCurveSnapshot(bcAddr string) (*curveSnap, error) {
 		RealSolSOL: realSolSOL,
 		Complete:   bc.Complete,
 	}, nil
+}
+
+// Повтор при гонке create → аккаунт кривой ещё не в RPC
+func getCurveSnapshotWithRetry(bcAddr string) (*curveSnap, error) {
+	s, err := getCurveSnapshot(bcAddr)
+	if err == nil && s != nil && s.PriceUSD > 0 {
+		return s, nil
+	}
+	time.Sleep(180 * time.Millisecond)
+	return getCurveSnapshot(bcAddr)
 }
 
 // curveVelocityOK — второй замер после паузы: нужен заметный приток (покупки/боты).
@@ -1302,7 +1365,7 @@ func main() {
 					return
 				}
 
-				snap0, err := getCurveSnapshot(bc)
+				snap0, err := getCurveSnapshotWithRetry(bc)
 				if err != nil || snap0 == nil || snap0.PriceUSD <= 0 {
 					logRejectLine("no_price", sym, mint, "нет цены в bonding curve")
 					return

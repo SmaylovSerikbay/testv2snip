@@ -72,10 +72,10 @@ const (
 	// Если create-транзакция старше — не считаем «только что залистились» (защита от кривых сигналов)
 	MAX_CREATE_TX_AGE = 45 * time.Minute
 
-	// Velocity: короче пауза + ниже пороги → чаще проход к скаму (риск ложных притоков выше)
+	// Velocity: если в сводке копится vel_мало — ещё ниже; vel_RPC — RPC/лимиты, не пороги
 	VELOCITY_PAUSE         = 2200 * time.Millisecond
-	VELOCITY_MIN_DPROGRESS = 0.0008 // ~0.08 п.п. progress
-	VELOCITY_MIN_DREALSOL  = 0.006  // +0.006 SOL за окно
+	VELOCITY_MIN_DPROGRESS = 0.0005 // ~0.05 п.п. progress
+	VELOCITY_MIN_DREALSOL  = 0.004  // +0.004 SOL за окно
 
 	// Логи: false = не печатать каждый отсев (только сводка раз в минуту + успешный ВХОД)
 	VERBOSE_REJECT_LOGS = false
@@ -120,6 +120,9 @@ var rejectLabelRU = map[string]string{
 	"late":     "поздно",
 	"low_sol":  "мало_SOL",
 	"velocity": "velocity",
+	"vel_rpc":  "vel_RPC",
+	"vel_low":  "vel_мало",
+	"vel_late": "vel_поздно",
 	"scam":     "скам",
 	"pda_err":  "PDA",
 }
@@ -158,7 +161,7 @@ func printRejectSummary() {
 	if rejectPrevSnapshot == nil {
 		rejectPrevSnapshot = make(map[string]int64)
 	}
-	order := []string{"no_mint", "not_pump", "stale_tx", "no_price", "complete", "empty", "late", "low_sol", "velocity", "scam", "pda_err"}
+	order := []string{"no_mint", "not_pump", "stale_tx", "no_price", "complete", "empty", "late", "low_sol", "velocity", "vel_rpc", "vel_low", "vel_late", "scam", "pda_err"}
 	seen := make(map[string]bool, len(order))
 
 	var deltaParts []string
@@ -686,25 +689,28 @@ func getCurveSnapshotWithRetry(bcAddr string) (*curveSnap, error) {
 }
 
 // curveVelocityOK — второй замер после паузы: нужен заметный приток (покупки/боты).
-func curveVelocityOK(bc string, snap0 *curveSnap) (snap1 *curveSnap, ok bool, detail string) {
+// rejectKey пустой при ok; иначе vel_rpc / vel_low / vel_late — для сводки отсева.
+func curveVelocityOK(bc string, snap0 *curveSnap) (snap1 *curveSnap, ok bool, detail string, rejectKey string) {
 	if snap0 == nil || snap0.Complete {
-		return nil, false, "нет снимка"
+		return nil, false, "нет снимка", "velocity"
 	}
 	time.Sleep(VELOCITY_PAUSE)
 	s1, err := getCurveSnapshotWithRetry(bc)
-	if err != nil || s1 == nil || s1.PriceUSD <= 0 || s1.Complete {
-		return nil, false, "второй снимок кривой"
+	if err != nil || s1 == nil || s1.PriceUSD <= 0 {
+		return nil, false, "второй снимок кривой", "vel_rpc"
+	}
+	if s1.Complete {
+		return nil, false, "кривая complete на втором замере", "complete"
 	}
 	dP := s1.Progress - snap0.Progress
 	dSol := s1.RealSolSOL - snap0.RealSolSOL
 	if dP < VELOCITY_MIN_DPROGRESS && dSol < VELOCITY_MIN_DREALSOL {
-		return s1, false, fmt.Sprintf("мало притока (Δ%.2f%% / +%.3f SOL за %v)", dP*100, dSol, VELOCITY_PAUSE)
+		return s1, false, fmt.Sprintf("мало притока (Δ%.2f%% / +%.3f SOL за %v)", dP*100, dSol, VELOCITY_PAUSE), "vel_low"
 	}
-	// Запас после короткой паузы (агрессивный режим — кривая быстрее двигается)
 	if s1.Progress > SNIPER_CURVE_MAX+0.06 {
-		return s1, false, fmt.Sprintf("кривая уже %.1f%% — поздно", s1.Progress*100)
+		return s1, false, fmt.Sprintf("кривая уже %.1f%% — поздно", s1.Progress*100), "vel_late"
 	}
-	return s1, true, fmt.Sprintf("Δ%.2f%% / +%.3f SOL за %v", dP*100, dSol, VELOCITY_PAUSE)
+	return s1, true, fmt.Sprintf("Δ%.2f%% / +%.3f SOL за %v", dP*100, dSol, VELOCITY_PAUSE), ""
 }
 
 // ════════════════════════════════════════════════════
@@ -1647,9 +1653,12 @@ func main() {
 				}
 
 				atomic.AddInt64(&funnelInWindow, 1)
-				snap1, vOK, vDetail := curveVelocityOK(bc, snap0)
+				snap1, vOK, vDetail, vKey := curveVelocityOK(bc, snap0)
 				if !vOK {
-					logRejectLine("velocity", sym, mint, "velocity: "+vDetail)
+					if vKey == "" {
+						vKey = "velocity"
+					}
+					logRejectLine(vKey, sym, mint, "velocity: "+vDetail)
 					return
 				}
 

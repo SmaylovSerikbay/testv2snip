@@ -38,7 +38,7 @@ const (
 var (
 	pumpBuySlippageBps       uint64 = 3000 // buy 30%
 	pumpSellSlippageBps      uint64 = 4000 // sell 40%
-	pumpPriorityFeeLamports  uint64 = 5_000_000 // 0.005 SOL
+	pumpPriorityFeeLamports  uint64 = 1_500_000 // 0.0015 SOL
 	pumpPriorityMaxFeeBps    uint64 = 120 // максимум приоритета как доля от размера сделки (1.2%)
 	pumpSellRetryPriorityFee uint64 = 8_000_000
 	pumpDirectRPC     *solanarpc.Client

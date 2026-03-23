@@ -63,18 +63,18 @@ const (
 	// Recovery Mode ($3.9): узкое окно + ликвидность, чтобы не брать «пустые» мёртвые пулы.
 	SNIPER_CURVE_MIN = 0.002 // 0.2%
 	SNIPER_CURVE_MAX = 0.15  // 15%
-	MIN_REAL_SOL     = 1.20  // минимум 1.2 SOL в кривой (чуть больше входов)
+	MIN_REAL_SOL     = 1.00  // минимум 1.0 SOL в кривой (ранние импульсы)
 
 	// Анти-скам
 	CREATOR_SOL_MIN     = 0.04 // не слишком режем поток, но отсеиваем совсем пустых
 	CREATOR_SOL_SUSPECT = 80.0
 	MAX_NONCURVE_PCT    = 0.12
 
-	// Выходы Recovery: hard SL -25%; подтверждение краша ниже -20% два тика подряд.
-	STOP_LOSS_HARD   = 0.75 // -25%
-	STOP_CONFIRM_LVL = 0.80 // -20% (уровень подтверждения)
-	STOP_CONFIRM_N   = 2
-	TAKE_PROFIT      = 3.0 // +200%
+	// Выходы Final Recovery: hard SL -30%; TP только от +150%.
+	STOP_LOSS_HARD   = 0.70 // -30%
+	STOP_CONFIRM_LVL = 0.70 // -30%
+	STOP_CONFIRM_N   = 1
+	TAKE_PROFIT      = 2.5 // +150%
 	TRAIL_ACTIVATE   = 1.40 // трейлинг стартует после +40%
 	TRAILING         = 0.16
 	TRAIL_MIN_AGE    = 10 * time.Second
@@ -92,7 +92,7 @@ const (
 	VELOCITY_MIN_DPROGRESS = 0.0
 	VELOCITY_MIN_DREALSOL  = 0.0
 	VELOCITY_MIN_DELTA_DP  = -0.0001 // -0.01% (разрешаем микро-откат на замере)
-	LIVE_FIXED_BUY_SOL     = 0.022 // fixed buy for recovery mode
+	LIVE_FIXED_BUY_SOL     = 0.013 // fixed buy for final recovery mode
 
 	// Логи: false = не печатать каждый отсев (только сводка раз в минуту + успешный ВХОД)
 	VERBOSE_REJECT_LOGS = false
@@ -2033,14 +2033,7 @@ func monitor(w *Wallet, mint, bcAddr, sym, source string) {
 				w.closePos(mint, "БРЕЙК-ИВН после импульса", price)
 				return
 			}
-			if time.Since(opened) >= SCRATCH_AFTER && mult < SCRATCH_IF_BELOW {
-				w.closePos(mint, "СКРЕТЧ (слабый импульс)", price)
-				return
-			}
-			if time.Since(opened) >= NO_IMPULSE_AFTER && peak < entry*NO_IMPULSE_NEED {
-				w.closePos(mint, "НЕТ ИМПУЛЬСА", price)
-				return
-			}
+			// Final Recovery: не выходим по "слабому импульсу"/"нет импульса", даём позиции разыграться.
 			if price <= entry*STOP_CONFIRM_LVL {
 				confirmedStopTicks++
 			} else {

@@ -95,7 +95,7 @@ const (
 
 	// Если create-транзакция старше — не считаем «только что залистились» (защита от кривых сигналов)
 	MAX_CREATE_TX_AGE = 30 * time.Minute
-	MAX_READY_TO_SEND_DELAY = 2 * time.Second
+	MAX_READY_TO_SEND_DELAY = 2500 * time.Millisecond
 
 	VELOCITY_PAUSE         = 500 * time.Millisecond // микро-velocity: быстрее вход
 	VELOCITY_MIN_DPROGRESS = 0.0
@@ -2454,6 +2454,7 @@ func main() {
 
 	refreshSolPriceUSD()
 	refreshDynamicPriorityFeeFromRPC()
+	startPumpHotCaches()
 	sp := getSolUSD()
 	fmt.Printf("%s SOL/USD: $%.2f (CoinGecko, автообновление ~90 с)\n", green("✓"), sp)
 	go func() {

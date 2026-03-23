@@ -53,6 +53,19 @@ var (
 		lamports uint64
 		ts       time.Time
 	}
+	recentBlockhashCache struct {
+		mu       sync.Mutex
+		blockhash solana.Hash
+		ts       time.Time
+	}
+	jitoHTTPClient = &http.Client{
+		Timeout: 6 * time.Second,
+		Transport: &http.Transport{
+			MaxIdleConns:        64,
+			MaxIdleConnsPerHost: 64,
+			IdleConnTimeout:     90 * time.Second,
+		},
+	}
 )
 
 func initPumpDirectFromEnv() {
@@ -89,6 +102,64 @@ func rpcPumpDirect() *solanarpc.Client {
 		pumpDirectRPC = solanarpc.New(heliusURL())
 	})
 	return pumpDirectRPC
+}
+
+func refreshRecentBlockhashCache() {
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	recent, err := rpcPumpDirect().GetLatestBlockhash(ctx, solanarpc.CommitmentProcessed)
+	if err != nil || recent == nil {
+		return
+	}
+	recentBlockhashCache.mu.Lock()
+	recentBlockhashCache.blockhash = recent.Value.Blockhash
+	recentBlockhashCache.ts = time.Now()
+	recentBlockhashCache.mu.Unlock()
+}
+
+func getRecentBlockhashCached() (solana.Hash, bool) {
+	recentBlockhashCache.mu.Lock()
+	defer recentBlockhashCache.mu.Unlock()
+	if recentBlockhashCache.ts.IsZero() {
+		return solana.Hash{}, false
+	}
+	if time.Since(recentBlockhashCache.ts) > 8*time.Second {
+		return solana.Hash{}, false
+	}
+	return recentBlockhashCache.blockhash, true
+}
+
+func prewarmJitoConnection() {
+	url := strings.TrimSpace(os.Getenv("JITO_BLOCK_ENGINE_URL"))
+	if url == "" {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodHead, url, nil)
+	if err != nil {
+		return
+	}
+	_, _ = jitoHTTPClient.Do(req)
+}
+
+func startPumpHotCaches() {
+	refreshRecentBlockhashCache()
+	prewarmJitoConnection()
+	go func() {
+		t := time.NewTicker(2 * time.Second)
+		defer t.Stop()
+		for range t.C {
+			refreshRecentBlockhashCache()
+		}
+	}()
+	go func() {
+		t := time.NewTicker(10 * time.Second)
+		defer t.Stop()
+		for range t.C {
+			prewarmJitoConnection()
+		}
+	}()
 }
 
 // fastHotBuyMode: в горячем входе не делаем лишние pre-check RPC перед отправкой.
@@ -227,7 +298,7 @@ func sendJitoBundle(ctx context.Context, blockEngineURL string, tx *solana.Trans
 		return solana.Signature{}, time.Time{}, err
 	}
 	req.Header.Set("Content-Type", "application/json")
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := jitoHTTPClient.Do(req)
 	if err != nil {
 		return solana.Signature{}, time.Time{}, err
 	}
@@ -773,16 +844,16 @@ func swapPumpFun(ctx context.Context, rpcClient *solanarpc.Client, wallet solana
 		return solana.Signature{}, 0, 0, time.Time{}, err
 	}
 
-	recent, err := rpcClient.GetLatestBlockhash(ctx, solanarpc.CommitmentFinalized)
-	if err != nil {
-		return solana.Signature{}, 0, 0, time.Time{}, err
+	cachedBH, ok := getRecentBlockhashCached()
+	if !ok {
+		return solana.Signature{}, 0, 0, time.Time{}, fmt.Errorf("blockhash cache cold")
 	}
 
 	all := append([]solana.Instruction{}, cuLimitIx, cuPriceIx)
 	all = append(all, preIxs...)
 	all = append(all, buyIx)
 
-	tx, err := solana.NewTransaction(all, recent.Value.Blockhash, solana.TransactionPayer(owner))
+	tx, err := solana.NewTransaction(all, cachedBH, solana.TransactionPayer(owner))
 	if err != nil {
 		return solana.Signature{}, 0, 0, time.Time{}, err
 	}

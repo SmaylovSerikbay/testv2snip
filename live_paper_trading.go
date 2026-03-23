@@ -781,6 +781,14 @@ func hotPathSilent() bool {
 	return true
 }
 
+func fastAntiScamMode() bool {
+	s := strings.TrimSpace(strings.ToLower(os.Getenv("FAST_ANTI_SCAM")))
+	if s == "0" || s == "false" || s == "no" {
+		return false
+	}
+	return true
+}
+
 func abortIfTooLate(tok NewToken, stage string) bool {
 	if tok.DetectedAt.IsZero() {
 		return false
@@ -1444,6 +1452,19 @@ func hasSocialLinksInMetadata(mint string) (bool, string) {
 	return true, "social ok"
 }
 
+func socialFromCacheOnly(mint string) (bool, string, bool) {
+	metadataCache.mu.Lock()
+	defer metadataCache.mu.Unlock()
+	if metadataCache.m == nil {
+		return false, "", false
+	}
+	e, ok := metadataCache.m[mint]
+	if !ok || time.Since(e.ts) > 20*time.Minute {
+		return false, "", false
+	}
+	return e.ok, e.detail, true
+}
+
 func devSoldInFirstMinute(creator string, createAt *time.Time) (bool, string) {
 	if creator == "" || createAt == nil {
 		return false, "skip dev-sold check"
@@ -1659,6 +1680,22 @@ func antiScamCheck(mint, mintAuthorityRef, liquidityVault, creator string, creat
 	}
 	if sol > creatorMaxSOL {
 		return false, fmt.Sprintf("SOL создателя %.1f > %.0f (подозр.)", sol, creatorMaxSOL)
+	}
+	if fastAntiScamMode() {
+		badMint, badFreeze, err := rpcMintAuthorities(mint, mintAuthorityRef, extraMintAuth...)
+		if err != nil {
+			return false, "mint RPC"
+		}
+		if badMint {
+			return false, "mintAuthority не кривая (чужая чеканка)"
+		}
+		if badFreeze {
+			return false, "freezeAuthority (заморозка счетов)"
+		}
+		if okSocial, socialDetail, cached := socialFromCacheOnly(mint); cached && !okSocial {
+			return false, socialDetail
+		}
+		return true, fmt.Sprintf("fast anti-scam | dev %.2f SOL", sol)
 	}
 
 	type filterResult struct {

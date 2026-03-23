@@ -77,6 +77,10 @@ var (
 		blockhash solana.Hash
 		ts       time.Time
 	}
+	jitoLastSend struct {
+		mu sync.Mutex
+		ts time.Time
+	}
 	jitoHTTPClient = &http.Client{
 		Timeout: 500 * time.Millisecond,
 		Transport: &http.Transport{
@@ -297,28 +301,44 @@ func refreshDynamicPriorityFeeFromRPC() {
 	priorityFeeCache.mu.Unlock()
 }
 
+const jitoMinInterval = 2 * time.Second // не чаще 1 раз в 2 сек — иначе 429 Too Many Requests
+
 func sendPumpTransaction(ctx context.Context, rpcClient *solanarpc.Client, tx *solana.Transaction) (solana.Signature, time.Time, error) {
 	if j := strings.TrimSpace(os.Getenv("JITO_BLOCK_ENGINE_URL")); j != "" {
-		fireAndForget := strings.TrimSpace(strings.ToLower(os.Getenv("JITO_FIRE_AND_FORGET"))) != "0"
-		if fireAndForget {
-			txSig := solana.Signature{}
-			if len(tx.Signatures) > 0 {
-				txSig = tx.Signatures[0]
-			}
-			go func(url string, txCopy *solana.Transaction) {
-				bgCtx, cancel := context.WithTimeout(context.Background(), 250*time.Millisecond)
-				defer cancel()
-				if _, _, err := sendJitoBundle(bgCtx, url, txCopy); err != nil {
-					fmt.Printf("❌ Jito bundle (async): %v\n", err)
+		// Rate limit: если недавно слали — сразу в RPC, чтобы не схлопотать 429
+		jitoLastSend.mu.Lock()
+		elapsed := time.Since(jitoLastSend.ts)
+		jitoLastSend.mu.Unlock()
+		if elapsed >= jitoMinInterval {
+			fireAndForget := strings.TrimSpace(strings.ToLower(os.Getenv("JITO_FIRE_AND_FORGET"))) != "0"
+			if fireAndForget {
+				jitoLastSend.mu.Lock()
+				jitoLastSend.ts = time.Now()
+				jitoLastSend.mu.Unlock()
+				txSig := solana.Signature{}
+				if len(tx.Signatures) > 0 {
+					txSig = tx.Signatures[0]
 				}
-			}(j, tx)
-			return txSig, time.Now(), nil
-		}
-		jitoCtx, cancel := context.WithTimeout(ctx, 200*time.Millisecond)
-		sig, sentAt, err := sendJitoBundle(jitoCtx, j, tx)
-		cancel()
-		if err == nil {
-			return sig, sentAt, nil
+				go func(url string, txCopy *solana.Transaction) {
+					bgCtx, cancel := context.WithTimeout(context.Background(), 250*time.Millisecond)
+					defer cancel()
+					if _, _, err := sendJitoBundle(bgCtx, url, txCopy); err != nil {
+						fmt.Printf("❌ Jito bundle (async): %v\n", err)
+					}
+				}(j, tx)
+				return txSig, time.Now(), nil
+			}
+			jitoCtx, cancel := context.WithTimeout(ctx, 500*time.Millisecond)
+			sig, sentAt, err := sendJitoBundle(jitoCtx, j, tx)
+			cancel()
+			if err == nil {
+				jitoLastSend.mu.Lock()
+				jitoLastSend.ts = time.Now()
+				jitoLastSend.mu.Unlock()
+				return sig, sentAt, nil
+			}
+			// 429 или другая ошибка — fallback на RPC (лучше хоть как-то отправить, чем потерять сделку)
+			fmt.Printf("⚠ Jito failed (%v) → fallback RPC\n", err)
 		}
 	}
 	sig, err := rpcClient.SendTransactionWithOpts(ctx, tx, solanarpc.TransactionOpts{

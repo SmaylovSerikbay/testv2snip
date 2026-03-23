@@ -95,6 +95,7 @@ const (
 
 	// Если create-транзакция старше — не считаем «только что залистились» (защита от кривых сигналов)
 	MAX_CREATE_TX_AGE = 30 * time.Minute
+	MAX_READY_TO_SEND_DELAY = 2 * time.Second
 
 	VELOCITY_PAUSE         = 500 * time.Millisecond // микро-velocity: быстрее вход
 	VELOCITY_MIN_DPROGRESS = 0.0
@@ -758,6 +759,14 @@ func isRateLimitErr(err error) bool {
 	return strings.Contains(s, "429") ||
 		strings.Contains(s, "-32429") ||
 		strings.Contains(s, "rate limit")
+}
+
+func hotPathSilent() bool {
+	s := strings.TrimSpace(strings.ToLower(os.Getenv("HOT_PATH_SILENT")))
+	if s == "0" || s == "false" || s == "no" {
+		return false
+	}
+	return true
 }
 
 // ════════════════════════════════════════════════════
@@ -1844,6 +1853,13 @@ func (w *Wallet) open(tok NewToken, sym string, spot float64) bool {
 
 // openLive — реальный свап SOL→токен только через Pump.fun bonding curve (pump_direct).
 func (w *Wallet) openLive(tok NewToken, sym string, spot float64, capitalUSD float64) bool {
+	if !tok.DetectedAt.IsZero() && time.Since(tok.DetectedAt) > MAX_READY_TO_SEND_DELAY {
+		ms := time.Since(tok.DetectedAt).Milliseconds()
+		consoleMu.Lock()
+		fmt.Printf("❌ TRADE ABORTED: Latency too high (%d ms)\n", ms)
+		consoleMu.Unlock()
+		return false
+	}
 	if !liveUsePumpDirect(tok) {
 		consoleMu.Lock()
 		fmt.Println(yellow("⚠ LIVE: только Pump.fun на кривой — LaunchLab/другие источники в live отключены (бумага без изменений)."))
@@ -1881,16 +1897,20 @@ func (w *Wallet) openLive(tok NewToken, sym string, spot float64, capitalUSD flo
 	var sig string
 	var solIn uint64
 	var sentAt time.Time
-	fmt.Println(gray("⏳ Pump.fun: прямая покупка на кривой…"))
+	if !hotPathSilent() {
+		fmt.Println(gray("⏳ Pump.fun: прямая покупка на кривой…"))
+	}
 	tokenRaw, sig, solIn, sentAt, err = PumpDirectBuy(tok.Mint, lamports)
 	if err != nil && isRateLimitErr(err) {
 		time.Sleep(1 * time.Second)
 		tokenRaw, sig, solIn, sentAt, err = PumpDirectBuy(tok.Mint, lamports)
 	}
 	if err != nil {
-		consoleMu.Lock()
-		fmt.Printf("%s %v\n", red("❌ Pump buy:"), err)
-		consoleMu.Unlock()
+		if !hotPathSilent() {
+			consoleMu.Lock()
+			fmt.Printf("%s %v\n", red("❌ Pump buy:"), err)
+			consoleMu.Unlock()
+		}
 		syncWalletBalanceUSDFresh(w)
 		return false
 	}
@@ -2543,10 +2563,12 @@ func main() {
 				}
 
 				sym := "$" + short(mint)
-				consoleMu.Lock()
-				fmt.Printf("%s Token Detected | %s | %s | %s\n",
-					gray("⏱"), sym, src, tok.DetectedAt.Format(time.RFC3339Nano))
-				consoleMu.Unlock()
+				if !hotPathSilent() {
+					consoleMu.Lock()
+					fmt.Printf("%s Token Detected | %s | %s | %s\n",
+						gray("⏱"), sym, src, tok.DetectedAt.Format(time.RFC3339Nano))
+					consoleMu.Unlock()
+				}
 
 				if createAt != nil && time.Since(*createAt) > MAX_CREATE_TX_AGE {
 					logRejectLine("stale_tx", sym, mint, fmt.Sprintf(
@@ -2620,10 +2642,19 @@ func main() {
 					return
 				}
 				if !tok.DetectedAt.IsZero() {
-					consoleMu.Lock()
-					fmt.Printf("%s Filters Passed | %s | +%dms\n",
-						gray("⏱"), sym, time.Since(tok.DetectedAt).Milliseconds())
-					consoleMu.Unlock()
+					delta := time.Since(tok.DetectedAt)
+					if !hotPathSilent() {
+						consoleMu.Lock()
+						fmt.Printf("%s Filters Passed | %s | +%dms\n",
+							gray("⏱"), sym, delta.Milliseconds())
+						consoleMu.Unlock()
+					}
+					if delta > MAX_READY_TO_SEND_DELAY {
+						consoleMu.Lock()
+						fmt.Printf("❌ TRADE ABORTED: Latency too high (%d ms)\n", delta.Milliseconds())
+						consoleMu.Unlock()
+						return
+					}
 				}
 
 				atomic.AddInt64(&funnelPassScam, 1)

@@ -91,6 +91,15 @@ func rpcPumpDirect() *solanarpc.Client {
 	return pumpDirectRPC
 }
 
+// fastHotBuyMode: в горячем входе не делаем лишние pre-check RPC перед отправкой.
+func fastHotBuyMode() bool {
+	s := strings.TrimSpace(strings.ToLower(os.Getenv("HOT_PATH_FAST_BUY")))
+	if s == "0" || s == "false" || s == "no" {
+		return false
+	}
+	return true
+}
+
 func applySlippagePump(amount uint64, slippageBps uint64) uint64 {
 	if amount == 0 || slippageBps >= 10_000 {
 		return 0
@@ -117,11 +126,17 @@ func choosePriorityFeeLamports(baseTradeLamports uint64) uint64 {
 	if dyn, ok := cachedDynamicPriorityFeeLamports(); ok && dyn > 0 {
 		fee = dyn
 	}
+	if strings.TrimSpace(os.Getenv("JITO_BLOCK_ENGINE_URL")) != "" && fee < 1_000_000 {
+		fee = 1_000_000 // 0.001 SOL минимум для быстрого попадания в bundle
+	}
 	if baseTradeLamports > 0 && pumpPriorityMaxFeeBps > 0 {
 		capFee := (baseTradeLamports * pumpPriorityMaxFeeBps) / 10_000
 		if capFee > 0 && fee > capFee {
 			fee = capFee
 		}
+	}
+	if strings.TrimSpace(os.Getenv("JITO_BLOCK_ENGINE_URL")) != "" && fee < 1_000_000 {
+		fee = 1_000_000
 	}
 	return fee
 }
@@ -225,6 +240,20 @@ func sendJitoBundle(ctx context.Context, blockEngineURL string, tx *solana.Trans
 		sig = tx.Signatures[0]
 	}
 	return sig, time.Now(), nil
+}
+
+func signTransactionAsync(tx *solana.Transaction, owner solana.PublicKey, wallet solana.PrivateKey) error {
+	done := make(chan error, 1)
+	go func() {
+		_, err := tx.Sign(func(key solana.PublicKey) *solana.PrivateKey {
+			if key.Equals(owner) {
+				return &wallet
+			}
+			return nil
+		})
+		done <- err
+	}()
+	return <-done
 }
 
 func nativeBalanceLamports(ctx context.Context, rpcClient *solanarpc.Client, owner solana.PublicKey) (uint64, error) {
@@ -552,18 +581,14 @@ func mintTokenProgram(ctx context.Context, c *solanarpc.Client, mint solana.Publ
 
 func swapPumpFun(ctx context.Context, rpcClient *solanarpc.Client, wallet solana.PrivateKey, mint solana.PublicKey, spendableLamports uint64) (solana.Signature, uint64, uint64, time.Time, error) {
 	owner := wallet.PublicKey()
-	balBefore, err := nativeBalanceLamports(ctx, rpcClient, owner)
-	if err != nil {
-		return solana.Signature{}, 0, 0, time.Time{}, err
-	}
-
-	tokenProgram, err := mintTokenProgram(ctx, rpcClient, mint)
-	if err != nil {
-		return solana.Signature{}, 0, 0, time.Time{}, err
-	}
-	mintDecimals, err := mintDecimalsFromMintData(ctx, rpcClient, mint)
-	if err != nil {
-		return solana.Signature{}, 0, 0, time.Time{}, err
+	fastMode := fastHotBuyMode()
+	var balBefore uint64
+	if !fastMode {
+		var err error
+		balBefore, err = nativeBalanceLamports(ctx, rpcClient, owner)
+		if err != nil {
+			return solana.Signature{}, 0, 0, time.Time{}, err
+		}
 	}
 
 	bondingCurve, _, err := derivePumpBondingCurve(mint)
@@ -575,48 +600,83 @@ func swapPumpFun(ctx context.Context, rpcClient *solanarpc.Client, wallet solana
 	if err != nil {
 		return solana.Signature{}, 0, 0, time.Time{}, err
 	}
-	gInfo, err := rpcClient.GetAccountInfoWithOpts(ctx, globalPK, &solanarpc.GetAccountInfoOpts{Encoding: solana.EncodingBase64, Commitment: solanarpc.CommitmentProcessed})
-	if err != nil || gInfo == nil || gInfo.Value == nil || gInfo.Value.Data == nil {
-		return solana.Signature{}, 0, 0, time.Time{}, fmt.Errorf("global account missing")
+
+	var (
+		tokenProgram solana.PublicKey
+		mintDecimals uint8
+		feeRecipient solana.PublicKey
+		feeBps       uint64
+		creatorFeeBps uint64
+		vTok         uint64
+		vSol         uint64
+		realToken    uint64
+		complete     bool
+		creator      solana.PublicKey
+		firstErr     error
+	)
+	var wg sync.WaitGroup
+	var errMu sync.Mutex
+	setErr := func(e error) {
+		if e == nil {
+			return
+		}
+		errMu.Lock()
+		if firstErr == nil {
+			firstErr = e
+		}
+		errMu.Unlock()
 	}
-	gData := gInfo.Value.Data.GetBinary()
-	feeRecipient, feeBps, creatorFeeBps, err := parsePumpGlobalFees(gData)
-	if err != nil {
-		return solana.Signature{}, 0, 0, time.Time{}, err
+	wg.Add(3)
+	go func() {
+		defer wg.Done()
+		tp, e := mintTokenProgram(ctx, rpcClient, mint)
+		if e != nil {
+			setErr(e)
+			return
+		}
+		tokenProgram = tp
+		md, e := mintDecimalsFromMintData(ctx, rpcClient, mint)
+		if e != nil {
+			setErr(e)
+			return
+		}
+		mintDecimals = md
+	}()
+	go func() {
+		defer wg.Done()
+		gInfo, e := rpcClient.GetAccountInfoWithOpts(ctx, globalPK, &solanarpc.GetAccountInfoOpts{Encoding: solana.EncodingBase64, Commitment: solanarpc.CommitmentProcessed})
+		if e != nil || gInfo == nil || gInfo.Value == nil || gInfo.Value.Data == nil {
+			setErr(fmt.Errorf("global account missing"))
+			return
+		}
+		fr, fbps, cfbps, e := parsePumpGlobalFees(gInfo.Value.Data.GetBinary())
+		if e != nil {
+			setErr(e)
+			return
+		}
+		feeRecipient, feeBps, creatorFeeBps = fr, fbps, cfbps
+	}()
+	go func() {
+		defer wg.Done()
+		bcInfo, e := rpcClient.GetAccountInfoWithOpts(ctx, bondingCurve, &solanarpc.GetAccountInfoOpts{Encoding: solana.EncodingBase64, Commitment: solanarpc.CommitmentProcessed})
+		if e != nil || bcInfo == nil || bcInfo.Value == nil || bcInfo.Value.Data == nil {
+			setErr(fmt.Errorf("bonding curve account missing"))
+			return
+		}
+		vt, vs, rt, _, _, c, cr, e := parsePumpBondingCurveData(bcInfo.Value.Data.GetBinary())
+		if e != nil {
+			setErr(e)
+			return
+		}
+		vTok, vSol, realToken, complete, creator = vt, vs, rt, c, cr
+	}()
+	wg.Wait()
+	if firstErr != nil {
+		return solana.Signature{}, 0, 0, time.Time{}, firstErr
 	}
 
 	spendableBudget := pumpSpendableWithBuffer(spendableLamports, pumpSpendableBufferBps)
 
-	const minSolReserveAfterPumpBuyLamports uint64 = 10_000_000
-	estThisTxFees := pumpPriorityFeeLamports + 25_000
-	minBalanceRequired := spendableBudget + minSolReserveAfterPumpBuyLamports + estThisTxFees
-
-	natBal, err := rpcClient.GetBalance(ctx, owner, solanarpc.CommitmentProcessed)
-	if err != nil {
-		return solana.Signature{}, 0, 0, time.Time{}, fmt.Errorf("getBalance: %w", err)
-	}
-	if natBal == nil {
-		return solana.Signature{}, 0, 0, time.Time{}, fmt.Errorf("getBalance: empty response")
-	}
-	if natBal.Value < minBalanceRequired {
-		return solana.Signature{}, 0, 0, time.Time{}, fmt.Errorf(
-			"insufficient SOL: после покупки нужен резерв ≥%.4f SOL + комиссии; есть %d, нужно ≥%d (spendable %d)",
-			float64(minSolReserveAfterPumpBuyLamports)/1e9,
-			natBal.Value,
-			minBalanceRequired,
-			spendableBudget,
-		)
-	}
-
-	bcInfo, err := rpcClient.GetAccountInfoWithOpts(ctx, bondingCurve, &solanarpc.GetAccountInfoOpts{Encoding: solana.EncodingBase64, Commitment: solanarpc.CommitmentProcessed})
-	if err != nil || bcInfo == nil || bcInfo.Value == nil || bcInfo.Value.Data == nil {
-		return solana.Signature{}, 0, 0, time.Time{}, fmt.Errorf("bonding curve account missing")
-	}
-	bcData := bcInfo.Value.Data.GetBinary()
-	vTok, vSol, realToken, _, _, complete, creator, err := parsePumpBondingCurveData(bcData)
-	if err != nil {
-		return solana.Signature{}, 0, 0, time.Time{}, err
-	}
 	if complete {
 		return solana.Signature{}, 0, 0, time.Time{}, fmt.Errorf("bonding curve complete (migrated)")
 	}
@@ -726,12 +786,7 @@ func swapPumpFun(ctx context.Context, rpcClient *solanarpc.Client, wallet solana
 	if err != nil {
 		return solana.Signature{}, 0, 0, time.Time{}, err
 	}
-	_, err = tx.Sign(func(key solana.PublicKey) *solana.PrivateKey {
-		if key.Equals(owner) {
-			return &wallet
-		}
-		return nil
-	})
+	err = signTransactionAsync(tx, owner, wallet)
 	if err != nil {
 		return solana.Signature{}, 0, 0, time.Time{}, err
 	}
@@ -740,10 +795,12 @@ func swapPumpFun(ctx context.Context, rpcClient *solanarpc.Client, wallet solana
 	if err != nil {
 		return solana.Signature{}, 0, 0, time.Time{}, err
 	}
-	// Фактические лампорты, списанные с кошелька, важнее оценок (учёт комиссий/priority/реального исполнения).
-	actualSpent, ok := waitNativeBalanceDelta(ctx, rpcClient, owner, balBefore, false)
-	if !ok || actualSpent == 0 {
-		actualSpent = spendableBudget
+	actualSpent := spendableBudget
+	if !fastMode {
+		// Фактические лампорты, списанные с кошелька, важнее оценок (учёт комиссий/priority/реального исполнения).
+		if measured, ok := waitNativeBalanceDelta(ctx, rpcClient, owner, balBefore, false); ok && measured > 0 {
+			actualSpent = measured
+		}
 	}
 	return sig, expectedOut, actualSpent, sentAt, nil
 }
@@ -914,12 +971,7 @@ func swapPumpFunSellAmount(ctx context.Context, rpcClient *solanarpc.Client, wal
 	if err != nil {
 		return solana.Signature{}, 0, err
 	}
-	_, err = tx.Sign(func(key solana.PublicKey) *solana.PrivateKey {
-		if key.Equals(owner) {
-			return &wallet
-		}
-		return nil
-	})
+	err = signTransactionAsync(tx, owner, wallet)
 	if err != nil {
 		return solana.Signature{}, 0, err
 	}

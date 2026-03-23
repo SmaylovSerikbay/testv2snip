@@ -45,7 +45,7 @@ func syncWalletBalanceUSD(w *Wallet) {
 	if !liveTradingEnabled() {
 		return
 	}
-	sol, err := rpcGetBalanceSOL(livePub.String())
+	sol, err := rpcGetBalanceSOLCached(livePub.String(), BALANCE_CHECK_INTERVAL)
 	if err != nil {
 		return
 	}

@@ -59,6 +59,11 @@ const (
 
 	PRICE_TICK = 3 * time.Second
 	MAX_HOLD   = 7 * time.Minute
+	// Сервисные интервалы/лимиты RPC для защиты от -32429.
+	BALANCE_CHECK_INTERVAL = 10 * time.Second
+	RPC_RETRY_BASE_DELAY  = 2 * time.Second
+	RPC_MAX_RETRIES       = 4
+	RPC_MAX_CONCURRENT    = 3
 
 	// Recovery Mode ($3.9): узкое окно + ликвидность, чтобы не брать «пустые» мёртвые пулы.
 	SNIPER_CURVE_MIN = 0.002 // 0.2%
@@ -491,6 +496,17 @@ func stakeFromBalance(balance float64) float64 {
 // ════════════════════════════════════════════════════
 
 var httpClient = &http.Client{Timeout: 8 * time.Second}
+var rpcLimiter = make(chan struct{}, RPC_MAX_CONCURRENT)
+
+type balCacheEntry struct {
+	sol float64
+	ts  time.Time
+}
+
+var balanceCache struct {
+	mu sync.Mutex
+	m  map[string]balCacheEntry
+}
 
 // Курс SOL/USD (CoinGecko, иначе fallback в getSolUSD)
 var solUSDPrice struct {
@@ -585,12 +601,42 @@ func rpc(method string, params []interface{}) ([]byte, error) {
 		"jsonrpc": "2.0", "id": 1,
 		"method": method, "params": params,
 	})
-	resp, err := httpClient.Post(heliusURL(), "application/json", bytes.NewReader(body))
-	if err != nil {
-		return nil, err
+	rpcLimiter <- struct{}{}
+	defer func() { <-rpcLimiter }()
+
+	backoff := RPC_RETRY_BASE_DELAY
+	for attempt := 0; attempt < RPC_MAX_RETRIES; attempt++ {
+		resp, err := httpClient.Post(heliusURL(), "application/json", bytes.NewReader(body))
+		if err != nil {
+			if attempt == RPC_MAX_RETRIES-1 {
+				return nil, err
+			}
+			time.Sleep(backoff)
+			backoff *= 2
+			continue
+		}
+		raw, readErr := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if readErr != nil {
+			if attempt == RPC_MAX_RETRIES-1 {
+				return nil, readErr
+			}
+			time.Sleep(backoff)
+			backoff *= 2
+			continue
+		}
+		rateLimited := resp.StatusCode == 429 || bytes.Contains(raw, []byte(`"code":-32429`))
+		if rateLimited {
+			if attempt == RPC_MAX_RETRIES-1 {
+				return nil, fmt.Errorf("rpc rate-limited after retries (-32429)")
+			}
+			time.Sleep(backoff)
+			backoff *= 2
+			continue
+		}
+		return raw, nil
 	}
-	defer resp.Body.Close()
-	return io.ReadAll(resp.Body)
+	return nil, fmt.Errorf("rpc failed after retries")
 }
 
 // ════════════════════════════════════════════════════
@@ -974,6 +1020,31 @@ func rpcGetBalanceSOL(pub string) (float64, error) {
 		return wrapped.Value / 1e9, nil
 	}
 	return 0, fmt.Errorf("balance parse")
+}
+
+func rpcGetBalanceSOLCached(pub string, ttl time.Duration) (float64, error) {
+	if ttl <= 0 {
+		return rpcGetBalanceSOL(pub)
+	}
+	now := time.Now()
+	balanceCache.mu.Lock()
+	if balanceCache.m == nil {
+		balanceCache.m = make(map[string]balCacheEntry)
+	}
+	if e, ok := balanceCache.m[pub]; ok && now.Sub(e.ts) <= ttl {
+		balanceCache.mu.Unlock()
+		return e.sol, nil
+	}
+	balanceCache.mu.Unlock()
+
+	sol, err := rpcGetBalanceSOL(pub)
+	if err != nil {
+		return 0, err
+	}
+	balanceCache.mu.Lock()
+	balanceCache.m[pub] = balCacheEntry{sol: sol, ts: now}
+	balanceCache.mu.Unlock()
+	return sol, nil
 }
 
 // freezeAuthority ≠ null — опасно. mintAuthority часто = bonding curve / pool (норма) или null.
@@ -2160,7 +2231,7 @@ func main() {
 	tokenCh := make(chan NewToken, 200)
 	var seen sync.Map
 	// Больше слотов: пока один токен в sleep(velocity), остальные create обрабатываются
-	sem := make(chan struct{}, 12)
+	sem := make(chan struct{}, RPC_MAX_CONCURRENT)
 
 	go listenProgram(PUMP_PROGRAM, "Pump.fun", pumpCreateFromLogs, tokenCh, "pump")
 	go listenProgram(LAUNCHLAB_PROGRAM, "Raydium LaunchLab", launchLabInitFromLogs, tokenCh, "launchlab")

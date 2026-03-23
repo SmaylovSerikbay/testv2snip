@@ -78,7 +78,7 @@ const (
 	// Recovery Mode ($3.9): узкое окно + ликвидность, чтобы не брать «пустые» мёртвые пулы.
 	SNIPER_CURVE_MIN           = 0.0  // 0.0%
 	SNIPER_CURVE_MAX           = 0.25 // 25%
-	MIN_REAL_SOL               = 0.35 // минимум 0.35 SOL в кривой
+	MIN_REAL_SOL               = 0.20 // минимум 0.2 SOL в кривой
 	FAST_HEAVY_CHECK_CURVE_MAX = 0.05  // тяжёлые RPC-фильтры только до 5% кривой
 	CREATOR_BALANCE_CACHE_TTL  = 5 * time.Minute
 
@@ -90,11 +90,11 @@ const (
 	DEV_MAX_TXS_HOUR      = 7    // dev >7 tx/час — serial rugger (создаёт 4+ токенов)
 
 	// Выходы Final Recovery: hard SL -30%; TP только от +150%.
-	STOP_LOSS_HARD      = 0.80 // -20%
-	STOP_CONFIRM_LVL    = 0.80 // -20%
+	STOP_LOSS_HARD      = 0.85 // -15%
+	STOP_CONFIRM_LVL    = 0.85 // -15%
 	STOP_CONFIRM_N      = 1
 	SELL_SLIPPAGE_GUARD = 0.10            // >10% ожидаемого slip на выходе — подождать следующий тик
-	TAKE_PROFIT         = 1.40            // +40% — фиксируем весь объём
+	TAKE_PROFIT         = 1.30            // +30% — фиксируем весь объём
 	TRAIL_ACTIVATE      = 1.15            // трейлинг после +15% (было +40%)
 	TRAILING            = 0.12            // откат 12% от пика (было 16%)
 	TRAIL_MIN_AGE       = 5 * time.Second // был 10s — трейл раньше
@@ -109,12 +109,12 @@ const (
 	MAX_CREATE_TX_AGE       = 30 * time.Minute
 	MAX_READY_TO_SEND_DELAY = 4000 * time.Millisecond
 
-	VELOCITY_PAUSE         = 300 * time.Millisecond // быстрее реакция на импульс
+	VELOCITY_PAUSE         = 200 * time.Millisecond // быстрее реакция на импульс
 	VELOCITY_MIN_DPROGRESS = 0.02                   // min +2% за паузу — только первая волна
 	VELOCITY_MIN_DREALSOL  = 0.0
 	VELOCITY_MIN_DELTA_DP  = -0.0001 // -0.01% (разрешаем микро-откат на замере)
-	LIVE_FIXED_BUY_SOL     = 0.015   // target fixed buy size
-	LIVE_BUY_BALANCE_SHARE = 0.85    // or 85% of available SOL after reserve
+	LIVE_FIXED_BUY_SOL     = 0.04 // фиксированная ставка в live
+	LIVE_BUY_BALANCE_SHARE = 0.85 // legacy (не используется в fixed live buy)
 	ACTIVE_POSITIONS_FILE  = "current_trades.json"
 
 	// Логи: false = не печатать каждый отсев (только сводка раз в минуту + успешный ВХОД)
@@ -2242,9 +2242,10 @@ func (w *Wallet) openLive(tok NewToken, sym string, spot float64, capitalUSD flo
 	}
 	reserve := liveReserveSOL
 	_ = capitalUSD
-	solForSwap := (solBal - reserve) * LIVE_BUY_BALANCE_SHARE
-	if solForSwap > solBal-reserve {
-		solForSwap = solBal - reserve
+	availableAfterReserve := solBal - reserve
+	solForSwap := LIVE_FIXED_BUY_SOL
+	if availableAfterReserve < solForSwap {
+		solForSwap = availableAfterReserve
 	}
 	if solForSwap <= 0.001 {
 		consoleMu.Lock()
@@ -2880,8 +2881,8 @@ func main() {
 		}
 	}
 	if liveTradingEnabled() {
-		fmt.Printf("%s Баланс: %s (ончейн) | Ставка: FULL PORT %.0f%% от доступного SOL (после резерва) | Макс позиций: %d\n",
-			bold("▶"), green(fmt.Sprintf("$%.2f", wallet.Balance)), LIVE_BUY_BALANCE_SHARE*100, MAX_POSITIONS)
+		fmt.Printf("%s Баланс: %s (ончейн) | Ставка: FIXED %.3f SOL (после резерва) | Макс позиций: %d\n",
+			bold("▶"), green(fmt.Sprintf("$%.2f", wallet.Balance)), LIVE_FIXED_BUY_SOL, MAX_POSITIONS)
 	} else {
 		fmt.Printf("%s Баланс: %s | Ставка: %.2f%% от банка (min $%.2f) → сейчас ~$%.2f на сделку | Макс позиций: %d\n",
 			bold("▶"), green(fmt.Sprintf("$%.2f", PAPER_BALANCE)), BET_PCT_OF_BALANCE*100, MIN_STAKE_USD,

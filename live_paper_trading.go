@@ -2023,6 +2023,9 @@ func (w *Wallet) openLive(tok NewToken, sym string, spot float64, capitalUSD flo
 		if !tok.FiltersPassedAt.IsZero() {
 			d1 := tok.FiltersPassedAt.Sub(tok.DetectedAt).Milliseconds()
 			d2 := sentAt.Sub(tok.FiltersPassedAt).Milliseconds()
+			if !lat.SignedAt.IsZero() {
+				d2 = lat.SignedAt.Sub(tok.FiltersPassedAt).Milliseconds()
+			}
 			d3 := int64(lat.SendingMs)
 			fmt.Printf("%s dt_detect_to_filter=%dms | dt_filter_to_sign=%dms | dt_sign_to_send=%dms\n",
 				gray("⏱"), d1, d2, d3)

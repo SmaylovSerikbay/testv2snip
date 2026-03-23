@@ -40,6 +40,7 @@ type buyLatencyBreakdown struct {
 	BlockhashMs     int64
 	SigningMs       int64
 	SendingMs       int64
+	SignedAt        time.Time
 	BlockhashCached bool
 }
 
@@ -71,7 +72,7 @@ var (
 		ts       time.Time
 	}
 	jitoHTTPClient = &http.Client{
-		Timeout: 1200 * time.Millisecond,
+		Timeout: 500 * time.Millisecond,
 		Transport: &http.Transport{
 			MaxIdleConns:        64,
 			MaxIdleConnsPerHost: 64,
@@ -287,7 +288,7 @@ func refreshDynamicPriorityFeeFromRPC() {
 
 func sendPumpTransaction(ctx context.Context, rpcClient *solanarpc.Client, tx *solana.Transaction) (solana.Signature, time.Time, error) {
 	if j := strings.TrimSpace(os.Getenv("JITO_BLOCK_ENGINE_URL")); j != "" {
-		jitoCtx, cancel := context.WithTimeout(ctx, 900*time.Millisecond)
+		jitoCtx, cancel := context.WithTimeout(ctx, 200*time.Millisecond)
 		sig, sentAt, err := sendJitoBundle(jitoCtx, j, tx)
 		cancel()
 		if err == nil {
@@ -604,19 +605,19 @@ func pumpValidateBuyQuote(expectedOut, minOut, realToken uint64, mintDecimals ui
 	return nil
 }
 
-func mintDecimalsFromMintData(ctx context.Context, c *solanarpc.Client, mint solana.PublicKey) (uint8, error) {
+func mintMetaFromMintData(ctx context.Context, c *solanarpc.Client, mint solana.PublicKey) (tokenProgram solana.PublicKey, decimals uint8, err error) {
 	acc, err := c.GetAccountInfoWithOpts(ctx, mint, &solanarpc.GetAccountInfoOpts{Encoding: solana.EncodingBase64, Commitment: solanarpc.CommitmentProcessed})
 	if err != nil || acc == nil || acc.Value == nil {
-		return 0, fmt.Errorf("get mint account")
+		return solana.PublicKey{}, 0, fmt.Errorf("get mint account")
 	}
 	data := acc.Value.Data.GetBinary()
 	if len(data) < 45 {
-		return 0, fmt.Errorf("mint data too short")
+		return solana.PublicKey{}, 0, fmt.Errorf("mint data too short")
 	}
-	return data[44], nil
+	return acc.Value.Owner, data[44], nil
 }
 
-func ensurePumpUserATA(ctx context.Context, rpcClient *solanarpc.Client, preIxs *[]solana.Instruction, owner, mint, tokenProgram solana.PublicKey) (solana.PublicKey, error) {
+func ensurePumpUserATA(preIxs *[]solana.Instruction, owner, mint, tokenProgram solana.PublicKey) (solana.PublicKey, error) {
 	ata, _, err := solana.FindProgramAddress(
 		[][]byte{owner.Bytes(), tokenProgram.Bytes(), mint.Bytes()},
 		solana.SPLAssociatedTokenAccountProgramID,
@@ -624,10 +625,7 @@ func ensurePumpUserATA(ctx context.Context, rpcClient *solanarpc.Client, preIxs 
 	if err != nil {
 		return solana.PublicKey{}, err
 	}
-	info, err := rpcClient.GetAccountInfoWithOpts(ctx, ata, &solanarpc.GetAccountInfoOpts{Encoding: solana.EncodingBase64, Commitment: solanarpc.CommitmentProcessed})
-	if err == nil && info != nil && info.Value != nil {
-		return ata, nil
-	}
+	// Idempotent ATA create: безопасно добавлять всегда, без RPC pre-check.
 	ix := solana.NewInstruction(
 		solana.SPLAssociatedTokenAccountProgramID,
 		[]*solana.AccountMeta{
@@ -638,10 +636,15 @@ func ensurePumpUserATA(ctx context.Context, rpcClient *solanarpc.Client, preIxs 
 			{PublicKey: solana.SystemProgramID, IsSigner: false, IsWritable: false},
 			{PublicKey: tokenProgram, IsSigner: false, IsWritable: false},
 		},
-		[]byte{},
+		[]byte{1},
 	)
 	*preIxs = append(*preIxs, ix)
 	return ata, nil
+}
+
+func mintTokenProgram(ctx context.Context, c *solanarpc.Client, mint solana.PublicKey) (solana.PublicKey, error) {
+	tp, _, err := mintMetaFromMintData(ctx, c, mint)
+	return tp, err
 }
 
 func ceilDivBigPump(a, b *big.Int) *big.Int {
@@ -667,14 +670,6 @@ func encodePumpSellData(tokenAmount, minSolOut uint64) []byte {
 	binary.LittleEndian.PutUint64(buf[8:16], tokenAmount)
 	binary.LittleEndian.PutUint64(buf[16:24], minSolOut)
 	return buf
-}
-
-func mintTokenProgram(ctx context.Context, c *solanarpc.Client, mint solana.PublicKey) (solana.PublicKey, error) {
-	acc, err := c.GetAccountInfoWithOpts(ctx, mint, &solanarpc.GetAccountInfoOpts{Encoding: solana.EncodingBase64, Commitment: solanarpc.CommitmentProcessed})
-	if err != nil || acc == nil || acc.Value == nil {
-		return solana.PublicKey{}, fmt.Errorf("get mint account")
-	}
-	return acc.Value.Owner, nil
 }
 
 func swapPumpFun(ctx context.Context, rpcClient *solanarpc.Client, wallet solana.PrivateKey, mint solana.PublicKey, spendableLamports uint64) (solana.Signature, uint64, uint64, time.Time, error) {
@@ -728,17 +723,12 @@ func swapPumpFun(ctx context.Context, rpcClient *solanarpc.Client, wallet solana
 	wg.Add(3)
 	go func() {
 		defer wg.Done()
-		tp, e := mintTokenProgram(ctx, rpcClient, mint)
+		tp, md, e := mintMetaFromMintData(ctx, rpcClient, mint)
 		if e != nil {
 			setErr(e)
 			return
 		}
 		tokenProgram = tp
-		md, e := mintDecimalsFromMintData(ctx, rpcClient, mint)
-		if e != nil {
-			setErr(e)
-			return
-		}
 		mintDecimals = md
 	}()
 	go func() {
@@ -858,7 +848,7 @@ func swapPumpFun(ctx context.Context, rpcClient *solanarpc.Client, wallet solana
 	buyIx := solana.NewInstruction(pumpProgramPK, metas, data)
 
 	var preIxs []solana.Instruction
-	if _, err := ensurePumpUserATA(ctx, rpcClient, &preIxs, owner, mint, tokenProgram); err != nil {
+	if _, err := ensurePumpUserATA(&preIxs, owner, mint, tokenProgram); err != nil {
 		return solana.Signature{}, 0, 0, time.Time{}, fmt.Errorf("user ATA: %w", err)
 	}
 
@@ -890,6 +880,7 @@ func swapPumpFun(ctx context.Context, rpcClient *solanarpc.Client, wallet solana
 	}
 	signStart := time.Now()
 	err = signTransactionAsync(tx, owner, wallet)
+	signedAt := time.Now()
 	signingMs := time.Since(signStart).Milliseconds()
 	if err != nil {
 		return solana.Signature{}, 0, 0, time.Time{}, err
@@ -906,6 +897,7 @@ func swapPumpFun(ctx context.Context, rpcClient *solanarpc.Client, wallet solana
 		BlockhashMs:     blockhashMs,
 		SigningMs:       signingMs,
 		SendingMs:       sendingMs,
+		SignedAt:        signedAt,
 		BlockhashCached: true,
 	})
 	actualSpent := spendableBudget

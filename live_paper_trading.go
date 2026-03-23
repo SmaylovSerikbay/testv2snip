@@ -78,7 +78,7 @@ const (
 	// Recovery Mode ($3.9): узкое окно + ликвидность, чтобы не брать «пустые» мёртвые пулы.
 	SNIPER_CURVE_MIN           = 0.0  // 0.0%
 	SNIPER_CURVE_MAX           = 0.25 // 25%
-	MIN_REAL_SOL               = 0.20 // минимум 0.2 SOL в кривой
+	MIN_REAL_SOL               = 0.15 // минимум 0.15 SOL в кривой
 	FAST_HEAVY_CHECK_CURVE_MAX = 0.05  // тяжёлые RPC-фильтры только до 5% кривой
 	CREATOR_BALANCE_CACHE_TTL  = 5 * time.Minute
 
@@ -90,11 +90,11 @@ const (
 	DEV_MAX_TXS_HOUR      = 7    // dev >7 tx/час — serial rugger (создаёт 4+ токенов)
 
 	// Выходы Final Recovery: hard SL -30%; TP только от +150%.
-	STOP_LOSS_HARD      = 0.85 // -15%
-	STOP_CONFIRM_LVL    = 0.85 // -15%
+	STOP_LOSS_HARD      = 0.90 // -10%
+	STOP_CONFIRM_LVL    = 0.90 // -10%
 	STOP_CONFIRM_N      = 1
 	SELL_SLIPPAGE_GUARD = 0.10            // >10% ожидаемого slip на выходе — подождать следующий тик
-	TAKE_PROFIT         = 1.30            // +30% — фиксируем весь объём
+	TAKE_PROFIT         = 1.20            // +20% — фиксируем весь объём
 	TRAIL_ACTIVATE      = 1.15            // трейлинг после +15% (было +40%)
 	TRAILING            = 0.12            // откат 12% от пика (было 16%)
 	TRAIL_MIN_AGE       = 5 * time.Second // был 10s — трейл раньше
@@ -109,7 +109,7 @@ const (
 	MAX_CREATE_TX_AGE       = 30 * time.Minute
 	MAX_READY_TO_SEND_DELAY = 4000 * time.Millisecond
 
-	VELOCITY_PAUSE         = 200 * time.Millisecond // быстрее реакция на импульс
+	VELOCITY_PAUSE         = 150 * time.Millisecond // быстрее реакция на импульс
 	VELOCITY_MIN_DPROGRESS = 0.02                   // min +2% за паузу — только первая волна
 	VELOCITY_MIN_DREALSOL  = 0.0
 	VELOCITY_MIN_DELTA_DP  = -0.0001 // -0.01% (разрешаем микро-откат на замере)
@@ -1623,11 +1623,12 @@ func hasSocialLinksInMetadata(mint string) (bool, string) {
 	s := strings.ToLower(string(body))
 	hasTg := strings.Contains(s, "t.me/") || strings.Contains(s, "telegram")
 	hasTw := strings.Contains(s, "twitter.com/") || strings.Contains(s, "x.com/")
-	if !hasTg && !hasTw {
+	hasWeb := strings.Contains(s, "http://") || strings.Contains(s, "https://") || strings.Contains(s, "\"website\"")
+	if !hasTg && !hasTw && !hasWeb {
 		metadataCache.mu.Lock()
-		metadataCache.m[mint] = metadataCacheEntry{ok: false, detail: "нет Telegram/Twitter в metadata", ts: time.Now()}
+		metadataCache.m[mint] = metadataCacheEntry{ok: false, detail: "нет social (tg/twitter/website) в metadata", ts: time.Now()}
 		metadataCache.mu.Unlock()
-		return false, "нет Telegram/Twitter в metadata"
+		return false, "нет social (tg/twitter/website) в metadata"
 	}
 	metadataCache.mu.Lock()
 	metadataCache.m[mint] = metadataCacheEntry{ok: true, detail: "social ok", ts: time.Now()}
@@ -3394,4 +3395,3 @@ func parseLaunchLabCreateTx(sig string) (mint, creator string, createBlockTime *
 	}
 	return mint, creator, createBlockTime
 }
-

@@ -2,11 +2,16 @@
 package main
 
 import (
+	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/binary"
+	"encoding/json"
 	"fmt"
 	"math/big"
+	"net/http"
 	"os"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -43,6 +48,11 @@ var (
 	pumpSellRetryPriorityFee uint64 = 8_000_000
 	pumpDirectRPC     *solanarpc.Client
 	pumpDirectRPCOnce sync.Once
+	priorityFeeCache struct {
+		mu       sync.Mutex
+		lamports uint64
+		ts       time.Time
+	}
 )
 
 func initPumpDirectFromEnv() {
@@ -104,6 +114,9 @@ func effectiveMicroLamportsPerCUPump(priorityLamports uint64) uint64 {
 
 func choosePriorityFeeLamports(baseTradeLamports uint64) uint64 {
 	fee := pumpPriorityFeeLamports
+	if dyn, ok := cachedDynamicPriorityFeeLamports(); ok && dyn > 0 {
+		fee = dyn
+	}
 	if baseTradeLamports > 0 && pumpPriorityMaxFeeBps > 0 {
 		capFee := (baseTradeLamports * pumpPriorityMaxFeeBps) / 10_000
 		if capFee > 0 && fee > capFee {
@@ -113,18 +126,105 @@ func choosePriorityFeeLamports(baseTradeLamports uint64) uint64 {
 	return fee
 }
 
-func sendPumpTransaction(ctx context.Context, rpcClient *solanarpc.Client, tx *solana.Transaction) (solana.Signature, error) {
+func cachedDynamicPriorityFeeLamports() (uint64, bool) {
+	priorityFeeCache.mu.Lock()
+	defer priorityFeeCache.mu.Unlock()
+	if priorityFeeCache.lamports == 0 {
+		return 0, false
+	}
+	if time.Since(priorityFeeCache.ts) > 90*time.Second {
+		return 0, false
+	}
+	return priorityFeeCache.lamports, true
+}
+
+// refreshDynamicPriorityFeeFromRPC обновляет кэш фи в фоне.
+// В buy-пути эта функция не вызывается, чтобы не добавлять latency от retry/backoff.
+func refreshDynamicPriorityFeeFromRPC() {
+	raw, err := rpc("getRecentPrioritizationFees", []interface{}{[]string{}})
+	if err != nil {
+		return
+	}
+	var out struct {
+		Result []struct {
+			PrioritizationFee uint64 `json:"prioritizationFee"`
+		} `json:"result"`
+	}
+	if json.Unmarshal(raw, &out) != nil || len(out.Result) == 0 {
+		return
+	}
+	fees := make([]uint64, 0, len(out.Result))
+	for _, r := range out.Result {
+		if r.PrioritizationFee > 0 {
+			fees = append(fees, r.PrioritizationFee)
+		}
+	}
+	if len(fees) == 0 {
+		return
+	}
+	sort.Slice(fees, func(i, j int) bool { return fees[i] < fees[j] })
+	// Берём верхний квартиль microLamports/CU как рабочий компромисс скорости/комиссии.
+	microPerCU := fees[(len(fees)*3)/4]
+	lamports := microPerCU * uint64(pumpComputeUnitLimit) / 1_000_000
+	if lamports == 0 {
+		lamports = pumpPriorityFeeLamports
+	}
+	priorityFeeCache.mu.Lock()
+	priorityFeeCache.lamports = lamports
+	priorityFeeCache.ts = time.Now()
+	priorityFeeCache.mu.Unlock()
+}
+
+func sendPumpTransaction(ctx context.Context, rpcClient *solanarpc.Client, tx *solana.Transaction) (solana.Signature, time.Time, error) {
 	if j := strings.TrimSpace(os.Getenv("JITO_BLOCK_ENGINE_URL")); j != "" {
-		_ = j
+		if sig, sentAt, err := sendJitoBundle(ctx, j, tx); err == nil {
+			return sig, sentAt, nil
+		}
 	}
 	sig, err := rpcClient.SendTransactionWithOpts(ctx, tx, solanarpc.TransactionOpts{
 		SkipPreflight:       false,
 		PreflightCommitment: solanarpc.CommitmentProcessed,
 	})
 	if err != nil {
-		return solana.Signature{}, fmt.Errorf("SendTransactionWithOpts: %w", err)
+		return solana.Signature{}, time.Time{}, fmt.Errorf("SendTransactionWithOpts: %w", err)
 	}
-	return sig, nil
+	return sig, time.Now(), nil
+}
+
+func sendJitoBundle(ctx context.Context, blockEngineURL string, tx *solana.Transaction) (solana.Signature, time.Time, error) {
+	rawTx, err := tx.MarshalBinary()
+	if err != nil {
+		return solana.Signature{}, time.Time{}, fmt.Errorf("marshal tx: %w", err)
+	}
+	b64Tx := base64.StdEncoding.EncodeToString(rawTx)
+	payload := map[string]interface{}{
+		"jsonrpc": "2.0",
+		"id":      1,
+		"method":  "sendBundle",
+		"params":  []interface{}{[]string{b64Tx}},
+	}
+	body, err := json.Marshal(payload)
+	if err != nil {
+		return solana.Signature{}, time.Time{}, err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, blockEngineURL, bytes.NewReader(body))
+	if err != nil {
+		return solana.Signature{}, time.Time{}, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return solana.Signature{}, time.Time{}, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return solana.Signature{}, time.Time{}, fmt.Errorf("jito status: %s", resp.Status)
+	}
+	sig := solana.Signature{}
+	if len(tx.Signatures) > 0 {
+		sig = tx.Signatures[0]
+	}
+	return sig, time.Now(), nil
 }
 
 func nativeBalanceLamports(ctx context.Context, rpcClient *solanarpc.Client, owner solana.PublicKey) (uint64, error) {
@@ -450,39 +550,39 @@ func mintTokenProgram(ctx context.Context, c *solanarpc.Client, mint solana.Publ
 	return acc.Value.Owner, nil
 }
 
-func swapPumpFun(ctx context.Context, rpcClient *solanarpc.Client, wallet solana.PrivateKey, mint solana.PublicKey, spendableLamports uint64) (solana.Signature, uint64, uint64, error) {
+func swapPumpFun(ctx context.Context, rpcClient *solanarpc.Client, wallet solana.PrivateKey, mint solana.PublicKey, spendableLamports uint64) (solana.Signature, uint64, uint64, time.Time, error) {
 	owner := wallet.PublicKey()
 	balBefore, err := nativeBalanceLamports(ctx, rpcClient, owner)
 	if err != nil {
-		return solana.Signature{}, 0, 0, err
+		return solana.Signature{}, 0, 0, time.Time{}, err
 	}
 
 	tokenProgram, err := mintTokenProgram(ctx, rpcClient, mint)
 	if err != nil {
-		return solana.Signature{}, 0, 0, err
+		return solana.Signature{}, 0, 0, time.Time{}, err
 	}
 	mintDecimals, err := mintDecimalsFromMintData(ctx, rpcClient, mint)
 	if err != nil {
-		return solana.Signature{}, 0, 0, err
+		return solana.Signature{}, 0, 0, time.Time{}, err
 	}
 
 	bondingCurve, _, err := derivePumpBondingCurve(mint)
 	if err != nil {
-		return solana.Signature{}, 0, 0, err
+		return solana.Signature{}, 0, 0, time.Time{}, err
 	}
 
 	globalPK, _, err := derivePumpGlobal()
 	if err != nil {
-		return solana.Signature{}, 0, 0, err
+		return solana.Signature{}, 0, 0, time.Time{}, err
 	}
 	gInfo, err := rpcClient.GetAccountInfoWithOpts(ctx, globalPK, &solanarpc.GetAccountInfoOpts{Encoding: solana.EncodingBase64, Commitment: solanarpc.CommitmentProcessed})
 	if err != nil || gInfo == nil || gInfo.Value == nil || gInfo.Value.Data == nil {
-		return solana.Signature{}, 0, 0, fmt.Errorf("global account missing")
+		return solana.Signature{}, 0, 0, time.Time{}, fmt.Errorf("global account missing")
 	}
 	gData := gInfo.Value.Data.GetBinary()
 	feeRecipient, feeBps, creatorFeeBps, err := parsePumpGlobalFees(gData)
 	if err != nil {
-		return solana.Signature{}, 0, 0, err
+		return solana.Signature{}, 0, 0, time.Time{}, err
 	}
 
 	spendableBudget := pumpSpendableWithBuffer(spendableLamports, pumpSpendableBufferBps)
@@ -493,13 +593,13 @@ func swapPumpFun(ctx context.Context, rpcClient *solanarpc.Client, wallet solana
 
 	natBal, err := rpcClient.GetBalance(ctx, owner, solanarpc.CommitmentProcessed)
 	if err != nil {
-		return solana.Signature{}, 0, 0, fmt.Errorf("getBalance: %w", err)
+		return solana.Signature{}, 0, 0, time.Time{}, fmt.Errorf("getBalance: %w", err)
 	}
 	if natBal == nil {
-		return solana.Signature{}, 0, 0, fmt.Errorf("getBalance: empty response")
+		return solana.Signature{}, 0, 0, time.Time{}, fmt.Errorf("getBalance: empty response")
 	}
 	if natBal.Value < minBalanceRequired {
-		return solana.Signature{}, 0, 0, fmt.Errorf(
+		return solana.Signature{}, 0, 0, time.Time{}, fmt.Errorf(
 			"insufficient SOL: после покупки нужен резерв ≥%.4f SOL + комиссии; есть %d, нужно ≥%d (spendable %d)",
 			float64(minSolReserveAfterPumpBuyLamports)/1e9,
 			natBal.Value,
@@ -510,15 +610,15 @@ func swapPumpFun(ctx context.Context, rpcClient *solanarpc.Client, wallet solana
 
 	bcInfo, err := rpcClient.GetAccountInfoWithOpts(ctx, bondingCurve, &solanarpc.GetAccountInfoOpts{Encoding: solana.EncodingBase64, Commitment: solanarpc.CommitmentProcessed})
 	if err != nil || bcInfo == nil || bcInfo.Value == nil || bcInfo.Value.Data == nil {
-		return solana.Signature{}, 0, 0, fmt.Errorf("bonding curve account missing")
+		return solana.Signature{}, 0, 0, time.Time{}, fmt.Errorf("bonding curve account missing")
 	}
 	bcData := bcInfo.Value.Data.GetBinary()
 	vTok, vSol, realToken, _, _, complete, creator, err := parsePumpBondingCurveData(bcData)
 	if err != nil {
-		return solana.Signature{}, 0, 0, err
+		return solana.Signature{}, 0, 0, time.Time{}, err
 	}
 	if complete {
-		return solana.Signature{}, 0, 0, fmt.Errorf("bonding curve complete (migrated)")
+		return solana.Signature{}, 0, 0, time.Time{}, fmt.Errorf("bonding curve complete (migrated)")
 	}
 
 	expectedOut, minOut := pumpComputeMinTokensOut(
@@ -529,7 +629,7 @@ func swapPumpFun(ctx context.Context, rpcClient *solanarpc.Client, wallet solana
 		minOut = 1
 	}
 	if err := pumpValidateBuyQuote(expectedOut, minOut, realToken, mintDecimals); err != nil {
-		return solana.Signature{}, 0, 0, fmt.Errorf("pump buy quote: %w", err)
+		return solana.Signature{}, 0, 0, time.Time{}, fmt.Errorf("pump buy quote: %w", err)
 	}
 
 	assocBonding, _, err := solana.FindProgramAddress(
@@ -537,7 +637,7 @@ func swapPumpFun(ctx context.Context, rpcClient *solanarpc.Client, wallet solana
 		solana.SPLAssociatedTokenAccountProgramID,
 	)
 	if err != nil {
-		return solana.Signature{}, 0, 0, err
+		return solana.Signature{}, 0, 0, time.Time{}, err
 	}
 
 	assocUser, _, err := solana.FindProgramAddress(
@@ -545,32 +645,32 @@ func swapPumpFun(ctx context.Context, rpcClient *solanarpc.Client, wallet solana
 		solana.SPLAssociatedTokenAccountProgramID,
 	)
 	if err != nil {
-		return solana.Signature{}, 0, 0, err
+		return solana.Signature{}, 0, 0, time.Time{}, err
 	}
 
 	creatorVault, _, err := derivePumpCreatorVault(creator)
 	if err != nil {
-		return solana.Signature{}, 0, 0, err
+		return solana.Signature{}, 0, 0, time.Time{}, err
 	}
 	eventAuth, _, err := derivePumpEventAuthority()
 	if err != nil {
-		return solana.Signature{}, 0, 0, err
+		return solana.Signature{}, 0, 0, time.Time{}, err
 	}
 	gVol, _, err := derivePumpGlobalVolumeAccumulator()
 	if err != nil {
-		return solana.Signature{}, 0, 0, err
+		return solana.Signature{}, 0, 0, time.Time{}, err
 	}
 	uVol, _, err := derivePumpUserVolumeAccumulator(owner)
 	if err != nil {
-		return solana.Signature{}, 0, 0, err
+		return solana.Signature{}, 0, 0, time.Time{}, err
 	}
 	feeCfg, _, err := derivePumpFeeConfig()
 	if err != nil {
-		return solana.Signature{}, 0, 0, err
+		return solana.Signature{}, 0, 0, time.Time{}, err
 	}
 	bondingCurveV2, _, err := derivePumpBondingCurveV2(mint)
 	if err != nil {
-		return solana.Signature{}, 0, 0, err
+		return solana.Signature{}, 0, 0, time.Time{}, err
 	}
 
 	data := encodePumpBuyExactSolInData(spendableBudget, minOut)
@@ -599,23 +699,23 @@ func swapPumpFun(ctx context.Context, rpcClient *solanarpc.Client, wallet solana
 
 	var preIxs []solana.Instruction
 	if _, err := ensurePumpUserATA(ctx, rpcClient, &preIxs, owner, mint, tokenProgram); err != nil {
-		return solana.Signature{}, 0, 0, fmt.Errorf("user ATA: %w", err)
+		return solana.Signature{}, 0, 0, time.Time{}, fmt.Errorf("user ATA: %w", err)
 	}
 
 	cuLimitIx, err := computebudget.NewSetComputeUnitLimitInstruction(pumpComputeUnitLimit).ValidateAndBuild()
 	if err != nil {
-		return solana.Signature{}, 0, 0, err
+		return solana.Signature{}, 0, 0, time.Time{}, err
 	}
 	priorityLamports := choosePriorityFeeLamports(spendableBudget)
 	microPerCU := effectiveMicroLamportsPerCUPump(priorityLamports)
 	cuPriceIx, err := computebudget.NewSetComputeUnitPriceInstruction(microPerCU).ValidateAndBuild()
 	if err != nil {
-		return solana.Signature{}, 0, 0, err
+		return solana.Signature{}, 0, 0, time.Time{}, err
 	}
 
 	recent, err := rpcClient.GetLatestBlockhash(ctx, solanarpc.CommitmentFinalized)
 	if err != nil {
-		return solana.Signature{}, 0, 0, err
+		return solana.Signature{}, 0, 0, time.Time{}, err
 	}
 
 	all := append([]solana.Instruction{}, cuLimitIx, cuPriceIx)
@@ -624,7 +724,7 @@ func swapPumpFun(ctx context.Context, rpcClient *solanarpc.Client, wallet solana
 
 	tx, err := solana.NewTransaction(all, recent.Value.Blockhash, solana.TransactionPayer(owner))
 	if err != nil {
-		return solana.Signature{}, 0, 0, err
+		return solana.Signature{}, 0, 0, time.Time{}, err
 	}
 	_, err = tx.Sign(func(key solana.PublicKey) *solana.PrivateKey {
 		if key.Equals(owner) {
@@ -633,19 +733,19 @@ func swapPumpFun(ctx context.Context, rpcClient *solanarpc.Client, wallet solana
 		return nil
 	})
 	if err != nil {
-		return solana.Signature{}, 0, 0, err
+		return solana.Signature{}, 0, 0, time.Time{}, err
 	}
 
-	sig, err := sendPumpTransaction(ctx, rpcClient, tx)
+	sig, sentAt, err := sendPumpTransaction(ctx, rpcClient, tx)
 	if err != nil {
-		return solana.Signature{}, 0, 0, err
+		return solana.Signature{}, 0, 0, time.Time{}, err
 	}
 	// Фактические лампорты, списанные с кошелька, важнее оценок (учёт комиссий/priority/реального исполнения).
 	actualSpent, ok := waitNativeBalanceDelta(ctx, rpcClient, owner, balBefore, false)
 	if !ok || actualSpent == 0 {
 		actualSpent = spendableBudget
 	}
-	return sig, expectedOut, actualSpent, nil
+	return sig, expectedOut, actualSpent, sentAt, nil
 }
 
 func pumpQuoteMinSolForSell(tokenAmount, vSol, vToken uint64, slipBps uint64) uint64 {
@@ -823,7 +923,7 @@ func swapPumpFunSellAmount(ctx context.Context, rpcClient *solanarpc.Client, wal
 	if err != nil {
 		return solana.Signature{}, 0, err
 	}
-	sig, err := sendPumpTransaction(ctx, rpcClient, tx)
+	sig, _, err := sendPumpTransaction(ctx, rpcClient, tx)
 	if err != nil {
 		return solana.Signature{}, 0, err
 	}
@@ -957,18 +1057,18 @@ func liveUsePumpDirectClose(pos *Position) bool {
 }
 
 // PumpDirectBuy — покупка на bonding curve; tokenRaw — ожидаемые атомы по котировке; solIn — lamports в инструкции.
-func PumpDirectBuy(mintStr string, spendLamports uint64) (tokenRaw uint64, sig string, solIn uint64, err error) {
+func PumpDirectBuy(mintStr string, spendLamports uint64) (tokenRaw uint64, sig string, solIn uint64, sentAt time.Time, err error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
 	defer cancel()
 	mint, err := solana.PublicKeyFromBase58(mintStr)
 	if err != nil {
-		return 0, "", 0, err
+		return 0, "", 0, time.Time{}, err
 	}
-	s, expectedOut, spendBudget, err := swapPumpFun(ctx, rpcPumpDirect(), livePrivKey, mint, spendLamports)
+	s, expectedOut, spendBudget, sentAt, err := swapPumpFun(ctx, rpcPumpDirect(), livePrivKey, mint, spendLamports)
 	if err != nil {
-		return 0, "", 0, err
+		return 0, "", 0, time.Time{}, err
 	}
-	return expectedOut, s.String(), spendBudget, nil
+	return expectedOut, s.String(), spendBudget, sentAt, nil
 }
 
 // PumpDirectSellAll — продажа всего баланса токена; solOutLamports — грубая оценка выхода SOL (до slippage в min_out).

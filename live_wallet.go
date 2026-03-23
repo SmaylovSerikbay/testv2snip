@@ -54,3 +54,17 @@ func syncWalletBalanceUSD(w *Wallet) {
 	w.Balance = usd
 	w.mu.Unlock()
 }
+
+func syncWalletBalanceUSDFresh(w *Wallet) {
+	if !liveTradingEnabled() {
+		return
+	}
+	sol, err := rpcRefreshBalanceSOLCached(livePub.String())
+	if err != nil {
+		return
+	}
+	usd := sol * getSolUSD()
+	w.mu.Lock()
+	w.Balance = usd
+	w.mu.Unlock()
+}

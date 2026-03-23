@@ -60,7 +60,7 @@ const (
 	PRICE_TICK = 3 * time.Second
 	MAX_HOLD   = 3 * time.Minute
 	// Сервисные интервалы/лимиты RPC для защиты от -32429.
-	BALANCE_CHECK_INTERVAL = 10 * time.Second
+	BALANCE_CHECK_INTERVAL = 30 * time.Second
 	RPC_RETRY_BASE_DELAY  = 2 * time.Second
 	RPC_MAX_RETRIES       = 4
 	RPC_MAX_CONCURRENT    = 3
@@ -100,7 +100,7 @@ const (
 	VELOCITY_MIN_DELTA_DP  = -0.0001 // -0.01% (разрешаем микро-откат на замере)
 	LIVE_FIXED_BUY_SOL     = 0.015 // target fixed buy size
 	LIVE_BUY_BALANCE_SHARE = 0.85  // or 85% of available SOL after reserve
-	ACTIVE_POSITIONS_FILE  = "active_positions.json"
+	ACTIVE_POSITIONS_FILE  = "current_trades.json"
 
 	// Логи: false = не печатать каждый отсев (только сводка раз в минуту + успешный ВХОД)
 	VERBOSE_REJECT_LOGS = false
@@ -321,6 +321,7 @@ type NewToken struct {
 	BondingCurve string // pump: bonding curve PDA | launchlab: pool state PDA
 	Sig          string
 	Source       string // "pump" | "launchlab" (пусто = pump)
+	DetectedAt   time.Time
 }
 
 // postTokenBal — элемент meta.postTokenBalances в getTransaction (jsonParsed)
@@ -462,7 +463,11 @@ func (w *Wallet) loadActivePositions() {
 	}
 	raw, err := os.ReadFile(ACTIVE_POSITIONS_FILE)
 	if err != nil || len(raw) == 0 {
-		return
+		legacyRaw, legacyErr := os.ReadFile("active_positions.json")
+		if legacyErr != nil || len(legacyRaw) == 0 {
+			return
+		}
+		raw = legacyRaw
 	}
 	var list []persistedPosition
 	if json.Unmarshal(raw, &list) != nil {
@@ -515,7 +520,7 @@ func newWallet() *Wallet {
 		ExitLoss: make(map[string]int),
 	}
 	if liveTradingEnabled() {
-		syncWalletBalanceUSD(w)
+		syncWalletBalanceUSDFresh(w)
 		w.Start = w.Balance
 		w.loadActivePositions()
 	}
@@ -1151,6 +1156,21 @@ func rpcGetBalanceSOLCached(pub string, ttl time.Duration) (float64, error) {
 	return sol, nil
 }
 
+func rpcRefreshBalanceSOLCached(pub string) (float64, error) {
+	sol, err := rpcGetBalanceSOL(pub)
+	if err != nil {
+		return 0, err
+	}
+	now := time.Now()
+	balanceCache.mu.Lock()
+	if balanceCache.m == nil {
+		balanceCache.m = make(map[string]balCacheEntry)
+	}
+	balanceCache.m[pub] = balCacheEntry{sol: sol, ts: now}
+	balanceCache.mu.Unlock()
+	return sol, nil
+}
+
 // freezeAuthority ≠ null — опасно. mintAuthority часто = bonding curve / pool (норма) или null.
 func rpcMintAuthorities(mint, bondingCurve string, extraAllow ...string) (badMintAuth, badFreeze bool, err error) {
 	data, err := rpc("getAccountInfo", []interface{}{
@@ -1568,30 +1588,84 @@ func antiScamCheck(mint, mintAuthorityRef, liquidityVault, creator string, creat
 	if sol > creatorMaxSOL {
 		return false, fmt.Sprintf("SOL создателя %.1f > %.0f (подозр.)", sol, creatorMaxSOL)
 	}
-	badMint, badFreeze, err := rpcMintAuthorities(mint, mintAuthorityRef, extraMintAuth...)
-	if err != nil {
-		return false, "mint RPC"
+
+	type filterResult struct {
+		key   string
+		ok    bool
+		detail string
 	}
-	if badMint {
-		return false, "mintAuthority не кривая (чужая чеканка)"
-	}
-	if badFreeze {
-		return false, "freezeAuthority (заморозка счетов)"
-	}
-	okSocial, socialDetail := hasSocialLinksInMetadata(mint)
-	if !okSocial {
-		return false, socialDetail
-	}
-	if sold, soldDetail := devSoldInFirstMinute(creator, createAt); sold {
-		return false, soldDetail
-	}
-	okBundle, bundleDetail := bundledBuyersCheck(mint, creator, createAt)
-	if !okBundle {
-		return false, bundleDetail
-	}
-	ok2, hd := rpcHolderDistributionOK(mint, liquidityVault, creator, minCurveShare, maxNonCurveShare)
-	if !ok2 {
-		return false, hd
+	results := make(chan filterResult, 5)
+	var wg sync.WaitGroup
+	wg.Add(5)
+
+	// mint check
+	go func() {
+		defer wg.Done()
+		badMint, badFreeze, err := rpcMintAuthorities(mint, mintAuthorityRef, extraMintAuth...)
+		if err != nil {
+			results <- filterResult{key: "mint", ok: false, detail: "mint RPC"}
+			return
+		}
+		if badMint {
+			results <- filterResult{key: "mint", ok: false, detail: "mintAuthority не кривая (чужая чеканка)"}
+			return
+		}
+		if badFreeze {
+			results <- filterResult{key: "mint", ok: false, detail: "freezeAuthority (заморозка счетов)"}
+			return
+		}
+		results <- filterResult{key: "mint", ok: true, detail: "mint ok"}
+	}()
+
+	// creator history
+	go func() {
+		defer wg.Done()
+		if sold, soldDetail := devSoldInFirstMinute(creator, createAt); sold {
+			results <- filterResult{key: "creator", ok: false, detail: soldDetail}
+			return
+		}
+		results <- filterResult{key: "creator", ok: true, detail: "creator ok"}
+	}()
+
+	// liquidity / holders check
+	go func() {
+		defer wg.Done()
+		ok2, hd := rpcHolderDistributionOK(mint, liquidityVault, creator, minCurveShare, maxNonCurveShare)
+		results <- filterResult{key: "liquidity", ok: ok2, detail: hd}
+	}()
+
+	// social metadata check
+	go func() {
+		defer wg.Done()
+		okSocial, socialDetail := hasSocialLinksInMetadata(mint)
+		results <- filterResult{key: "social", ok: okSocial, detail: socialDetail}
+	}()
+
+	// bundled buyers check
+	go func() {
+		defer wg.Done()
+		okBundle, bundleDetail := bundledBuyersCheck(mint, creator, createAt)
+		results <- filterResult{key: "bundle", ok: okBundle, detail: bundleDetail}
+	}()
+
+	wg.Wait()
+	close(results)
+
+	hd := ""
+	socialDetail := ""
+	bundleDetail := ""
+	for r := range results {
+		if !r.ok {
+			return false, r.detail
+		}
+		switch r.key {
+		case "liquidity":
+			hd = r.detail
+		case "social":
+			socialDetail = r.detail
+		case "bundle":
+			bundleDetail = r.detail
+		}
 	}
 	return true, hd + fmt.Sprintf(" | %s | %s | dev %.2f SOL", socialDetail, bundleDetail, sol)
 }
@@ -1694,10 +1768,15 @@ func listenProgram(programID, prettyLabel string, wantLogs func([]string) bool, 
 				continue
 			}
 			if wantLogs(v.Logs) {
-				ch <- NewToken{Sig: v.Signature, Source: tokenSrc}
+				ch <- NewToken{Sig: v.Signature, Source: tokenSrc, DetectedAt: time.Now()}
 			}
 		}
 	}
+}
+
+// listenPumpWSS — отдельный WSS-слушатель логов Pump.fun для минимальной задержки на детекте.
+func listenPumpWSS(ch chan<- NewToken) {
+	listenProgram(PUMP_PROGRAM, "Pump.fun", pumpCreateFromLogs, ch, "pump")
 }
 
 // ════════════════════════════════════════════════════
@@ -1763,7 +1842,7 @@ func (w *Wallet) openLive(tok NewToken, sym string, spot float64, capitalUSD flo
 	if solPrice < 1 {
 		return false
 	}
-	solBal, err := rpcGetBalanceSOL(livePub.String())
+	solBal, err := rpcGetBalanceSOLCached(livePub.String(), BALANCE_CHECK_INTERVAL)
 	if err != nil {
 		consoleMu.Lock()
 		fmt.Println(red("❌ RPC баланс: " + err.Error()))
@@ -1772,11 +1851,7 @@ func (w *Wallet) openLive(tok NewToken, sym string, spot float64, capitalUSD flo
 	}
 	reserve := liveReserveSOL
 	_ = capitalUSD
-	maxByBalance := (solBal - reserve) * LIVE_BUY_BALANCE_SHARE
-	solForSwap := LIVE_FIXED_BUY_SOL
-	if maxByBalance < solForSwap {
-		solForSwap = maxByBalance
-	}
+	solForSwap := (solBal - reserve) * LIVE_BUY_BALANCE_SHARE
 	if solForSwap > solBal-reserve {
 		solForSwap = solBal - reserve
 	}
@@ -1793,16 +1868,24 @@ func (w *Wallet) openLive(tok NewToken, sym string, spot float64, capitalUSD flo
 	var tokenRaw uint64
 	var sig string
 	var solIn uint64
+	var sentAt time.Time
 	fmt.Println(gray("⏳ Pump.fun: прямая покупка на кривой…"))
-	tokenRaw, sig, solIn, err = PumpDirectBuy(tok.Mint, lamports)
+	tokenRaw, sig, solIn, sentAt, err = PumpDirectBuy(tok.Mint, lamports)
 	if err != nil {
 		consoleMu.Lock()
 		fmt.Printf("%s %v\n", red("❌ Pump buy:"), err)
 		consoleMu.Unlock()
-		syncWalletBalanceUSD(w)
+		syncWalletBalanceUSDFresh(w)
 		return false
 	}
-	syncWalletBalanceUSD(w)
+	if !tok.DetectedAt.IsZero() && !sentAt.IsZero() {
+		delayMs := sentAt.Sub(tok.DetectedAt).Milliseconds()
+		consoleMu.Lock()
+		fmt.Printf("%s Transaction Sent | %s | %s | delay=%dms\n",
+			gray("⏱"), "$"+short(tok.Mint), sentAt.Format(time.RFC3339Nano), delayMs)
+		consoleMu.Unlock()
+	}
+	syncWalletBalanceUSDFresh(w)
 	tokens := float64(tokenRaw) / 1e6 // pump: 6 decimals
 	entry := spot
 	if tokens > 0 {
@@ -1828,6 +1911,10 @@ func (w *Wallet) openLive(tok NewToken, sym string, spot float64, capitalUSD flo
 		TokenRaw:     tokenRaw,
 		BuyLamports:  solIn,
 		Source:       tokenSource(tok),
+	}
+	if !tok.DetectedAt.IsZero() {
+		fmt.Printf("%s Transaction Confirmed | %s | +%dms\n",
+			gray("⏱"), "$"+short(tok.Mint), time.Since(tok.DetectedAt).Milliseconds())
 	}
 	w.saveActivePositionsLocked()
 	bal := w.Balance
@@ -1898,7 +1985,7 @@ func (w *Wallet) closePosLive(pos *Position, reason string, spot float64) {
 		consoleMu.Lock()
 		fmt.Println(yellow("⚠ LIVE выход: только Pump.fun на кривой — эта позиция не pump; закрой вручную на DEX."))
 		consoleMu.Unlock()
-		syncWalletBalanceUSD(w)
+		syncWalletBalanceUSDFresh(w)
 		w.mu.Lock()
 		w.Pos[pos.Mint] = pos
 		w.saveActivePositionsLocked()
@@ -1935,7 +2022,7 @@ func (w *Wallet) closePosLive(pos *Position, reason string, spot float64) {
 		w.mu.Unlock()
 		return
 	}
-	syncWalletBalanceUSD(w)
+	syncWalletBalanceUSDFresh(w)
 
 	net := float64(solOut) / 1e9 * solUSD
 	pnl := net - pos.CapitalUSD
@@ -2325,12 +2412,19 @@ func main() {
 	}
 
 	refreshSolPriceUSD()
+	refreshDynamicPriorityFeeFromRPC()
 	sp := getSolUSD()
 	fmt.Printf("%s SOL/USD: $%.2f (CoinGecko, автообновление ~90 с)\n", green("✓"), sp)
 	go func() {
 		t := time.NewTicker(90 * time.Second)
 		for range t.C {
 			refreshSolPriceUSD()
+		}
+	}()
+	go func() {
+		t := time.NewTicker(20 * time.Second)
+		for range t.C {
+			refreshDynamicPriorityFeeFromRPC()
 		}
 	}()
 
@@ -2347,9 +2441,8 @@ func main() {
 		}
 	}
 	if liveTradingEnabled() {
-		fixedUSD := LIVE_FIXED_BUY_SOL * getSolUSD()
-		fmt.Printf("%s Баланс: %s (ончейн) | Ставка: до %.3f SOL (лимит %.0f%% от доступного) (~$%.2f) | Макс позиций: %d\n",
-			bold("▶"), green(fmt.Sprintf("$%.2f", wallet.Balance)), LIVE_FIXED_BUY_SOL, LIVE_BUY_BALANCE_SHARE*100, fixedUSD, MAX_POSITIONS)
+		fmt.Printf("%s Баланс: %s (ончейн) | Ставка: FULL PORT %.0f%% от доступного SOL (после резерва) | Макс позиций: %d\n",
+			bold("▶"), green(fmt.Sprintf("$%.2f", wallet.Balance)), LIVE_BUY_BALANCE_SHARE*100, MAX_POSITIONS)
 	} else {
 		fmt.Printf("%s Баланс: %s | Ставка: %.2f%% от банка (min $%.2f) → сейчас ~$%.2f на сделку | Макс позиций: %d\n",
 			bold("▶"), green(fmt.Sprintf("$%.2f", PAPER_BALANCE)), BET_PCT_OF_BALANCE*100, MIN_STAKE_USD,
@@ -2367,7 +2460,7 @@ func main() {
 	// Больше слотов: пока один токен в sleep(velocity), остальные create обрабатываются
 	sem := make(chan struct{}, RPC_MAX_CONCURRENT)
 
-	go listenProgram(PUMP_PROGRAM, "Pump.fun", pumpCreateFromLogs, tokenCh, "pump")
+	go listenPumpWSS(tokenCh)
 	go listenProgram(LAUNCHLAB_PROGRAM, "Raydium LaunchLab", launchLabInitFromLogs, tokenCh, "launchlab")
 
 	go func() {
@@ -2416,6 +2509,9 @@ func main() {
 				if _, loaded := seen.LoadOrStore(mint, true); loaded {
 					return
 				}
+				if tok.DetectedAt.IsZero() {
+					tok.DetectedAt = time.Now()
+				}
 
 				wallet.mu.Lock()
 				cnt := len(wallet.Pos)
@@ -2426,6 +2522,10 @@ func main() {
 				}
 
 				sym := "$" + short(mint)
+				consoleMu.Lock()
+				fmt.Printf("%s Token Detected | %s | %s | %s\n",
+					gray("⏱"), sym, src, tok.DetectedAt.Format(time.RFC3339Nano))
+				consoleMu.Unlock()
 
 				if createAt != nil && time.Since(*createAt) > MAX_CREATE_TX_AGE {
 					logRejectLine("stale_tx", sym, mint, fmt.Sprintf(
@@ -2492,6 +2592,12 @@ func main() {
 				if !ok {
 					logRejectLine("scam", sym, mint, "фильтр: "+scamMeta)
 					return
+				}
+				if !tok.DetectedAt.IsZero() {
+					consoleMu.Lock()
+					fmt.Printf("%s Filters Passed | %s | +%dms\n",
+						gray("⏱"), sym, time.Since(tok.DetectedAt).Milliseconds())
+					consoleMu.Unlock()
 				}
 
 				atomic.AddInt64(&funnelPassScam, 1)

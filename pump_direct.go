@@ -39,6 +39,7 @@ var (
 	pumpSlippageBps          uint64 = 4000 // 40% bps для min_out на кривой; PUMP_SLIPPAGE_BPS в .env
 	pumpPriorityFeeLamports  uint64 = 120_000
 	pumpPriorityMaxFeeBps    uint64 = 120 // максимум приоритета как доля от размера сделки (1.2%)
+	pumpSellRetryPriorityFee uint64 = 8_000_000
 	pumpDirectRPC     *solanarpc.Client
 	pumpDirectRPCOnce sync.Once
 )
@@ -883,6 +884,31 @@ func swapPumpFunSellWithFallback(
 			continue
 		}
 		sig, gross, err := swapPumpFunSellAmount(ctx, rpcClient, wallet, mint, amt, slipBps)
+		if err == nil {
+			return sig, gross, nil
+		}
+		lastErr = err
+		if !isPumpOverflow6024(err) {
+			return solana.Signature{}, 0, err
+		}
+	}
+	// Аварийный повтор: 50% slippage + повышенный priority fee (как requested anti-6024 path).
+	prevPriority := pumpPriorityFeeLamports
+	prevCap := pumpPriorityMaxFeeBps
+	if pumpPriorityFeeLamports < pumpSellRetryPriorityFee {
+		pumpPriorityFeeLamports = pumpSellRetryPriorityFee
+	}
+	pumpPriorityMaxFeeBps = 0 // на аварийном проходе не режем fee cap
+	defer func() {
+		pumpPriorityFeeLamports = prevPriority
+		pumpPriorityMaxFeeBps = prevCap
+	}()
+
+	for _, amt := range amounts {
+		if amt == 0 {
+			continue
+		}
+		sig, gross, err := swapPumpFunSellAmount(ctx, rpcClient, wallet, mint, amt, 5000)
 		if err == nil {
 			return sig, gross, nil
 		}

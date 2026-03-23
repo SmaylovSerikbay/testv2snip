@@ -726,6 +726,10 @@ func curveVelocityOK(bc string, snap0 *curveSnap, source string, createAt *time.
 	if snap0 == nil || snap0.Complete {
 		return nil, false, "нет снимка", "velocity"
 	}
+	// Для aggressive профиля — максимальная скорость входа без дополнительной задержки.
+	if envSignalProfile() == "aggressive" {
+		return snap0, true, "aggressive: zero-delay pass", ""
+	}
 	if envSkipVelocity() {
 		return snap0, true, "SKIP_VELOCITY=1 (без паузы и второго замера)", ""
 	}

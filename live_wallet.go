@@ -1,0 +1,56 @@
+// Боевой режим: ключ из env, без сторонних swap API — сделки только через pump_direct.go.
+package main
+
+import (
+	"fmt"
+	"os"
+	"strings"
+
+	"github.com/gagliardetto/solana-go"
+)
+
+const (
+	// Резерв SOL на комиссии (не включаем в сумму свапа)
+	liveReserveSOL = 0.012
+)
+
+var (
+	livePrivKey solana.PrivateKey
+	livePub     solana.PublicKey
+)
+
+func liveTradingEnabled() bool {
+	return strings.TrimSpace(os.Getenv("LIVE_TRADING")) == "1"
+}
+
+func initLiveTrading() error {
+	if !liveTradingEnabled() {
+		return nil
+	}
+	s := strings.TrimSpace(os.Getenv("SOLANA_PRIVATE_KEY"))
+	if s == "" {
+		return fmt.Errorf("LIVE_TRADING=1: задай SOLANA_PRIVATE_KEY (base58 от Phantom Export Private Key)")
+	}
+	pk, err := solana.PrivateKeyFromBase58(s)
+	if err != nil {
+		return fmt.Errorf("SOLANA_PRIVATE_KEY: %w", err)
+	}
+	livePrivKey = pk
+	livePub = pk.PublicKey()
+	initPumpDirectFromEnv()
+	return nil
+}
+
+func syncWalletBalanceUSD(w *Wallet) {
+	if !liveTradingEnabled() {
+		return
+	}
+	sol, err := rpcGetBalanceSOL(livePub.String())
+	if err != nil {
+		return
+	}
+	usd := sol * getSolUSD()
+	w.mu.Lock()
+	w.Balance = usd
+	w.mu.Unlock()
+}

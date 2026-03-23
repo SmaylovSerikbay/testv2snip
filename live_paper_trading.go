@@ -22,7 +22,21 @@ import (
 
 	"github.com/gagliardetto/solana-go"
 	"github.com/gorilla/websocket"
+	"github.com/joho/godotenv"
 )
+
+// Тестовые флаги окружения (для отладки, не для «боевой» охоты за качеством).
+func envSkipVelocity() bool   { return strings.TrimSpace(os.Getenv("SKIP_VELOCITY")) == "1" }
+func envSkipAntiScam() bool   { return strings.TrimSpace(os.Getenv("SKIP_ANTI_SCAM")) == "1" }
+func envSignalProfile() string {
+	p := strings.TrimSpace(strings.ToLower(os.Getenv("SIGNAL_PROFILE")))
+	switch p {
+	case "strict", "balanced", "aggressive":
+		return p
+	default:
+		return "balanced"
+	}
+}
 
 // ════════════════════════════════════════════════════
 //  КОНФИГ
@@ -30,7 +44,7 @@ import (
 
 const (
 	HELIUS_API_KEY = "1859e3e5-5d82-476e-a121-8d5f57705cf7"
-	PAPER_BALANCE = 7.0
+	PAPER_BALANCE  = 7.0
 	// Доля баланса на одну сделку: при $7 → ~$1; после плюса ставка считается от нового банка
 	BET_PCT_OF_BALANCE = 1.0 / 7.0
 	MIN_STAKE_USD      = 0.25 // не открываем позицию мельче (пыль / шум)
@@ -38,50 +52,49 @@ const (
 
 	// Pump.fun: Global fee_basis_points = 100 → 1% с покупки и с продажи (документация программы)
 	PUMP_FEE_BPS = 100
-	// Проскальзывание/хуже исполнение относительно spot (консервативно)
-	SLIPPAGE_BPS = 60
-	// Оценка сети: base + priority ~N лампортов на подпись (бумага; на mainnet меняется)
-	SOLANA_TX_LAMPORTS = 18_000.0
+	// Проскальзывание: ниже — меньше «налога» на бумажный PnL
+	SLIPPAGE_BPS = 35
+	// Оценка сети на одну подпись (бумага); live — по факту RPC / pump
+	SOLANA_TX_LAMPORTS = 12_000.0
 
 	PRICE_TICK = 3 * time.Second
 	MAX_HOLD   = 7 * time.Minute
 
-	// ── Снайпер (paper): шире окно + мягче скам = чаще кандидаты; цель — чаще входы (не гарантия 1/2мин — зависит от сети)
-	SNIPER_CURVE_MIN = 0.007 // ≥0.7%
-	SNIPER_CURVE_MAX = 0.088 // ≤8.8%
-	MIN_REAL_SOL     = 0.12 // минимум SOL в кривой
+	// ── Снайпер: баланс «чистота/частота», чтобы были реальные входы за сессию
+	SNIPER_CURVE_MIN = 0.006 // ≥0.6% по кривой
+	SNIPER_CURVE_MAX = 0.10  // ≤10%
+	MIN_REAL_SOL     = 0.08  // минимум реального SOL в кривой
 
-	// Анти-скам — чуть мягче, чтобы не резать всё на velocity/скаме
-	CREATOR_SOL_MIN     = 0.045
+	// Анти-скам
+	CREATOR_SOL_MIN     = 0.04 // не слишком режем поток, но отсеиваем совсем пустых
 	CREATOR_SOL_SUSPECT = 80.0
 	MAX_NONCURVE_PCT    = 0.12
 
-	// Выходы: быстрый скальп
+	// Выходы: ловим импульс, но не держим бесконечно
 	STOP_LOSS        = 0.90
-	TAKE_PROFIT      = 1.35 // +35% spot по цели доходности (бумага)
-	TRAIL_ACTIVATE   = 1.08
-	TRAILING         = 0.07
-	TRAIL_MIN_AGE    = 18 * time.Second
-	TRAIL_MIN_PROFIT = 1.035
-	BREAKEVEN_ARM    = 1.05
-	SCRATCH_AFTER    = 90 * time.Second
-	SCRATCH_IF_BELOW = 0.985
-	NO_IMPULSE_AFTER = 2*time.Minute + 30*time.Second
-	NO_IMPULSE_NEED  = 1.025
+	TAKE_PROFIT      = 2.0 // полный выход ~+100% spot (икс-зона; бумага)
+	TRAIL_ACTIVATE   = 1.12 // трейлинг после уверенного плюса
+	TRAILING         = 0.10 // чуть плотнее, чтобы не отдавать откат
+	TRAIL_MIN_AGE    = 25 * time.Second
+	TRAIL_MIN_PROFIT = 1.06 // пол трейлинга не ниже ~+6% к входу
+	BREAKEVEN_ARM    = 1.06
+	SCRATCH_AFTER    = 2 * time.Minute  // не зависаем в флэте слишком долго
+	SCRATCH_IF_BELOW = 0.97             // скретч только если совсем плоско
+	NO_IMPULSE_AFTER = 4 * time.Minute // «нет импульса» — после умеренной консолидации
+	NO_IMPULSE_NEED  = 1.04            // пик должен хотя бы +4% к входу, иначе выход
 
 	// Если create-транзакция старше — не считаем «только что залистились» (защита от кривых сигналов)
-	MAX_CREATE_TX_AGE = 45 * time.Minute
+	MAX_CREATE_TX_AGE = 30 * time.Minute
 
-	// Velocity: если в сводке копится vel_мало — ещё ниже; vel_RPC — RPC/лимиты, не пороги
-	VELOCITY_PAUSE         = 2200 * time.Millisecond
-	VELOCITY_MIN_DPROGRESS = 0.0005 // ~0.05 п.п. progress
-	VELOCITY_MIN_DREALSOL  = 0.004  // +0.004 SOL за окно
+	VELOCITY_PAUSE         = 1400 * time.Millisecond // ещё короче: быстрее ловим ранний импульс
+	VELOCITY_MIN_DPROGRESS = 0.00008                 // ~0.008 п.п. за окно
+	VELOCITY_MIN_DREALSOL  = 0.0004                  // +0.0004 SOL за окно
 
 	// Логи: false = не печатать каждый отсев (только сводка раз в минуту + успешный ВХОД)
 	VERBOSE_REJECT_LOGS = false
 )
 
-// Wrapped SOL mint — для Jupiter Price API
+// Wrapped SOL mint (wrap/совместимость)
 const WSOL_MINT = "So11111111111111111111111111111111111111112"
 
 // Частые SPL в tx — не mint pump-монеты (раньше цепляли первый баланс → USDC и т.д.)
@@ -102,11 +115,11 @@ var (
 
 // Воронка входа (накопительно с запуска) — видно, до какого шага доходят токены
 var (
-	funnelInWindow  int64 // прошли кривую+ликвидность, до velocity
-	funnelPassVel   int64 // прошли velocity
-	funnelPassScam  int64 // прошли анти-скам
-	funnelOpenOK    int64 // open() = true
-	funnelOpenFail  int64 // open() = false (редко: баланс/лимит)
+	funnelInWindow int64 // прошли кривую+ликвидность, до velocity
+	funnelPassVel  int64 // прошли velocity
+	funnelPassScam int64 // прошли анти-скам
+	funnelOpenOK   int64 // open() = true
+	funnelOpenFail int64 // open() = false (редко: баланс/лимит)
 )
 
 // Подписи ключей в минутной сводке (рус./кратко)
@@ -227,7 +240,7 @@ func printFunnelLine() {
 	if iw == 0 {
 		fmt.Println(gray("   (если «в_окне»=0 — почти всё отсекается до velocity: no_price / пусто / поздно / low_sol)"))
 	} else if v == 0 {
-		fmt.Println(gray(fmt.Sprintf("   (были в окне кривой, но velocity за %v ещё ни разу не прошёл — узкое место)", VELOCITY_PAUSE)))
+		fmt.Println(gray(fmt.Sprintf("   (были в окне кривой, но velocity ещё ни разу не прошёл — узкое место; проф=%s)", envSignalProfile())))
 	} else if sc == 0 {
 		fmt.Println(gray("   (velocity был, анти-скам пока не пропустил ни одного)"))
 	}
@@ -268,6 +281,9 @@ func printEntryPace() {
 
 const PUMP_PROGRAM = "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P"
 
+// LAUNCHLAB_PROGRAM — Raydium LaunchLab (mainnet), см. docs.raydium.io
+const LAUNCHLAB_PROGRAM = "LanMV9sAd7wArD4vJFi2qDdfnVhFxYSUg6eADduJ3uj"
+
 // Pump.fun: decimals у монет на кривой = 6 (как в Global / bonding curve)
 const pumpTokenDecimals = 6
 
@@ -290,8 +306,9 @@ var (
 
 type NewToken struct {
 	Mint         string
-	BondingCurve string // адрес bonding curve аккаунта
+	BondingCurve string // pump: bonding curve PDA | launchlab: pool state PDA
 	Sig          string
+	Source       string // "pump" | "launchlab" (пусто = pump)
 }
 
 // postTokenBal — элемент meta.postTokenBalances в getTransaction (jsonParsed)
@@ -319,6 +336,37 @@ type Position struct {
 	CapitalUSD     float64 // сколько USD снято с баланса (гросс)
 	OpenedAt       time.Time
 	BreakevenArmed bool
+	// Боевой режим: фактические лампорты на входе и raw-баланс SPL для продажи
+	Live          bool
+	TokenRaw      uint64
+	BuyLamports   uint64
+	Source        string // pump | launchlab
+}
+
+// snapshotPosition — копия полей без mutex (для closePos из горутины мониторинга).
+func snapshotPosition(p *Position) *Position {
+	return &Position{
+		Mint:           p.Mint,
+		BondingCurve:   p.BondingCurve,
+		Symbol:         p.Symbol,
+		EntryPrice:     p.EntryPrice,
+		Tokens:         p.Tokens,
+		PeakPrice:      p.PeakPrice,
+		CapitalUSD:     p.CapitalUSD,
+		OpenedAt:       p.OpenedAt,
+		BreakevenArmed: p.BreakevenArmed,
+		Live:           p.Live,
+		TokenRaw:       p.TokenRaw,
+		BuyLamports:    p.BuyLamports,
+		Source:         p.Source,
+	}
+}
+
+func tokenSource(tok NewToken) string {
+	if tok.Source == "launchlab" {
+		return "launchlab"
+	}
+	return "pump"
 }
 
 type ClosedTrade struct {
@@ -345,13 +393,18 @@ type Wallet struct {
 }
 
 func newWallet() *Wallet {
-	return &Wallet{
+	w := &Wallet{
 		Balance:  PAPER_BALANCE,
 		Start:    PAPER_BALANCE,
 		Pos:      make(map[string]*Position),
 		ExitWin:  make(map[string]int),
 		ExitLoss: make(map[string]int),
 	}
+	if liveTradingEnabled() {
+		syncWalletBalanceUSD(w)
+		w.Start = w.Balance
+	}
+	return w
 }
 
 // bucketExitReason — короткий ярлык для статистики
@@ -399,7 +452,7 @@ func lossLearningHint(reason string) string {
 
 // Времена успешных входов — оценка среднего интервала между сделками
 var (
-	recentEntryMu   sync.Mutex
+	recentEntryMu    sync.Mutex
 	recentEntryTimes []time.Time
 )
 
@@ -433,7 +486,7 @@ func stakeFromBalance(balance float64) float64 {
 
 var httpClient = &http.Client{Timeout: 8 * time.Second}
 
-// Курс SOL/USD (обновляется с Jupiter, иначе fallback)
+// Курс SOL/USD (CoinGecko, иначе fallback в getSolUSD)
 var solUSDPrice struct {
 	mu  sync.RWMutex
 	USD float64
@@ -449,42 +502,7 @@ func getSolUSD() float64 {
 	return 170
 }
 
-func fetchJupiterSOLPrice() (float64, error) {
-	type jupV6 struct {
-		Data map[string]struct {
-			Price float64 `json:"price"`
-		} `json:"data"`
-	}
-	try := func(url string) (float64, bool) {
-		resp, err := httpClient.Get(url)
-		if err != nil || resp.StatusCode != 200 {
-			if resp != nil {
-				resp.Body.Close()
-			}
-			return 0, false
-		}
-		defer resp.Body.Close()
-		body, err := io.ReadAll(resp.Body)
-		if err != nil {
-			return 0, false
-		}
-		var out jupV6
-		if json.Unmarshal(body, &out) != nil || len(out.Data) == 0 {
-			return 0, false
-		}
-		for _, row := range out.Data {
-			if row.Price > 0 {
-				return row.Price, true
-			}
-		}
-		return 0, false
-	}
-	if p, ok := try("https://price.jup.ag/v6/price?ids=" + WSOL_MINT); ok {
-		return p, nil
-	}
-	if p, ok := try("https://lite-api.jup.ag/price/v2?ids=" + WSOL_MINT); ok {
-		return p, nil
-	}
+func fetchSolUSDPrice() (float64, error) {
 	return fetchCoinGeckoSOL()
 }
 
@@ -512,7 +530,7 @@ func fetchCoinGeckoSOL() (float64, error) {
 }
 
 func refreshSolPriceUSD() {
-	p, err := fetchJupiterSOLPrice()
+	p, err := fetchSolUSDPrice()
 	if err != nil {
 		return
 	}
@@ -570,7 +588,7 @@ func rpc(method string, params []interface{}) ([]byte, error) {
 }
 
 // ════════════════════════════════════════════════════
-//  PUMP.FUN BONDING CURVE — реальная цена без Jupiter
+//  PUMP.FUN BONDING CURVE — реальная цена on-chain
 //
 //  Pump.fun хранит виртуальные резервы в bonding curve аккаунте.
 //  Цена токена = virtualSolReserves / virtualTokenReserves * SOL_PRICE
@@ -678,24 +696,42 @@ func getCurveSnapshot(bcAddr string) (*curveSnap, error) {
 	}, nil
 }
 
-// Повтор при гонке create → аккаунт кривой ещё не в RPC
-func getCurveSnapshotWithRetry(bcAddr string) (*curveSnap, error) {
-	s, err := getCurveSnapshot(bcAddr)
-	if err == nil && s != nil && s.PriceUSD > 0 {
-		return s, nil
+func getCurveSnapshotUnified(bcAddr, source string) (*curveSnap, error) {
+	if source == "launchlab" {
+		return getLaunchLabSnapshot(bcAddr)
 	}
-	time.Sleep(180 * time.Millisecond)
 	return getCurveSnapshot(bcAddr)
+}
+
+// Несколько попыток: create → кривая/pool иногда появляется в RPC с задержкой.
+func getCurveSnapshotWithRetry(bcAddr string, source string) (*curveSnap, error) {
+	var last *curveSnap
+	var lastErr error
+	for attempt := 0; attempt < 4; attempt++ {
+		if attempt > 0 {
+			time.Sleep(time.Duration(120*attempt) * time.Millisecond)
+		}
+		s, err := getCurveSnapshotUnified(bcAddr, source)
+		last, lastErr = s, err
+		if err == nil && s != nil && s.PriceUSD > 0 {
+			return s, nil
+		}
+	}
+	return last, lastErr
 }
 
 // curveVelocityOK — второй замер после паузы: нужен заметный приток (покупки/боты).
 // rejectKey пустой при ok; иначе vel_rpc / vel_low / vel_late — для сводки отсева.
-func curveVelocityOK(bc string, snap0 *curveSnap) (snap1 *curveSnap, ok bool, detail string, rejectKey string) {
+func curveVelocityOK(bc string, snap0 *curveSnap, source string, createAt *time.Time) (snap1 *curveSnap, ok bool, detail string, rejectKey string) {
 	if snap0 == nil || snap0.Complete {
 		return nil, false, "нет снимка", "velocity"
 	}
-	time.Sleep(VELOCITY_PAUSE)
-	s1, err := getCurveSnapshotWithRetry(bc)
+	if envSkipVelocity() {
+		return snap0, true, "SKIP_VELOCITY=1 (без паузы и второго замера)", ""
+	}
+	pause, minDP, minDSol, mode := adaptiveVelocityParams(createAt, snap0)
+	time.Sleep(pause)
+	s1, err := getCurveSnapshotWithRetry(bc, source)
 	if err != nil || s1 == nil || s1.PriceUSD <= 0 {
 		return nil, false, "второй снимок кривой", "vel_rpc"
 	}
@@ -704,13 +740,58 @@ func curveVelocityOK(bc string, snap0 *curveSnap) (snap1 *curveSnap, ok bool, de
 	}
 	dP := s1.Progress - snap0.Progress
 	dSol := s1.RealSolSOL - snap0.RealSolSOL
-	if dP < VELOCITY_MIN_DPROGRESS && dSol < VELOCITY_MIN_DREALSOL {
-		return s1, false, fmt.Sprintf("мало притока (Δ%.2f%% / +%.3f SOL за %v)", dP*100, dSol, VELOCITY_PAUSE), "vel_low"
+	if dP < minDP && dSol < minDSol {
+		return s1, false, fmt.Sprintf("мало притока (Δ%.2f%% / +%.3f SOL за %v; проф=%s, need≈Δ%.2f%% или +%.3f SOL)",
+			dP*100, dSol, pause, mode, minDP*100, minDSol), "vel_low"
 	}
 	if s1.Progress > SNIPER_CURVE_MAX+0.06 {
 		return s1, false, fmt.Sprintf("кривая уже %.1f%% — поздно", s1.Progress*100), "vel_late"
 	}
-	return s1, true, fmt.Sprintf("Δ%.2f%% / +%.3f SOL за %v", dP*100, dSol, VELOCITY_PAUSE), ""
+	return s1, true, fmt.Sprintf("Δ%.2f%% / +%.3f SOL за %v (%s)", dP*100, dSol, pause, mode), ""
+}
+
+func adaptiveVelocityParams(createAt *time.Time, snap0 *curveSnap) (pause time.Duration, minDP, minDSol float64, tag string) {
+	pause = VELOCITY_PAUSE
+	minDP = VELOCITY_MIN_DPROGRESS
+	minDSol = VELOCITY_MIN_DREALSOL
+
+	switch envSignalProfile() {
+	case "strict":
+		minDP *= 1.55
+		minDSol *= 1.55
+		tag = "strict"
+	case "aggressive":
+		minDP *= 0.65
+		minDSol *= 0.65
+		tag = "aggressive"
+	default:
+		tag = "balanced"
+	}
+
+	// Адаптивность по возрасту create: на старте пулы живут быстрее, можно дать чуть мягче порог;
+	// если уже не «свежак», наоборот ужесточаем, чтобы не лезть в застой.
+	if createAt != nil {
+		age := time.Since(*createAt)
+		if age <= 15*time.Second {
+			minDP *= 0.8
+			minDSol *= 0.8
+			tag += "+fresh"
+		} else if age >= 90*time.Second {
+			minDP *= 1.25
+			minDSol *= 1.25
+			tag += "+stale"
+		}
+	}
+	if snap0 != nil {
+		if snap0.Progress < 0.03 {
+			minDP *= 0.9
+			minDSol *= 0.9
+		} else if snap0.Progress > 0.08 {
+			minDP *= 1.15
+			minDSol *= 1.15
+		}
+	}
+	return pause, minDP, minDSol, tag
 }
 
 // ════════════════════════════════════════════════════
@@ -858,7 +939,9 @@ func rpcGetBalanceSOL(pub string) (float64, error) {
 		return 0, err
 	}
 	var env struct {
-		Error  *struct{ Message string `json:"message"` } `json:"error"`
+		Error *struct {
+			Message string `json:"message"`
+		} `json:"error"`
 		Result json.RawMessage `json:"result"`
 	}
 	if err := json.Unmarshal(data, &env); err != nil {
@@ -883,8 +966,8 @@ func rpcGetBalanceSOL(pub string) (float64, error) {
 	return 0, fmt.Errorf("balance parse")
 }
 
-// freezeAuthority ≠ null — опасно. mintAuthority часто = bonding curve (норма) или null.
-func rpcMintAuthorities(mint, bondingCurve string) (badMintAuth, badFreeze bool, err error) {
+// freezeAuthority ≠ null — опасно. mintAuthority часто = bonding curve / pool (норма) или null.
+func rpcMintAuthorities(mint, bondingCurve string, extraAllow ...string) (badMintAuth, badFreeze bool, err error) {
 	data, err := rpc("getAccountInfo", []interface{}{
 		mint, map[string]string{"encoding": "jsonParsed"},
 	})
@@ -912,8 +995,17 @@ func rpcMintAuthorities(mint, bondingCurve string) (badMintAuth, badFreeze bool,
 		return false, false, fmt.Errorf("mint parse")
 	}
 	info := out.Result.Value.Data.Parsed.Info
-	if s, ok := info.MintAuthority.(string); ok && s != "" && s != bondingCurve {
-		badMintAuth = true
+	if s, ok := info.MintAuthority.(string); ok && s != "" {
+		valid := s == bondingCurve
+		for _, a := range extraAllow {
+			if a != "" && s == a {
+				valid = true
+				break
+			}
+		}
+		if !valid {
+			badMintAuth = true
+		}
 	}
 	if !jsonIsNull(info.FreezeAuthority) {
 		badFreeze = true
@@ -982,7 +1074,26 @@ func rpcParsedTokenAccountOwner(tokenAccAddr string) (owner string, err error) {
 }
 
 // Топ-холдеры: кривая должна держать львиную долю; иначе — раздача/скам-паттерн
-func rpcHolderDistributionOK(mint, bondingCurve, creator string) (ok bool, detail string) {
+func antiScamThresholds() (creatorMinSOL, creatorMaxSOL, minCurveShare, maxNonCurveShare float64) {
+	creatorMinSOL = CREATOR_SOL_MIN
+	creatorMaxSOL = CREATOR_SOL_SUSPECT
+	minCurveShare = 0.55
+	maxNonCurveShare = MAX_NONCURVE_PCT
+
+	switch envSignalProfile() {
+	case "strict":
+		creatorMinSOL = math.Max(creatorMinSOL, 0.06)
+		minCurveShare = 0.62
+		maxNonCurveShare = math.Min(maxNonCurveShare, 0.10)
+	case "aggressive":
+		creatorMinSOL = math.Min(creatorMinSOL, 0.02)
+		minCurveShare = 0.45
+		maxNonCurveShare = math.Max(maxNonCurveShare, 0.18)
+	}
+	return
+}
+
+func rpcHolderDistributionOK(mint, bondingCurve, creator string, minCurveShare, maxNonCurveShare float64) (ok bool, detail string) {
 	data, err := rpc("getTokenLargestAccounts", []interface{}{
 		mint, map[string]string{"commitment": "confirmed"},
 	})
@@ -1031,16 +1142,18 @@ func rpcHolderDistributionOK(mint, bondingCurve, creator string) (ok bool, detai
 			}
 		}
 	}
-	if curveAmt/total < 0.55 {
-		return false, fmt.Sprintf("в кривой только %.0f%% саплая", 100*curveAmt/total)
+	if curveAmt/total < minCurveShare {
+		return false, fmt.Sprintf("в кривой только %.0f%% саплая (нужно ≥%.0f%%)", 100*curveAmt/total, 100*minCurveShare)
 	}
-	if nonCurve/total > MAX_NONCURVE_PCT {
-		return false, fmt.Sprintf("%.0f%% токенов вне кривой (макс %.0f%%)", 100*nonCurve/total, 100*MAX_NONCURVE_PCT)
+	if nonCurve/total > maxNonCurveShare {
+		return false, fmt.Sprintf("%.0f%% токенов вне кривой (макс %.0f%%)", 100*nonCurve/total, 100*maxNonCurveShare)
 	}
 	return true, fmt.Sprintf("кривая ~%.0f%% supply", 100*curveAmt/total)
 }
 
-func antiScamCheck(mint, bondingCurve, creator string) (ok bool, detail string) {
+// mintAuthorityRef — pump: bonding curve PDA; launchlab: pool PDA (для сравнения с mintAuthority).
+// liquidityVault — аккаунт, где лежит основная ликвидность (pump: та же кривая; launchlab: pool_vault base).
+func antiScamCheck(mint, mintAuthorityRef, liquidityVault, creator string, extraMintAuth ...string) (ok bool, detail string) {
 	if creator == "" {
 		return false, "нет pubkey создателя"
 	}
@@ -1048,13 +1161,14 @@ func antiScamCheck(mint, bondingCurve, creator string) (ok bool, detail string) 
 	if err != nil {
 		return false, "balance RPC"
 	}
-	if sol < CREATOR_SOL_MIN {
-		return false, fmt.Sprintf("SOL создателя %.3f < %.2f", sol, CREATOR_SOL_MIN)
+	creatorMinSOL, creatorMaxSOL, minCurveShare, maxNonCurveShare := antiScamThresholds()
+	if sol < creatorMinSOL {
+		return false, fmt.Sprintf("SOL создателя %.3f < %.2f", sol, creatorMinSOL)
 	}
-	if sol > CREATOR_SOL_SUSPECT {
-		return false, fmt.Sprintf("SOL создателя %.1f > %.0f (подозр.)", sol, CREATOR_SOL_SUSPECT)
+	if sol > creatorMaxSOL {
+		return false, fmt.Sprintf("SOL создателя %.1f > %.0f (подозр.)", sol, creatorMaxSOL)
 	}
-	badMint, badFreeze, err := rpcMintAuthorities(mint, bondingCurve)
+	badMint, badFreeze, err := rpcMintAuthorities(mint, mintAuthorityRef, extraMintAuth...)
 	if err != nil {
 		return false, "mint RPC"
 	}
@@ -1064,7 +1178,7 @@ func antiScamCheck(mint, bondingCurve, creator string) (ok bool, detail string) 
 	if badFreeze {
 		return false, "freezeAuthority (заморозка счетов)"
 	}
-	ok2, hd := rpcHolderDistributionOK(mint, bondingCurve, creator)
+	ok2, hd := rpcHolderDistributionOK(mint, liquidityVault, creator, minCurveShare, maxNonCurveShare)
 	if !ok2 {
 		return false, hd
 	}
@@ -1075,7 +1189,17 @@ func antiScamCheck(mint, bondingCurve, creator string) (ok bool, detail string) 
 //  WEBSOCKET
 // ════════════════════════════════════════════════════
 
-func listenWS(ch chan<- NewToken) {
+func pumpCreateFromLogs(logs []string) bool {
+	for _, l := range logs {
+		if contains(l, "Instruction: Create") {
+			return true
+		}
+	}
+	return false
+}
+
+// listenProgram — подписка на логи одной программы (Pump.fun или Raydium LaunchLab).
+func listenProgram(programID, prettyLabel string, wantLogs func([]string) bool, ch chan<- NewToken, tokenSrc string) {
 	endpoints := []string{
 		"wss://mainnet.helius-rpc.com/?api-key=" + HELIUS_API_KEY,
 		"wss://atlas-mainnet.helius-rpc.com/?api-key=" + HELIUS_API_KEY,
@@ -1090,7 +1214,7 @@ func listenWS(ch chan<- NewToken) {
 	for {
 		url := endpoints[ei%len(endpoints)]
 		ei++
-		fmt.Printf("%s WS → %s\n", cyan("🔌"), url[:52]+"...")
+		fmt.Printf("%s WS [%s] → %s\n", cyan("🔌"), prettyLabel, url[:52]+"...")
 		conn, resp, err := dialer.Dial(url, headers)
 		if err != nil {
 			code := 0
@@ -1100,20 +1224,20 @@ func listenWS(ch chan<- NewToken) {
 			if code == 403 {
 				fmt.Println(red("❌ HTTP 403 — пробую другой endpoint..."))
 			} else {
-				fmt.Printf("%s %v\n", red("❌"), err)
+				fmt.Printf("%s [%s] %v\n", red("❌"), prettyLabel, err)
 			}
 			time.Sleep(backoff)
 			backoff = time.Duration(math.Min(float64(backoff*2), float64(30*time.Second)))
 			continue
 		}
 		backoff = 3 * time.Second
-		fmt.Println(green("✓ WebSocket подключён — слушаем Pump.fun!"))
+		fmt.Printf("%s WebSocket — %s\n", green("✓"), prettyLabel)
 
 		conn.WriteJSON(map[string]interface{}{
 			"jsonrpc": "2.0", "id": 1,
 			"method": "logsSubscribe",
 			"params": []interface{}{
-				map[string]interface{}{"mentions": []string{PUMP_PROGRAM}},
+				map[string]interface{}{"mentions": []string{programID}},
 				map[string]string{"commitment": "confirmed"},
 			},
 		})
@@ -1135,7 +1259,7 @@ func listenWS(ch chan<- NewToken) {
 		for {
 			_, msg, err := conn.ReadMessage()
 			if err != nil {
-				fmt.Println(yellow("⚠ WS разорван: " + err.Error()))
+				fmt.Printf("%s WS [%s] разорван: %s\n", yellow("⚠"), prettyLabel, err.Error())
 				close(stop)
 				conn.Close()
 				break
@@ -1158,11 +1282,8 @@ func listenWS(ch chan<- NewToken) {
 			if v.Signature == "" || v.Err != nil {
 				continue
 			}
-			for _, l := range v.Logs {
-				if contains(l, "Instruction: Create") {
-					ch <- NewToken{Sig: v.Signature}
-					break
-				}
+			if wantLogs(v.Logs) {
+				ch <- NewToken{Sig: v.Signature, Source: tokenSrc}
 			}
 		}
 	}
@@ -1173,6 +1294,21 @@ func listenWS(ch chan<- NewToken) {
 // ════════════════════════════════════════════════════
 
 func (w *Wallet) open(tok NewToken, sym string, spot float64) bool {
+	if liveTradingEnabled() {
+		w.mu.Lock()
+		if len(w.Pos) >= MAX_POSITIONS {
+			w.mu.Unlock()
+			return false
+		}
+		capital := stakeFromBalance(w.Balance)
+		if capital <= 0 {
+			w.mu.Unlock()
+			return false
+		}
+		w.mu.Unlock()
+		return w.openLive(tok, sym, spot, capital)
+	}
+
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	if len(w.Pos) >= MAX_POSITIONS {
@@ -1201,10 +1337,90 @@ func (w *Wallet) open(tok NewToken, sym string, spot float64) bool {
 		PeakPrice:    entry,
 		CapitalUSD:   capital,
 		OpenedAt:     time.Now(),
+		Source:       tokenSource(tok),
 	}
 	tx := solanaTxFeeUSD()
 	fmt.Printf("\n%s ВХОД  %-18s | гросс $%.2f | в кривую ~$%.2f | pump %.0f%% + сеть ~$%.3f | eff $%.10f | баланс $%.2f\n",
 		cyan("→"), sym, capital, pool, pumpFeePct()*100, tx, entry, w.Balance)
+	return true
+}
+
+// openLive — реальный свап SOL→токен только через Pump.fun bonding curve (pump_direct).
+func (w *Wallet) openLive(tok NewToken, sym string, spot float64, capitalUSD float64) bool {
+	if !liveUsePumpDirect(tok) {
+		consoleMu.Lock()
+		fmt.Println(yellow("⚠ LIVE: только Pump.fun на кривой — LaunchLab/другие источники в live отключены (бумага без изменений)."))
+		consoleMu.Unlock()
+		return false
+	}
+	solPrice := getSolUSD()
+	if solPrice < 1 {
+		return false
+	}
+	solBal, err := rpcGetBalanceSOL(livePub.String())
+	if err != nil {
+		consoleMu.Lock()
+		fmt.Println(red("❌ RPC баланс: " + err.Error()))
+		consoleMu.Unlock()
+		return false
+	}
+	reserve := liveReserveSOL
+	solForSwap := capitalUSD / solPrice
+	if solForSwap > solBal-reserve {
+		solForSwap = solBal - reserve
+	}
+	if solForSwap <= 0.001 {
+		consoleMu.Lock()
+		fmt.Println(yellow("⚠ LIVE: мало SOL после резерва под комиссии"))
+		consoleMu.Unlock()
+		return false
+	}
+	lamports := uint64(solForSwap * 1e9)
+	if lamports < 50_000 {
+		return false
+	}
+	var tokenRaw uint64
+	var sig string
+	var solIn uint64
+	fmt.Println(gray("⏳ Pump.fun: прямая покупка на кривой…"))
+	tokenRaw, sig, solIn, err = PumpDirectBuy(tok.Mint, lamports)
+	if err != nil {
+		consoleMu.Lock()
+		fmt.Printf("%s %v\n", red("❌ Pump buy:"), err)
+		consoleMu.Unlock()
+		syncWalletBalanceUSD(w)
+		return false
+	}
+	syncWalletBalanceUSD(w)
+	tokens := float64(tokenRaw) / 1e6 // pump: 6 decimals
+	entry := spot
+	if tokens > 0 {
+		entry = (float64(solIn) / 1e9 * solPrice) / tokens
+	}
+	capitalEff := float64(solIn) / 1e9 * solPrice
+
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if len(w.Pos) >= MAX_POSITIONS {
+		return false
+	}
+	w.Pos[tok.Mint] = &Position{
+		Mint:         tok.Mint,
+		BondingCurve: tok.BondingCurve,
+		Symbol:       sym,
+		EntryPrice:   entry,
+		Tokens:       tokens,
+		PeakPrice:    entry,
+		CapitalUSD:   capitalEff,
+		OpenedAt:     time.Now(),
+		Live:         true,
+		TokenRaw:     tokenRaw,
+		BuyLamports:  solIn,
+		Source:       tokenSource(tok),
+	}
+	bal := w.Balance
+	fmt.Printf("\n%s ВХОД LIVE %-18s | ~$%.2f SOL→токен | eff $%.10f | raw %d | %s | баланс $%.2f\n",
+		cyan("→"), sym, capitalEff, entry, tokenRaw, gray(sig), bal)
 	return true
 }
 
@@ -1215,22 +1431,95 @@ func (w *Wallet) closePos(mint, reason string, spot float64) {
 		w.mu.Unlock()
 		return
 	}
+	live := pos.Live
+	snap := snapshotPosition(pos)
 	delete(w.Pos, mint)
 	w.mu.Unlock()
 
-	net := exitNetAfterSell(pos.Tokens, spot)
+	if live {
+		w.closePosLive(snap, reason, spot)
+		return
+	}
+
+	net := exitNetAfterSell(snap.Tokens, spot)
+	pnl := net - snap.CapitalUSD
+	pct := 0.0
+	if snap.CapitalUSD > 0 {
+		pct = pnl / snap.CapitalUSD * 100
+	}
+	feesEst := snap.CapitalUSD*pumpFeePct() + snap.Tokens*spot*pumpFeePct() + 2*solanaTxFeeUSD()
+	dur := time.Since(snap.OpenedAt).Round(time.Second)
+
+	bk := bucketExitReason(reason)
+	w.mu.Lock()
+	w.Balance += net
+	w.Closed = append(w.Closed, ClosedTrade{
+		Symbol: snap.Symbol, Mint: snap.Mint, CapitalUSD: snap.CapitalUSD,
+		ExitNetUSD: net, FeesUSD: feesEst, PnL: pnl, PnLPct: pct,
+		Reason: reason, Dur: dur,
+	})
+	if pnl < 0 {
+		w.ExitLoss[bk]++
+	} else {
+		w.ExitWin[bk]++
+	}
+	bal := w.Balance
+	w.mu.Unlock()
+
+	icon := green("✓")
+	ps := green(fmt.Sprintf("+$%.2f (+%.0f%%)", pnl, pct))
+	if pnl < 0 {
+		icon = red("✗")
+		ps = red(fmt.Sprintf("$%.2f (%.0f%%)", pnl, pct))
+	}
+	fmt.Printf("\n%s ВЫХОД %-18s | %s | нетто $%.2f (~комиссии ~$%.2f) | %-24s | %s | бал: $%.2f\n",
+		icon, snap.Symbol, ps, net, feesEst, reason, dur, bal)
+	fmt.Printf("   %s %s\n", gray("DEX"), cyan(dexScreenerURL(snap.Mint)))
+	if pnl < 0 {
+		fmt.Printf("   %s [%s] %s\n", yellow("ⓘ учёт"), bk, lossLearningHint(reason))
+	}
+}
+
+func (w *Wallet) closePosLive(pos *Position, reason string, spot float64) {
+	_ = spot
+	if !liveUsePumpDirectClose(pos) {
+		consoleMu.Lock()
+		fmt.Println(yellow("⚠ LIVE выход: только Pump.fun на кривой — эта позиция не pump; закрой вручную на DEX."))
+		consoleMu.Unlock()
+		syncWalletBalanceUSD(w)
+		w.mu.Lock()
+		w.Pos[pos.Mint] = pos
+		w.mu.Unlock()
+		return
+	}
+	var sig string
+	var solOut uint64
+	fmt.Println(gray("⏳ Pump.fun: продажа на кривой…"))
+	sig, solOut, err := PumpDirectSellAll(pos.Mint)
+	solUSD := getSolUSD()
+	if err != nil {
+		consoleMu.Lock()
+		fmt.Printf("%s %v\n", red("❌ Pump sell:"), err)
+		consoleMu.Unlock()
+		syncWalletBalanceUSD(w)
+		w.mu.Lock()
+		w.Pos[pos.Mint] = pos
+		w.mu.Unlock()
+		return
+	}
+	syncWalletBalanceUSD(w)
+
+	net := float64(solOut) / 1e9 * solUSD
 	pnl := net - pos.CapitalUSD
 	pct := 0.0
 	if pos.CapitalUSD > 0 {
 		pct = pnl / pos.CapitalUSD * 100
 	}
-	// Оценка всех комиссий по сделке (для лога)
-	feesEst := pos.CapitalUSD*pumpFeePct() + pos.Tokens*spot*pumpFeePct() + 2*solanaTxFeeUSD()
+	feesEst := 2 * solanaTxFeeUSD()
 	dur := time.Since(pos.OpenedAt).Round(time.Second)
-
 	bk := bucketExitReason(reason)
+
 	w.mu.Lock()
-	w.Balance += net
 	w.Closed = append(w.Closed, ClosedTrade{
 		Symbol: pos.Symbol, Mint: pos.Mint, CapitalUSD: pos.CapitalUSD,
 		ExitNetUSD: net, FeesUSD: feesEst, PnL: pnl, PnLPct: pct,
@@ -1250,8 +1539,9 @@ func (w *Wallet) closePos(mint, reason string, spot float64) {
 		icon = red("✗")
 		ps = red(fmt.Sprintf("$%.2f (%.0f%%)", pnl, pct))
 	}
-	fmt.Printf("\n%s ВЫХОД %-18s | %s | нетто $%.2f (~комиссии ~$%.2f) | %-24s | %s | бал: $%.2f\n",
-		icon, pos.Symbol, ps, net, feesEst, reason, dur, bal)
+	fmt.Printf("\n%s ВЫХОД LIVE %-18s | %s | нетто ~$%.2f | %s | %s | бал: $%.2f\n",
+		icon, pos.Symbol, ps, net, reason, dur, bal)
+	fmt.Printf("   %s %s\n", gray("sig"), gray(sig))
 	fmt.Printf("   %s %s\n", gray("DEX"), cyan(dexScreenerURL(pos.Mint)))
 	if pnl < 0 {
 		fmt.Printf("   %s [%s] %s\n", yellow("ⓘ учёт"), bk, lossLearningHint(reason))
@@ -1259,6 +1549,9 @@ func (w *Wallet) closePos(mint, reason string, spot float64) {
 }
 
 func (w *Wallet) stats() {
+	if liveTradingEnabled() {
+		syncWalletBalanceUSD(w)
+	}
 	w.mu.Lock()
 	wins, total := 0, 0.0
 	for _, t := range w.Closed {
@@ -1296,8 +1589,12 @@ func (w *Wallet) stats() {
 
 	consoleMu.Lock()
 	defer consoleMu.Unlock()
+	title := "PAPER WALLET — РЕАЛЬНЫЕ ДАННЫЕ"
+	if liveTradingEnabled() {
+		title = "LIVE WALLET — MAINNET (Pump.fun)"
+	}
 	fmt.Println("\n" + bold("┌──────────────────────────────────────────────┐"))
-	fmt.Println(bold("│  PAPER WALLET — РЕАЛЬНЫЕ ДАННЫЕ              │"))
+	fmt.Println(bold("│  "+title+"                    │"))
 	fmt.Println(bold("├──────────────────────────────────────────────┤"))
 	fmt.Printf("│  Баланс:   %-33s│\n", bs)
 	fmt.Printf("│  PnL:      %-33s│\n", ps)
@@ -1372,14 +1669,14 @@ func runPaperSelfTest() {
 	} else {
 		fmt.Println(yellow("ⓘ PnL после комиссий не в плюсе — так бывает при узкой марже; логика кошелька всё равно отработала."))
 	}
-	fmt.Println(gray("Live: go run live_paper_trading.go (без -selftest) — ждёт реальные create-токены."))
+	fmt.Println(gray("Live: go run . (без -selftest) — ждёт реальные create-токены; live_wallet + pump_direct."))
 }
 
 // ════════════════════════════════════════════════════
 //  МОНИТОРИНГ — цена из bonding curve напрямую
 // ════════════════════════════════════════════════════
 
-func monitor(w *Wallet, mint, bcAddr, sym string) {
+func monitor(w *Wallet, mint, bcAddr, sym, source string) {
 	ticker := time.NewTicker(PRICE_TICK)
 	timeout := time.NewTimer(MAX_HOLD)
 	defer ticker.Stop()
@@ -1396,7 +1693,7 @@ func monitor(w *Wallet, mint, bcAddr, sym string) {
 	for {
 		select {
 		case <-timeout.C:
-			snap, _ := getCurveSnapshot(bcAddr)
+			snap, _ := getCurveSnapshotUnified(bcAddr, source)
 			px := 0.0
 			if snap != nil {
 				px = snap.PriceUSD
@@ -1412,7 +1709,7 @@ func monitor(w *Wallet, mint, bcAddr, sym string) {
 				return
 			}
 
-			snap, err := getCurveSnapshot(bcAddr)
+			snap, err := getCurveSnapshotUnified(bcAddr, source)
 			if err != nil || snap == nil || snap.PriceUSD <= 0 {
 				consecutiveFails++
 				if consecutiveFails > 5 {
@@ -1530,6 +1827,7 @@ func dexScreenerURL(mint string) string {
 // ════════════════════════════════════════════════════
 
 func main() {
+	_ = godotenv.Load()
 	selftest := flag.Bool("selftest", false, "проверка виртуального кошелька и комиссий за секунды (без WebSocket), затем выход")
 	flag.Parse()
 	if *selftest {
@@ -1543,17 +1841,36 @@ func main() {
 		fmt.Println(yellow("   dev.helius.xyz → Sign Up → Create App"))
 		os.Exit(1)
 	}
+	if err := initLiveTrading(); err != nil {
+		fmt.Println(red("❌ " + err.Error()))
+		os.Exit(1)
+	}
 
 	fmt.Println(bold("╔══════════════════════════════════════════════════════════╗"))
-	fmt.Println(bold("║   PUMP.FUN LIVE PAPER TRADING                            ║"))
-	fmt.Println(bold("║   Реальные токены · Реальные цены · Виртуальные деньги  ║"))
+	if liveTradingEnabled() {
+		fmt.Println(bold("║   PUMP.FUN — БОЕВОЙ РЕЖИМ (MAINNET)                      ║"))
+		fmt.Println(bold("║   Реальные SOL · Pump.fun curve · риск потери капитала    ║"))
+	} else {
+		fmt.Println(bold("║   PUMP.FUN LIVE PAPER TRADING                            ║"))
+		fmt.Println(bold("║   Реальные токены · Реальные цены · Виртуальные деньги  ║"))
+	}
 	fmt.Println(bold("╚══════════════════════════════════════════════════════════╝"))
-	fmt.Println(green("✓ Helius WebSocket — реальные транзакции Pump.fun"))
+	fmt.Println(green("✓ Helius WebSocket — Pump.fun + Raydium LaunchLab (два потока)"))
 	fmt.Println(green("✓ Bonding Curve Price — прямо из on-chain данных"))
+	if liveTradingEnabled() {
+		fmt.Printf("%s LIVE кошелёк %s | %s\n", green("✓"), cyan(short(livePub.String())),
+			yellow("Только mint …pump на кривой; LaunchLab в live не торгуется."))
+	}
+	if envSkipVelocity() {
+		fmt.Println(yellow("⚠ SKIP_VELOCITY=1 — нет 2.6с паузы и второго замера; больше входов, больше шума."))
+	}
+	if envSkipAntiScam() {
+		fmt.Println(red("⚠ SKIP_ANTI_SCAM=1 — фильтр скама отключён; в live можно слить SOL на мусор."))
+	}
 
 	refreshSolPriceUSD()
 	sp := getSolUSD()
-	fmt.Printf("%s SOL/USD: $%.2f (Jupiter Price API, автообновление)\n", green("✓"), sp)
+	fmt.Printf("%s SOL/USD: $%.2f (CoinGecko, автообновление ~90 с)\n", green("✓"), sp)
 	go func() {
 		t := time.NewTicker(90 * time.Second)
 		for range t.C {
@@ -1561,26 +1878,34 @@ func main() {
 		}
 	}()
 
-	fmt.Printf("\n%s Режим: %s | кривая: %.1f%%–%.1f%% | min SOL: %.2f | velocity: %v (Δ≥%.2f%% прогресса или +%.3f SOL) | ончейн-фильтры\n",
+	fmt.Printf("\n%s Режим: %s | кривая: %.1f%%–%.1f%% | min SOL: %.2f | velocity(base): %v (Δ≥%.2f%% или +%.3f SOL) | profile=%s | ончейн-фильтры\n",
 		bold("▶"), cyan("SNIPER"), SNIPER_CURVE_MIN*100, SNIPER_CURVE_MAX*100, MIN_REAL_SOL,
-		VELOCITY_PAUSE, VELOCITY_MIN_DPROGRESS*100, VELOCITY_MIN_DREALSOL)
-	fmt.Printf("%s Баланс: %s | Ставка: %.2f%% от банка (min $%.2f) → сейчас ~$%.2f на сделку | Макс позиций: %d\n",
-		bold("▶"), green(fmt.Sprintf("$%.2f", PAPER_BALANCE)), BET_PCT_OF_BALANCE*100, MIN_STAKE_USD,
-		stakeFromBalance(PAPER_BALANCE), MAX_POSITIONS)
+		VELOCITY_PAUSE, VELOCITY_MIN_DPROGRESS*100, VELOCITY_MIN_DREALSOL, envSignalProfile())
+	wallet := newWallet()
+	if liveTradingEnabled() {
+		st := stakeFromBalance(wallet.Balance)
+		fmt.Printf("%s Баланс: %s (ончейн) | Ставка: %.2f%% от банка (min $%.2f) → ~$%.2f на сделку | Макс позиций: %d\n",
+			bold("▶"), green(fmt.Sprintf("$%.2f", wallet.Balance)), BET_PCT_OF_BALANCE*100, MIN_STAKE_USD,
+			st, MAX_POSITIONS)
+	} else {
+		fmt.Printf("%s Баланс: %s | Ставка: %.2f%% от банка (min $%.2f) → сейчас ~$%.2f на сделку | Макс позиций: %d\n",
+			bold("▶"), green(fmt.Sprintf("$%.2f", PAPER_BALANCE)), BET_PCT_OF_BALANCE*100, MIN_STAKE_USD,
+			stakeFromBalance(PAPER_BALANCE), MAX_POSITIONS)
+	}
 	fmt.Printf("%s DexScreener — по mint показывается вся история торгов; даты на оси — календарь свечей, не дата «создания ссылки». Свежесть листинга смотри в строке ⏱ (время блока create-тx).\n",
 		gray("ⓘ"))
 	fmt.Printf("%s Быстрая проверка кошелька: %s\n",
-		gray("ⓘ"), cyan("go run live_paper_trading.go -selftest"))
+		gray("ⓘ"), cyan("go run . -selftest"))
 	fmt.Printf("%s Цель «~1 вход / 2 мин» — ориентир: одна позиция + поток Pump.fun; смотри строку ◎ «средний интервал» раз в минуту.\n\n",
 		gray("ⓘ"))
 
-	wallet := newWallet()
 	tokenCh := make(chan NewToken, 200)
 	var seen sync.Map
 	// Больше слотов: пока один токен в sleep(velocity), остальные create обрабатываются
 	sem := make(chan struct{}, 12)
 
-	go listenWS(tokenCh)
+	go listenProgram(PUMP_PROGRAM, "Pump.fun", pumpCreateFromLogs, tokenCh, "pump")
+	go listenProgram(LAUNCHLAB_PROGRAM, "Raydium LaunchLab", launchLabInitFromLogs, tokenCh, "launchlab")
 
 	go func() {
 		for tok := range tokenCh {
@@ -1589,20 +1914,38 @@ func main() {
 			go func() {
 				defer func() { <-sem }()
 
-				mint, creator, createAt := parseCreateTx(tok.Sig)
-				if mint == "" {
-					logRejectLine("no_mint", "?", "", "нет mint в create tx")
-					return
-				}
-				if !strings.HasSuffix(mint, "pump") {
-					sym := "$" + short(mint)
-					logRejectLine("not_pump", sym, mint, "mint не …pump — не pump.fun токен")
-					return
-				}
-				bc, err := pumpBondingCurvePDA(mint)
-				if err != nil {
-					logRejectLine("pda_err", "$"+short(mint), mint, err.Error())
-					return
+				src := tokenSource(tok)
+				var mint, creator string
+				var createAt *time.Time
+				var bc string
+				var err error
+				if src == "launchlab" {
+					mint, creator, createAt = parseLaunchLabCreateTx(tok.Sig)
+					if mint == "" {
+						logRejectLine("no_mint", "?", "", "launchlab: нет mint в tx")
+						return
+					}
+					bc, err = launchLabPoolPDA(mint)
+					if err != nil {
+						logRejectLine("pda_err", "$"+short(mint), mint, err.Error())
+						return
+					}
+				} else {
+					mint, creator, createAt = parseCreateTx(tok.Sig)
+					if mint == "" {
+						logRejectLine("no_mint", "?", "", "нет mint в create tx")
+						return
+					}
+					if !strings.HasSuffix(mint, "pump") {
+						sym := "$" + short(mint)
+						logRejectLine("not_pump", sym, mint, "mint не …pump — не pump.fun токен")
+						return
+					}
+					bc, err = pumpBondingCurvePDA(mint)
+					if err != nil {
+						logRejectLine("pda_err", "$"+short(mint), mint, err.Error())
+						return
+					}
 				}
 				tok.Mint = mint
 				tok.BondingCurve = bc
@@ -1627,9 +1970,9 @@ func main() {
 					return
 				}
 
-				snap0, err := getCurveSnapshotWithRetry(bc)
+				snap0, err := getCurveSnapshotWithRetry(bc, src)
 				if err != nil || snap0 == nil || snap0.PriceUSD <= 0 {
-					logRejectLine("no_price", sym, mint, "нет цены в bonding curve")
+					logRejectLine("no_price", sym, mint, "нет цены (кривая / pool)")
 					return
 				}
 				if snap0.Complete {
@@ -1653,7 +1996,7 @@ func main() {
 				}
 
 				atomic.AddInt64(&funnelInWindow, 1)
-				snap1, vOK, vDetail, vKey := curveVelocityOK(bc, snap0)
+				snap1, vOK, vDetail, vKey := curveVelocityOK(bc, snap0, src, createAt)
 				if !vOK {
 					if vKey == "" {
 						vKey = "velocity"
@@ -1663,7 +2006,26 @@ func main() {
 				}
 
 				atomic.AddInt64(&funnelPassVel, 1)
-				ok, scamMeta := antiScamCheck(mint, bc, creator)
+				liqVault := bc
+				if src == "launchlab" {
+					vault, err := launchLabBaseVault(bc, mint)
+					if err != nil {
+						logRejectLine("pda_err", sym, mint, "launchlab vault: "+err.Error())
+						return
+					}
+					liqVault = vault
+				}
+				var extraMint []string
+				if src == "launchlab" {
+					extraMint = []string{LAUNCHLAB_PROGRAM}
+				}
+				var ok bool
+				var scamMeta string
+				if envSkipAntiScam() {
+					ok, scamMeta = true, "[SKIP_ANTI_SCAM тест — не для реальной торговли]"
+				} else {
+					ok, scamMeta = antiScamCheck(mint, bc, liqVault, creator, extraMint...)
+				}
 				if !ok {
 					logRejectLine("scam", sym, mint, "фильтр: "+scamMeta)
 					return
@@ -1676,20 +2038,29 @@ func main() {
 
 				ageInfo := formatCreateAge(createAt)
 				consoleMu.Lock()
-				fmt.Printf("\n%s %-18s | $%.10f | curve %.1f%% | SOL %.2f | %s | %s → ВХОД\n",
-					green("✓"), sym, price, progress*100, realSol, gray(vDetail), gray(scamMeta))
+				srcTag := gray("pump")
+				if src == "launchlab" {
+					srcTag = cyan("LaunchLab")
+				}
+				fmt.Printf("\n%s %-18s | %s | $%.10f | curve %.1f%% | SOL %.2f | %s | %s → ВХОД\n",
+					green("✓"), sym, srcTag, price, progress*100, realSol, gray(vDetail), gray(scamMeta))
 				fmt.Printf("   %s %s\n", gray("⏱"), cyan(ageInfo))
 				fmt.Printf("   %s %s\n", gray("DEX"), cyan(dexScreenerURL(mint)))
-				opened := wallet.open(tok, sym, price)
+				if liveTradingEnabled() {
+					fmt.Println(gray("   ⏳ LIVE: подпись транзакции Pump.fun (RPC) — обычно несколько секунд."))
+				}
 				consoleMu.Unlock()
+
+				opened := wallet.open(tok, sym, price)
+
 				if opened {
 					atomic.AddInt64(&funnelOpenOK, 1)
 					recordSuccessfulEntry()
-					go monitor(wallet, mint, bc, sym)
+					go monitor(wallet, mint, bc, sym, src)
 				} else {
 					atomic.AddInt64(&funnelOpenFail, 1)
 					consoleMu.Lock()
-					fmt.Println(yellow("⚠ ВХОД отклонён open(): мало баланса или лимит позиций"))
+					fmt.Println(yellow("⚠ ВХОД отклонён open(): баланс, лимит, не pump в live, или RPC"))
 					consoleMu.Unlock()
 				}
 			}()
@@ -1740,5 +2111,194 @@ func main() {
 		}
 	}
 	wallet.mu.Unlock()
-	fmt.Println(bold("\n✓ Реальных денег не потрачено."))
+	if liveTradingEnabled() {
+		fmt.Println(yellow("\n⚠ LIVE: сделки были в mainnet — проверь баланс в кошельке."))
+	} else {
+		fmt.Println(bold("\n✓ Реальных денег не потрачено."))
+	}
+}
+
+// ════════════════════════════════════════════════════
+//  RAYDIUM LAUNCHLAB (в этом же файле — go run без launchlab.go)
+// ════════════════════════════════════════════════════
+
+func launchLabBaseVault(poolAddr, mint string) (string, error) {
+	pool, err := solana.PublicKeyFromBase58(poolAddr)
+	if err != nil {
+		return "", err
+	}
+	m, err := solana.PublicKeyFromBase58(mint)
+	if err != nil {
+		return "", err
+	}
+	prog := solana.MustPublicKeyFromBase58(LAUNCHLAB_PROGRAM)
+	pda, _, err := solana.FindProgramAddress(
+		[][]byte{[]byte("pool_vault"), pool.Bytes(), m.Bytes()},
+		prog,
+	)
+	if err != nil {
+		return "", err
+	}
+	return pda.String(), nil
+}
+
+func launchLabPoolPDA(mint string) (string, error) {
+	m, err := solana.PublicKeyFromBase58(mint)
+	if err != nil {
+		return "", err
+	}
+	wsol, err := solana.PublicKeyFromBase58(WSOL_MINT)
+	if err != nil {
+		return "", err
+	}
+	prog := solana.MustPublicKeyFromBase58(LAUNCHLAB_PROGRAM)
+	pda, _, err := solana.FindProgramAddress(
+		[][]byte{[]byte("pool"), m.Bytes(), wsol.Bytes()},
+		prog,
+	)
+	if err != nil {
+		return "", err
+	}
+	return pda.String(), nil
+}
+
+func parseLaunchLabPoolData(raw []byte) (virtualA, virtualB, realA, realB, totalFund uint64, status, mintDecA uint8, err error) {
+	if len(raw) < 8+77 {
+		return 0, 0, 0, 0, 0, 0, 0, fmt.Errorf("короткий аккаунт pool")
+	}
+	body := raw[8:]
+	if len(body) < 77 {
+		return 0, 0, 0, 0, 0, 0, 0, fmt.Errorf("короткое тело")
+	}
+	status = body[17]
+	mintDecA = body[18]
+	virtualA = binary.LittleEndian.Uint64(body[37:45])
+	virtualB = binary.LittleEndian.Uint64(body[45:53])
+	realA = binary.LittleEndian.Uint64(body[53:61])
+	realB = binary.LittleEndian.Uint64(body[61:69])
+	totalFund = binary.LittleEndian.Uint64(body[69:77])
+	return virtualA, virtualB, realA, realB, totalFund, status, mintDecA, nil
+}
+
+func getLaunchLabSnapshot(poolAddr string) (*curveSnap, error) {
+	data, err := rpc("getAccountInfo", []interface{}{
+		poolAddr,
+		map[string]string{"encoding": "base64"},
+	})
+	if err != nil {
+		return nil, err
+	}
+	var r struct {
+		Result *struct {
+			Value *struct {
+				Data  []interface{} `json:"data"`
+				Owner string        `json:"owner"`
+			} `json:"value"`
+		} `json:"result"`
+	}
+	if json.Unmarshal(data, &r) != nil || r.Result == nil || r.Result.Value == nil {
+		return nil, fmt.Errorf("нет pool аккаунта")
+	}
+	if r.Result.Value.Owner != LAUNCHLAB_PROGRAM {
+		return nil, fmt.Errorf("owner не LaunchLab")
+	}
+	arr := r.Result.Value.Data
+	if len(arr) < 1 {
+		return nil, fmt.Errorf("нет data")
+	}
+	b64str, _ := arr[0].(string)
+	raw, err := base64.StdEncoding.DecodeString(b64str)
+	if err != nil {
+		return nil, err
+	}
+	va, vb, _, rb, totalFund, status, mintDecA, err := parseLaunchLabPoolData(raw)
+	if err != nil {
+		return nil, err
+	}
+	if va == 0 {
+		return nil, fmt.Errorf("virtualA=0")
+	}
+	decA := int(mintDecA)
+	if decA <= 0 {
+		decA = 6
+	}
+	rawPerToken := math.Pow10(decA)
+	priceInSol := (float64(vb) / 1e9) / (float64(va) / rawPerToken)
+	sol := getSolUSD()
+	priceUSD := priceInSol * sol
+
+	realSol := float64(rb) / 1e9
+	var progress float64
+	if totalFund > 0 {
+		progress = float64(rb) / float64(totalFund)
+	}
+	if progress > 1 {
+		progress = 1
+	}
+	complete := status >= 2 || (totalFund > 0 && rb >= totalFund)
+	if complete {
+		progress = 1
+	}
+
+	return &curveSnap{
+		PriceUSD:   priceUSD,
+		Progress:   progress,
+		RealSolSOL: realSol,
+		Complete:   complete,
+	}, nil
+}
+
+func launchLabInitFromLogs(logs []string) bool {
+	for _, l := range logs {
+		if strings.Contains(l, "Instruction: InitializeV2") ||
+			strings.Contains(l, "Instruction: InitializeWithToken2022") {
+			return true
+		}
+	}
+	return false
+}
+
+func parseLaunchLabCreateTx(sig string) (mint, creator string, createBlockTime *time.Time) {
+	data, err := rpc("getTransaction", []interface{}{
+		sig,
+		map[string]interface{}{
+			"encoding":                       "jsonParsed",
+			"maxSupportedTransactionVersion": 0,
+			"commitment":                     "confirmed",
+		},
+	})
+	if err != nil {
+		return "", "", nil
+	}
+	var wrap struct {
+		Result json.RawMessage `json:"result"`
+	}
+	if json.Unmarshal(data, &wrap) != nil || string(wrap.Result) == "null" {
+		return "", "", nil
+	}
+	var r struct {
+		BlockTime *int64 `json:"blockTime"`
+		Meta      struct {
+			PostTokenBalances []postTokenBal `json:"postTokenBalances"`
+			LogMessages       []string         `json:"logMessages"`
+		} `json:"meta"`
+		Transaction struct {
+			Message struct {
+				AccountKeys []json.RawMessage `json:"accountKeys"`
+			} `json:"message"`
+		} `json:"transaction"`
+	}
+	if err := json.Unmarshal(wrap.Result, &r); err != nil {
+		return "", "", nil
+	}
+	if r.BlockTime != nil && *r.BlockTime > 0 {
+		t := time.Unix(*r.BlockTime, 0)
+		createBlockTime = &t
+	}
+	if !launchLabInitFromLogs(r.Meta.LogMessages) {
+		return "", "", createBlockTime
+	}
+	mint = pickMintFromPostBalances(r.Meta.PostTokenBalances)
+	creator = firstSignerFromKeys(r.Transaction.Message.AccountKeys)
+	return mint, creator, createBlockTime
 }

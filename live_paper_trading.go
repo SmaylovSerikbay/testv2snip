@@ -78,7 +78,7 @@ const (
 	// Recovery Mode ($3.9): узкое окно + ликвидность, чтобы не брать «пустые» мёртвые пулы.
 	SNIPER_CURVE_MIN           = 0.0  // 0.0%
 	SNIPER_CURVE_MAX           = 0.25 // 25%
-	MIN_REAL_SOL               = 0.30 // минимум 0.3 SOL в кривой
+	MIN_REAL_SOL               = 0.35 // минимум 0.35 SOL в кривой
 	FAST_HEAVY_CHECK_CURVE_MAX = 0.05  // тяжёлые RPC-фильтры только до 5% кривой
 	CREATOR_BALANCE_CACHE_TTL  = 5 * time.Minute
 
@@ -90,11 +90,11 @@ const (
 	DEV_MAX_TXS_HOUR      = 7    // dev >7 tx/час — serial rugger (создаёт 4+ токенов)
 
 	// Выходы Final Recovery: hard SL -30%; TP только от +150%.
-	STOP_LOSS_HARD      = 0.85 // -15% (было -30% — режем быстрее на pump.fun)
-	STOP_CONFIRM_LVL    = 0.85 // -15%
+	STOP_LOSS_HARD      = 0.80 // -20%
+	STOP_CONFIRM_LVL    = 0.80 // -20%
 	STOP_CONFIRM_N      = 1
 	SELL_SLIPPAGE_GUARD = 0.10            // >10% ожидаемого slip на выходе — подождать следующий тик
-	TAKE_PROFIT         = 1.10            // +10% — 10 быстрых сделок по ~$0.50, не ждём x10
+	TAKE_PROFIT         = 1.40            // +40% — фиксируем весь объём
 	TRAIL_ACTIVATE      = 1.15            // трейлинг после +15% (было +40%)
 	TRAILING            = 0.12            // откат 12% от пика (было 16%)
 	TRAIL_MIN_AGE       = 5 * time.Second // был 10s — трейл раньше
@@ -1949,6 +1949,11 @@ func antiScamCheck(mint, mintAuthorityRef, liquidityVault, creator string, creat
 	if sol > creatorMaxSOL {
 		return false, fmt.Sprintf("SOL создателя %.1f > %.0f (подозр.)", sol, creatorMaxSOL)
 	}
+	// Обязательный anti-scam: у токена должна быть хотя бы одна social-ссылка.
+	okSocial, socialDetail := hasSocialLinksInMetadata(mint)
+	if !okSocial {
+		return false, socialDetail
+	}
 	if fastAntiScamMode() {
 		badMint, badFreeze, err := rpcMintAuthorities(mint, mintAuthorityRef, extraMintAuth...)
 		if err != nil {
@@ -1960,16 +1965,13 @@ func antiScamCheck(mint, mintAuthorityRef, liquidityVault, creator string, creat
 		if badFreeze {
 			return false, "freezeAuthority (заморозка счетов)"
 		}
-		if okSocial, socialDetail, cached := socialFromCacheOnly(mint); cached && !okSocial {
-			return false, socialDetail
-		}
 		if okTop10, detailTop10 := rpcTop10HoldersClusterOK(mint, mintAuthorityRef); !okTop10 {
 			return false, detailTop10
 		}
 		if devCreatedTooMany(creator) {
 			return false, "dev serial rugger (>7 tx/час)"
 		}
-		return true, fmt.Sprintf("fast anti-scam | dev %.2f SOL", sol)
+		return true, fmt.Sprintf("fast anti-scam | %s | dev %.2f SOL", socialDetail, sol)
 	}
 
 	type filterResult struct {
@@ -2021,11 +2023,10 @@ func antiScamCheck(mint, mintAuthorityRef, liquidityVault, creator string, creat
 		results <- filterResult{key: "liquidity", ok: ok2, detail: hd}
 	}()
 
-	// social metadata check
+	// social metadata check (уже проверен выше, оставляем статус для детализации)
 	go func() {
 		defer wg.Done()
-		okSocial, socialDetail := hasSocialLinksInMetadata(mint)
-		results <- filterResult{key: "social", ok: okSocial, detail: socialDetail}
+		results <- filterResult{key: "social", ok: true, detail: socialDetail}
 	}()
 
 	// bundled buyers check
@@ -2039,7 +2040,7 @@ func antiScamCheck(mint, mintAuthorityRef, liquidityVault, creator string, creat
 	close(results)
 
 	hd := ""
-	socialDetail := ""
+	socialInfo := ""
 	bundleDetail := ""
 	for r := range results {
 		if !r.ok {
@@ -2049,12 +2050,12 @@ func antiScamCheck(mint, mintAuthorityRef, liquidityVault, creator string, creat
 		case "liquidity":
 			hd = r.detail
 		case "social":
-			socialDetail = r.detail
+			socialInfo = r.detail
 		case "bundle":
 			bundleDetail = r.detail
 		}
 	}
-	return true, hd + fmt.Sprintf(" | %s | %s | dev %.2f SOL", socialDetail, bundleDetail, sol)
+	return true, hd + fmt.Sprintf(" | %s | %s | dev %.2f SOL", socialInfo, bundleDetail, sol)
 }
 
 // ════════════════════════════════════════════════════

@@ -4,6 +4,7 @@ package main
 import (
 	"fmt"
 	"os"
+	"strconv"
 	"strings"
 
 	"github.com/gagliardetto/solana-go"
@@ -21,6 +22,15 @@ var (
 
 func liveTradingEnabled() bool {
 	return strings.TrimSpace(os.Getenv("LIVE_TRADING")) == "1"
+}
+
+func liveReserveSOLValue() float64 {
+	if s := strings.TrimSpace(os.Getenv("LIVE_RESERVE_SOL")); s != "" {
+		if v, err := strconv.ParseFloat(s, 64); err == nil && v >= 0.0005 && v <= 0.2 {
+			return v
+		}
+	}
+	return liveReserveSOL
 }
 
 func initLiveTrading() error {

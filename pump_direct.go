@@ -239,6 +239,14 @@ func preferJitoBundleFirst() bool {
 	return true
 }
 
+func useJitoEnabled() bool {
+	s := strings.TrimSpace(strings.ToLower(os.Getenv("USE_JITO")))
+	if s == "0" || s == "false" || s == "no" {
+		return false
+	}
+	return strings.TrimSpace(os.Getenv("JITO_BLOCK_ENGINE_URL")) != ""
+}
+
 func applySlippagePump(amount uint64, slippageBps uint64) uint64 {
 	if amount == 0 || slippageBps >= 10_000 {
 		return 0
@@ -265,7 +273,7 @@ func choosePriorityFeeLamports(baseTradeLamports uint64) uint64 {
 	if dyn, ok := cachedDynamicPriorityFeeLamports(); ok && dyn > 0 {
 		fee = dyn
 	}
-	if strings.TrimSpace(os.Getenv("JITO_BLOCK_ENGINE_URL")) != "" && fee < jitoMinTipLamports {
+	if useJitoEnabled() && fee < jitoMinTipLamports {
 		fee = jitoMinTipLamports
 	}
 	if baseTradeLamports > 0 && pumpPriorityMaxFeeBps > 0 {
@@ -274,7 +282,7 @@ func choosePriorityFeeLamports(baseTradeLamports uint64) uint64 {
 			fee = capFee
 		}
 	}
-	if strings.TrimSpace(os.Getenv("JITO_BLOCK_ENGINE_URL")) != "" && fee < jitoMinTipLamports {
+	if useJitoEnabled() && fee < jitoMinTipLamports {
 		fee = jitoMinTipLamports
 	}
 	return fee
@@ -351,8 +359,7 @@ func markJitoRateLimited(reason string) {
 }
 
 func shouldUseJitoPath() bool {
-	j := strings.TrimSpace(os.Getenv("JITO_BLOCK_ENGINE_URL"))
-	if j == "" {
+	if !useJitoEnabled() {
 		return false
 	}
 	if jitoRateLimitedNow() {

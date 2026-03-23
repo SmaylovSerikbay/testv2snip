@@ -1013,6 +1013,18 @@ func quickPumpTakeProfitMult() float64 {
 	return TAKE_PROFIT
 }
 
+func liveFixedBuySOLValue() float64 {
+	// Совместимость: FIXED_STAKE и FIXED_STAKE_SOL.
+	for _, k := range []string{"FIXED_STAKE_SOL", "FIXED_STAKE"} {
+		if s := strings.TrimSpace(os.Getenv(k)); s != "" {
+			if v, err := strconv.ParseFloat(s, 64); err == nil && v >= 0.001 && v <= 1.0 {
+				return v
+			}
+		}
+	}
+	return LIVE_FIXED_BUY_SOL
+}
+
 func printHotPathTrace(sym, src, status, detail string, parseMs, curveMs, checksMs int64, totalMs int64) {
 	if !hotPathTraceEnabled() {
 		return
@@ -2428,10 +2440,10 @@ func (w *Wallet) openLive(tok NewToken, sym string, spot float64, capitalUSD flo
 	if solBal <= 0 {
 		return false
 	}
-	reserve := liveReserveSOL
+	reserve := liveReserveSOLValue()
 	_ = capitalUSD
 	availableAfterReserve := solBal - reserve
-	solForSwap := LIVE_FIXED_BUY_SOL
+	solForSwap := liveFixedBuySOLValue()
 	if availableAfterReserve < solForSwap {
 		solForSwap = availableAfterReserve
 	}
@@ -2759,7 +2771,7 @@ func runPaperSelfTest() {
 
 	fmt.Println(bold("\n═══ PAPER SELF-TEST (кошелёк + комиссии, без WebSocket) ═══"))
 	fmt.Printf("Стартовый баланс: $%.2f · ставка в live: %.3f SOL (fixed)\n\n",
-		dw.Start, LIVE_FIXED_BUY_SOL)
+		dw.Start, liveFixedBuySOLValue())
 
 	if !dw.open(tok, sym, spot) {
 		fmt.Println(red("open() не прошёл — мало баланса или ставка"))
@@ -2843,6 +2855,9 @@ func monitor(w *Wallet, mint, bcAddr, sym, source string) {
 				if consecutiveFails > maxPriceFails && !(livePos && openedFor < 20*time.Second) {
 					w.closePos(mint, "ТОКЕН УМЕР (нет данных)", 0)
 					return
+				}
+				if livePos && openedFor < 20*time.Second && consecutiveFails > maxPriceFails {
+					consecutiveFails = maxPriceFails
 				}
 				fmt.Printf("  %s %-18s | ошибка цены (%d/%d)\n", gray("?"), sym, consecutiveFails, maxPriceFails)
 				continue
@@ -3035,7 +3050,7 @@ func main() {
 	if liveTradingEnabled() {
 		fmt.Printf("%s LIVE кошелёк %s | %s\n", green("✓"), cyan(short(livePub.String())),
 			yellow("Только mint …pump на кривой; LaunchLab в live не торгуется."))
-		if strings.TrimSpace(os.Getenv("JITO_BLOCK_ENGINE_URL")) != "" {
+		if useJitoEnabled() {
 			fmt.Println(green("✓ Jito bundles: ВКЛ (sendBundle)"))
 		} else {
 			fmt.Println(yellow("⚠ Jito bundles: ВЫКЛ (идет обычный RPC sendTransaction)"))
@@ -3096,7 +3111,7 @@ func main() {
 	}
 	if liveTradingEnabled() {
 		fmt.Printf("%s Баланс: %s (ончейн) | Ставка: FIXED %.3f SOL (после резерва) | Макс позиций: %d\n",
-			bold("▶"), green(fmt.Sprintf("$%.2f", wallet.Balance)), LIVE_FIXED_BUY_SOL, MAX_POSITIONS)
+			bold("▶"), green(fmt.Sprintf("$%.2f", wallet.Balance)), liveFixedBuySOLValue(), MAX_POSITIONS)
 	} else {
 		fmt.Printf("%s Баланс: %s | Ставка: %.2f%% от банка (min $%.2f) → сейчас ~$%.2f на сделку | Макс позиций: %d\n",
 			bold("▶"), green(fmt.Sprintf("$%.2f", PAPER_BALANCE)), BET_PCT_OF_BALANCE*100, MIN_STAKE_USD,

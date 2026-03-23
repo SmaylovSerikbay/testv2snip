@@ -79,7 +79,7 @@ const (
 	SNIPER_CURVE_MIN           = 0.0  // 0.0%
 	SNIPER_CURVE_MAX           = 0.25 // 25%
 	MIN_REAL_SOL               = 0.15 // минимум 0.15 SOL в кривой
-	FAST_HEAVY_CHECK_CURVE_MAX = 0.05  // тяжёлые RPC-фильтры только до 5% кривой
+	FAST_HEAVY_CHECK_CURVE_MAX = 0.05 // тяжёлые RPC-фильтры только до 5% кривой
 	CREATOR_BALANCE_CACHE_TTL  = 5 * time.Minute
 
 	// Анти-скам
@@ -113,8 +113,8 @@ const (
 	VELOCITY_MIN_DPROGRESS = 0.02                   // min +2% за паузу — только первая волна
 	VELOCITY_MIN_DREALSOL  = 0.0
 	VELOCITY_MIN_DELTA_DP  = -0.0001 // -0.01% (разрешаем микро-откат на замере)
-	LIVE_FIXED_BUY_SOL     = 0.04 // фиксированная ставка в live
-	LIVE_BUY_BALANCE_SHARE = 0.85 // legacy (не используется в fixed live buy)
+	LIVE_FIXED_BUY_SOL     = 0.04    // фиксированная ставка в live
+	LIVE_BUY_BALANCE_SHARE = 0.85    // legacy (не используется в fixed live buy)
 	ACTIVE_POSITIONS_FILE  = "current_trades.json"
 
 	// Логи: false = не печатать каждый отсев (только сводка раз в минуту + успешный ВХОД)
@@ -1193,7 +1193,17 @@ func parseCreateTx(sig string) (mint, creator string, createBlockTime *time.Time
 		return false
 	})
 	if !isCreate {
-		return "", "", createBlockTime
+		if mint == "" {
+			mint, creator, createBlockTime = refillMintFromConfirmed(sig, creator, createBlockTime, func(logs []string) bool {
+				for _, l := range logs {
+					if contains(l, "Instruction: Create") {
+						return true
+					}
+				}
+				return false
+			})
+		}
+		return mint, creator, createBlockTime
 	}
 	if mint == "" {
 		mint, creator, createBlockTime = refillMintFromConfirmed(sig, creator, createBlockTime, func(logs []string) bool {
@@ -1266,11 +1276,14 @@ func parseTxMintCreator(data []byte, wantLogs func([]string) bool) (mint, creato
 		t := time.Unix(*r.BlockTime, 0)
 		createBlockTime = &t
 	}
-	if !wantLogs(r.Meta.LogMessages) {
-		return "", firstSignerFromKeys(r.Transaction.Message.AccountKeys), createBlockTime, false
-	}
-	mint = pickMintFromPostBalances(r.Meta.PostTokenBalances)
 	creator = firstSignerFromKeys(r.Transaction.Message.AccountKeys)
+	mint = pickMintFromPostBalances(r.Meta.PostTokenBalances)
+	if mint == "" {
+		mint = pickMintFromAccountKeys(r.Transaction.Message.AccountKeys)
+	}
+	if !wantLogs(r.Meta.LogMessages) {
+		return mint, creator, createBlockTime, false
+	}
 	return mint, creator, createBlockTime, true
 }
 
@@ -1294,15 +1307,51 @@ func refillMintFromConfirmed(sig, creator string, createBlockTime *time.Time, wa
 			if blockTimeOut == nil && bt != nil {
 				blockTimeOut = bt
 			}
-			if ok && mint != "" {
+			if mint != "" {
 				return mint, creatorOut, blockTimeOut
 			}
+			_ = ok
 		}
 		if attempt < 2 {
 			time.Sleep(time.Duration(80*(attempt+1)) * time.Millisecond)
 		}
 	}
 	return "", creatorOut, blockTimeOut
+}
+
+func pickMintFromAccountKeys(keys []json.RawMessage) string {
+	var fallback string
+	for _, rawK := range keys {
+		var o struct {
+			Pubkey string `json:"pubkey"`
+		}
+		if json.Unmarshal(rawK, &o) == nil && o.Pubkey != "" {
+			k := o.Pubkey
+			if ignoredTokenMints[k] {
+				continue
+			}
+			if strings.HasSuffix(k, "pump") {
+				return k
+			}
+			if fallback == "" {
+				fallback = k
+			}
+			continue
+		}
+		var s string
+		if json.Unmarshal(rawK, &s) == nil && s != "" {
+			if ignoredTokenMints[s] {
+				continue
+			}
+			if strings.HasSuffix(s, "pump") {
+				return s
+			}
+			if fallback == "" {
+				fallback = s
+			}
+		}
+	}
+	return fallback
 }
 
 func formatCreateAge(t *time.Time) string {

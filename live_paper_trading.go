@@ -880,6 +880,24 @@ func fastAntiScamMode() bool {
 	return true
 }
 
+func hotPathTraceEnabled() bool {
+	s := strings.TrimSpace(strings.ToLower(os.Getenv("HOT_PATH_TRACE")))
+	if s == "0" || s == "false" || s == "no" {
+		return false
+	}
+	return true
+}
+
+func printHotPathTrace(sym, src, status, detail string, parseMs, curveMs, checksMs int64, totalMs int64) {
+	if !hotPathTraceEnabled() {
+		return
+	}
+	consoleMu.Lock()
+	fmt.Printf("%s HotPath | %s | %s | parse=%dms curve=%dms checks=%dms total=%dms | %s\n",
+		gray("⏱"), sym, src+"/"+status, parseMs, curveMs, checksMs, totalMs, detail)
+	consoleMu.Unlock()
+}
+
 func abortIfTooLate(tok NewToken, stage string) bool {
 	if tok.DetectedAt.IsZero() {
 		return false
@@ -2851,6 +2869,9 @@ func main() {
 			}
 			go func() {
 				defer func() { <-sem }()
+				traceStart := time.Now()
+				parseDone := traceStart
+				curveDone := traceStart
 
 				src := tokenSource(tok)
 				var mint, creator string
@@ -2888,11 +2909,16 @@ func main() {
 					bc, err = pumpBondingCurvePDA(mint)
 					if err != nil {
 						logRejectLine("pda_err", "$"+short(mint), mint, err.Error())
+						if !tok.DetectedAt.IsZero() {
+							total := time.Since(tok.DetectedAt).Milliseconds()
+							printHotPathTrace("$"+short(mint), src, "reject:pda_err", err.Error(), 0, 0, 0, total)
+						}
 						return
 					}
 				}
 				tok.Mint = mint
 				tok.BondingCurve = bc
+				parseDone = time.Now()
 
 				if _, loaded := seen.LoadOrStore(mint, true); loaded {
 					return
@@ -2920,34 +2946,62 @@ func main() {
 				if createAt != nil && time.Since(*createAt) > MAX_CREATE_TX_AGE {
 					logRejectLine("stale_tx", sym, mint, fmt.Sprintf(
 						"create-тx старше %v (%s) — не свежий листинг", MAX_CREATE_TX_AGE, formatCreateAge(createAt)))
+					if !tok.DetectedAt.IsZero() {
+						total := time.Since(tok.DetectedAt).Milliseconds()
+						printHotPathTrace(sym, src, "reject:stale_tx", "stale create tx", parseDone.Sub(traceStart).Milliseconds(), 0, 0, total)
+					}
 					return
 				}
 
 				snap0, err := getCurveSnapshotWithRetry(bc, src)
 				if abortIfTooLate(tok, "curve_snapshot") {
+					if !tok.DetectedAt.IsZero() {
+						total := time.Since(tok.DetectedAt).Milliseconds()
+						printHotPathTrace(sym, src, "reject:late_curve_snapshot", "latency guard", parseDone.Sub(traceStart).Milliseconds(), time.Since(parseDone).Milliseconds(), 0, total)
+					}
 					return
 				}
 				if err != nil || snap0 == nil || snap0.PriceUSD <= 0 {
 					logRejectLine("no_price", sym, mint, "нет цены (кривая / pool)")
+					if !tok.DetectedAt.IsZero() {
+						total := time.Since(tok.DetectedAt).Milliseconds()
+						printHotPathTrace(sym, src, "reject:no_price", "curve snapshot unavailable", parseDone.Sub(traceStart).Milliseconds(), time.Since(parseDone).Milliseconds(), 0, total)
+					}
 					return
 				}
 				if snap0.Complete {
 					logRejectLine("complete", sym, mint, "bonding curve complete")
+					if !tok.DetectedAt.IsZero() {
+						total := time.Since(tok.DetectedAt).Milliseconds()
+						printHotPathTrace(sym, src, "reject:complete", "bonding curve complete", parseDone.Sub(traceStart).Milliseconds(), time.Since(parseDone).Milliseconds(), 0, total)
+					}
 					return
 				}
 				if snap0.Progress < SNIPER_CURVE_MIN {
 					logRejectLine("empty", sym, mint, fmt.Sprintf("curve %.2f%% < %.1f%% — пусто",
 						snap0.Progress*100, SNIPER_CURVE_MIN*100))
+					if !tok.DetectedAt.IsZero() {
+						total := time.Since(tok.DetectedAt).Milliseconds()
+						printHotPathTrace(sym, src, "reject:empty", "curve too early", parseDone.Sub(traceStart).Milliseconds(), time.Since(parseDone).Milliseconds(), 0, total)
+					}
 					return
 				}
 				if snap0.Progress > SNIPER_CURVE_MAX {
 					logRejectLine("late", sym, mint, fmt.Sprintf("curve %.1f%% > %.1f%% — поздно",
 						snap0.Progress*100, SNIPER_CURVE_MAX*100))
+					if !tok.DetectedAt.IsZero() {
+						total := time.Since(tok.DetectedAt).Milliseconds()
+						printHotPathTrace(sym, src, "reject:late", "curve too late", parseDone.Sub(traceStart).Milliseconds(), time.Since(parseDone).Milliseconds(), 0, total)
+					}
 					return
 				}
 				if snap0.RealSolSOL < MIN_REAL_SOL {
 					logRejectLine("low_sol", sym, mint, fmt.Sprintf("real SOL %.2f < %.2f",
 						snap0.RealSolSOL, MIN_REAL_SOL))
+					if !tok.DetectedAt.IsZero() {
+						total := time.Since(tok.DetectedAt).Milliseconds()
+						printHotPathTrace(sym, src, "reject:low_sol", "real SOL below threshold", parseDone.Sub(traceStart).Milliseconds(), time.Since(parseDone).Milliseconds(), 0, total)
+					}
 					return
 				}
 
@@ -2957,10 +3011,15 @@ func main() {
 					vault, err := launchLabBaseVault(bc, mint)
 					if err != nil {
 						logRejectLine("pda_err", sym, mint, "launchlab vault: "+err.Error())
+						if !tok.DetectedAt.IsZero() {
+							total := time.Since(tok.DetectedAt).Milliseconds()
+							printHotPathTrace(sym, src, "reject:pda_err", "launchlab vault pda", parseDone.Sub(traceStart).Milliseconds(), time.Since(parseDone).Milliseconds(), 0, total)
+						}
 						return
 					}
 					liqVault = vault
 				}
+				curveDone = time.Now()
 				var extraMint []string
 				if src == "launchlab" {
 					extraMint = []string{LAUNCHLAB_PROGRAM}
@@ -2987,6 +3046,10 @@ func main() {
 				}()
 				wg.Wait()
 				if abortIfTooLate(tok, "velocity_check") {
+					if !tok.DetectedAt.IsZero() {
+						total := time.Since(tok.DetectedAt).Milliseconds()
+						printHotPathTrace(sym, src, "warn:velocity_latency", "velocity stage over delay", parseDone.Sub(traceStart).Milliseconds(), curveDone.Sub(parseDone).Milliseconds(), time.Since(curveDone).Milliseconds(), total)
+					}
 					return
 				}
 				if !vOK {
@@ -2994,19 +3057,35 @@ func main() {
 						vKey = "velocity"
 					}
 					logRejectLine(vKey, sym, mint, "velocity: "+vDetail)
+					if !tok.DetectedAt.IsZero() {
+						total := time.Since(tok.DetectedAt).Milliseconds()
+						printHotPathTrace(sym, src, "reject:"+vKey, vDetail, parseDone.Sub(traceStart).Milliseconds(), curveDone.Sub(parseDone).Milliseconds(), time.Since(curveDone).Milliseconds(), total)
+					}
 					return
 				}
 				atomic.AddInt64(&funnelPassVel, 1)
 				if src == "pump" && snap1.Progress > FAST_HEAVY_CHECK_CURVE_MAX {
 					logRejectLine("late", sym, mint, fmt.Sprintf("fast-gate: curve %.1f%% > %.1f%% до тяжёлых RPC-проверок",
 						snap1.Progress*100, FAST_HEAVY_CHECK_CURVE_MAX*100))
+					if !tok.DetectedAt.IsZero() {
+						total := time.Since(tok.DetectedAt).Milliseconds()
+						printHotPathTrace(sym, src, "reject:late_fast_gate", "curve progressed during checks", parseDone.Sub(traceStart).Milliseconds(), curveDone.Sub(parseDone).Milliseconds(), time.Since(curveDone).Milliseconds(), total)
+					}
 					return
 				}
 				if abortIfTooLate(tok, "anti_scam_check") {
+					if !tok.DetectedAt.IsZero() {
+						total := time.Since(tok.DetectedAt).Milliseconds()
+						printHotPathTrace(sym, src, "reject:late_anti_scam", "latency guard", parseDone.Sub(traceStart).Milliseconds(), curveDone.Sub(parseDone).Milliseconds(), time.Since(curveDone).Milliseconds(), total)
+					}
 					return
 				}
 				if !scamOK {
 					logRejectLine("scam", sym, mint, "фильтр: "+scamMeta)
+					if !tok.DetectedAt.IsZero() {
+						total := time.Since(tok.DetectedAt).Milliseconds()
+						printHotPathTrace(sym, src, "reject:scam", scamMeta, parseDone.Sub(traceStart).Milliseconds(), curveDone.Sub(parseDone).Milliseconds(), time.Since(curveDone).Milliseconds(), total)
+					}
 					return
 				}
 				if !tok.DetectedAt.IsZero() {
@@ -3019,10 +3098,15 @@ func main() {
 					}
 					if delta > MAX_READY_TO_SEND_DELAY {
 						abortIfTooLate(tok, "before_open")
+						printHotPathTrace(sym, src, "reject:before_open", "over max ready-to-send delay", parseDone.Sub(traceStart).Milliseconds(), curveDone.Sub(parseDone).Milliseconds(), time.Since(curveDone).Milliseconds(), delta.Milliseconds())
 						return
 					}
 				}
 				tok.FiltersPassedAt = time.Now()
+				if !tok.DetectedAt.IsZero() {
+					total := time.Since(tok.DetectedAt).Milliseconds()
+					printHotPathTrace(sym, src, "pass:filters", "ready to open position", parseDone.Sub(traceStart).Milliseconds(), curveDone.Sub(parseDone).Milliseconds(), time.Since(curveDone).Milliseconds(), total)
+				}
 
 				atomic.AddInt64(&funnelPassScam, 1)
 				price := snap1.PriceUSD

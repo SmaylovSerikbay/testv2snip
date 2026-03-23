@@ -1533,13 +1533,8 @@ func (w *Wallet) open(tok NewToken, sym string, spot float64) bool {
 			w.mu.Unlock()
 			return false
 		}
-		capital := stakeFromBalance(w.Balance)
-		if capital <= 0 {
-			w.mu.Unlock()
-			return false
-		}
 		w.mu.Unlock()
-		return w.openLive(tok, sym, spot, capital)
+		return w.openLive(tok, sym, spot, 0)
 	}
 
 	w.mu.Lock()
@@ -1877,8 +1872,8 @@ func runPaperSelfTest() {
 	defer consoleMu.Unlock()
 
 	fmt.Println(bold("\n═══ PAPER SELF-TEST (кошелёк + комиссии, без WebSocket) ═══"))
-	fmt.Printf("Стартовый баланс: $%.2f · ставка как в live: $%.2f (%.1f%% банка)\n\n",
-		dw.Start, stakeFromBalance(dw.Start), BET_PCT_OF_BALANCE*100)
+	fmt.Printf("Стартовый баланс: $%.2f · ставка в live: %.3f SOL (fixed)\n\n",
+		dw.Start, LIVE_FIXED_BUY_SOL)
 
 	if !dw.open(tok, sym, spot) {
 		fmt.Println(red("open() не прошёл — мало баланса или ставка"))
@@ -2139,10 +2134,9 @@ func main() {
 		VELOCITY_PAUSE, VELOCITY_MIN_DPROGRESS*100, VELOCITY_MIN_DREALSOL, envSignalProfile())
 	wallet := newWallet()
 	if liveTradingEnabled() {
-		st := stakeFromBalance(wallet.Balance)
-		fmt.Printf("%s Баланс: %s (ончейн) | Ставка: %.2f%% от банка (min $%.2f) → ~$%.2f на сделку | Макс позиций: %d\n",
-			bold("▶"), green(fmt.Sprintf("$%.2f", wallet.Balance)), BET_PCT_OF_BALANCE*100, MIN_STAKE_USD,
-			st, MAX_POSITIONS)
+		fixedUSD := LIVE_FIXED_BUY_SOL * getSolUSD()
+		fmt.Printf("%s Баланс: %s (ончейн) | Ставка: fixed %.3f SOL (~$%.2f) | Макс позиций: %d\n",
+			bold("▶"), green(fmt.Sprintf("$%.2f", wallet.Balance)), LIVE_FIXED_BUY_SOL, fixedUSD, MAX_POSITIONS)
 	} else {
 		fmt.Printf("%s Баланс: %s | Ставка: %.2f%% от банка (min $%.2f) → сейчас ~$%.2f на сделку | Макс позиций: %d\n",
 			bold("▶"), green(fmt.Sprintf("$%.2f", PAPER_BALANCE)), BET_PCT_OF_BALANCE*100, MIN_STAKE_USD,

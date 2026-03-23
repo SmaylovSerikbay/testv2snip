@@ -35,6 +35,14 @@ var pumpSellDisc = []byte{51, 230, 133, 164, 1, 127, 131, 173}
 
 var pumpProgramPK = solana.MustPublicKeyFromBase58(PUMP_PROGRAM)
 
+type buyLatencyBreakdown struct {
+	FiltersMs       int64
+	BlockhashMs     int64
+	SigningMs       int64
+	SendingMs       int64
+	BlockhashCached bool
+}
+
 const (
 	minMicroLamportsPerCU uint64 = 100_000
 	pumpComputeUnitLimit    uint32 = 600_000
@@ -52,6 +60,10 @@ var (
 		mu       sync.Mutex
 		lamports uint64
 		ts       time.Time
+	}
+	lastBuyLatency struct {
+		mu sync.Mutex
+		v  buyLatencyBreakdown
 	}
 	recentBlockhashCache struct {
 		mu       sync.Mutex
@@ -147,7 +159,7 @@ func startPumpHotCaches() {
 	refreshRecentBlockhashCache()
 	prewarmJitoConnection()
 	go func() {
-		t := time.NewTicker(2 * time.Second)
+		t := time.NewTicker(1 * time.Second)
 		defer t.Stop()
 		for range t.C {
 			refreshRecentBlockhashCache()
@@ -160,6 +172,18 @@ func startPumpHotCaches() {
 			prewarmJitoConnection()
 		}
 	}()
+}
+
+func setLastBuyLatency(v buyLatencyBreakdown) {
+	lastBuyLatency.mu.Lock()
+	lastBuyLatency.v = v
+	lastBuyLatency.mu.Unlock()
+}
+
+func getLastBuyLatency() buyLatencyBreakdown {
+	lastBuyLatency.mu.Lock()
+	defer lastBuyLatency.mu.Unlock()
+	return lastBuyLatency.v
 }
 
 // fastHotBuyMode: в горячем входе не делаем лишние pre-check RPC перед отправкой.
@@ -652,6 +676,7 @@ func mintTokenProgram(ctx context.Context, c *solanarpc.Client, mint solana.Publ
 
 func swapPumpFun(ctx context.Context, rpcClient *solanarpc.Client, wallet solana.PrivateKey, mint solana.PublicKey, spendableLamports uint64) (solana.Signature, uint64, uint64, time.Time, error) {
 	owner := wallet.PublicKey()
+	startAt := time.Now()
 	fastMode := fastHotBuyMode()
 	var balBefore uint64
 	if !fastMode {
@@ -745,6 +770,7 @@ func swapPumpFun(ctx context.Context, rpcClient *solanarpc.Client, wallet solana
 	if firstErr != nil {
 		return solana.Signature{}, 0, 0, time.Time{}, firstErr
 	}
+	filtersMs := time.Since(startAt).Milliseconds()
 
 	spendableBudget := pumpSpendableWithBuffer(spendableLamports, pumpSpendableBufferBps)
 
@@ -844,7 +870,9 @@ func swapPumpFun(ctx context.Context, rpcClient *solanarpc.Client, wallet solana
 		return solana.Signature{}, 0, 0, time.Time{}, err
 	}
 
+	bhStart := time.Now()
 	cachedBH, ok := getRecentBlockhashCached()
+	blockhashMs := time.Since(bhStart).Milliseconds()
 	if !ok {
 		return solana.Signature{}, 0, 0, time.Time{}, fmt.Errorf("blockhash cache cold")
 	}
@@ -857,15 +885,26 @@ func swapPumpFun(ctx context.Context, rpcClient *solanarpc.Client, wallet solana
 	if err != nil {
 		return solana.Signature{}, 0, 0, time.Time{}, err
 	}
+	signStart := time.Now()
 	err = signTransactionAsync(tx, owner, wallet)
+	signingMs := time.Since(signStart).Milliseconds()
 	if err != nil {
 		return solana.Signature{}, 0, 0, time.Time{}, err
 	}
 
+	sendStart := time.Now()
 	sig, sentAt, err := sendPumpTransaction(ctx, rpcClient, tx)
+	sendingMs := time.Since(sendStart).Milliseconds()
 	if err != nil {
 		return solana.Signature{}, 0, 0, time.Time{}, err
 	}
+	setLastBuyLatency(buyLatencyBreakdown{
+		FiltersMs:       filtersMs,
+		BlockhashMs:     blockhashMs,
+		SigningMs:       signingMs,
+		SendingMs:       sendingMs,
+		BlockhashCached: true,
+	})
 	actualSpent := spendableBudget
 	if !fastMode {
 		// Фактические лампорты, списанные с кошелька, важнее оценок (учёт комиссий/priority/реального исполнения).
@@ -1032,13 +1071,13 @@ func swapPumpFunSellAmount(ctx context.Context, rpcClient *solanarpc.Client, wal
 		return solana.Signature{}, 0, err
 	}
 
-	recent, err := rpcClient.GetLatestBlockhash(ctx, solanarpc.CommitmentFinalized)
-	if err != nil {
-		return solana.Signature{}, 0, err
+	cachedBH, ok := getRecentBlockhashCached()
+	if !ok {
+		return solana.Signature{}, 0, fmt.Errorf("blockhash cache cold")
 	}
 
 	all := []solana.Instruction{cuLimitIx, cuPriceIx, sellIx}
-	tx, err := solana.NewTransaction(all, recent.Value.Blockhash, solana.TransactionPayer(owner))
+	tx, err := solana.NewTransaction(all, cachedBH, solana.TransactionPayer(owner))
 	if err != nil {
 		return solana.Signature{}, 0, err
 	}

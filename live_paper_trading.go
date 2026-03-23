@@ -1919,6 +1919,9 @@ func (w *Wallet) openLive(tok NewToken, sym string, spot float64, capitalUSD flo
 		consoleMu.Lock()
 		fmt.Printf("%s Transaction Sent | %s | %s | delay=%dms\n",
 			gray("⏱"), "$"+short(tok.Mint), sentAt.Format(time.RFC3339Nano), delayMs)
+		lat := getLastBuyLatency()
+		fmt.Printf("%s latency breakdown | filters=%dms | blockhash(cache)=%dms | signing=%dms | sending=%dms\n",
+			gray("⏱"), lat.FiltersMs, lat.BlockhashMs, lat.SigningMs, lat.SendingMs)
 		consoleMu.Unlock()
 	}
 	syncWalletBalanceUSDFresh(w)
@@ -2508,7 +2511,12 @@ func main() {
 	go func() {
 		for tok := range tokenCh {
 			tok := tok
-			sem <- struct{}{}
+			select {
+			case sem <- struct{}{}:
+			default:
+				rejectBump("busy")
+				continue
+			}
 			go func() {
 				defer func() { <-sem }()
 

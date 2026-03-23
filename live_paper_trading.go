@@ -28,6 +28,20 @@ import (
 // Тестовые флаги окружения (для отладки, не для «боевой» охоты за качеством).
 func envSkipVelocity() bool { return strings.TrimSpace(os.Getenv("SKIP_VELOCITY")) == "1" }
 func envSkipAntiScam() bool { return strings.TrimSpace(os.Getenv("SKIP_ANTI_SCAM")) == "1" }
+func shouldSkipAntiScam() bool {
+	if envSkipAntiScam() {
+		return true
+	}
+	// В live+aggressive по умолчанию режем анти-скам ради скорости входа.
+	if liveTradingEnabled() && envSignalProfile() == "aggressive" {
+		s := strings.TrimSpace(strings.ToLower(os.Getenv("AUTO_SKIP_ANTI_SCAM")))
+		if s == "0" || s == "false" || s == "no" {
+			return false
+		}
+		return true
+	}
+	return false
+}
 func velocityPause() time.Duration {
 	if s := strings.TrimSpace(os.Getenv("VELOCITY_PAUSE_MS")); s != "" {
 		if ms, err := strconv.Atoi(s); err == nil && ms >= 150 && ms <= 800 {
@@ -635,6 +649,7 @@ func stakeFromBalance(balance float64) float64 {
 
 var httpClient = &http.Client{Timeout: 8 * time.Second}
 var rpcLimiter = make(chan struct{}, RPC_MAX_CONCURRENT)
+var rpcEndpointCursor uint64
 
 type balCacheEntry struct {
 	sol float64
@@ -737,8 +752,20 @@ func exitNetAfterSell(tokens float64, spot float64) float64 {
 	return gross*(1-pumpFeePct()) - solanaTxFeeUSD()
 }
 
+func heliusRPCURLs() []string {
+	return []string{
+		"https://mainnet.helius-rpc.com/?api-key=" + HELIUS_API_KEY,
+		"https://atlas-mainnet.helius-rpc.com/?api-key=" + HELIUS_API_KEY,
+	}
+}
+
 func heliusURL() string {
-	return "https://mainnet.helius-rpc.com/?api-key=" + HELIUS_API_KEY
+	urls := heliusRPCURLs()
+	if len(urls) == 0 {
+		return "https://mainnet.helius-rpc.com/?api-key=" + HELIUS_API_KEY
+	}
+	i := atomic.AddUint64(&rpcEndpointCursor, 1)
+	return urls[int(i)%len(urls)]
 }
 
 func apiReady() bool {
@@ -1223,7 +1250,8 @@ func getTransactionJSONParsedFast(sig string) ([]byte, error) {
 		return []interface{}{
 			sig,
 			map[string]interface{}{
-				"encoding":                       "jsonParsed",
+				// Для hot-path берём json (легче payload, быстрее ответа), парсер ниже поддерживает оба формата.
+				"encoding":                       "json",
 				"maxSupportedTransactionVersion": 0,
 				"commitment":                     commitment,
 			},
@@ -1294,7 +1322,7 @@ func refillMintFromConfirmed(sig, creator string, createBlockTime *time.Time, wa
 		data, err := rpc("getTransaction", []interface{}{
 			sig,
 			map[string]interface{}{
-				"encoding":                       "jsonParsed",
+				"encoding":                       "json",
 				"maxSupportedTransactionVersion": 0,
 				"commitment":                     "confirmed",
 			},
@@ -2892,8 +2920,8 @@ func main() {
 	if envSkipVelocity() {
 		fmt.Println(yellow("⚠ SKIP_VELOCITY=1 — нет 2.6с паузы и второго замера; больше входов, больше шума."))
 	}
-	if envSkipAntiScam() {
-		fmt.Println(red("⚠ SKIP_ANTI_SCAM=1 — фильтр скама отключён; в live можно слить SOL на мусор."))
+	if shouldSkipAntiScam() {
+		fmt.Println(red("⚠ Anti-scam фильтры отключены (SKIP/AUTO) — в live можно слить SOL на мусор."))
 	}
 
 	refreshSolPriceUSD()
@@ -3140,8 +3168,8 @@ func main() {
 				}()
 				go func() {
 					defer wg.Done()
-					if envSkipAntiScam() {
-						scamOK, scamMeta = true, "[SKIP_ANTI_SCAM тест — не для реальной торговли]"
+					if shouldSkipAntiScam() {
+						scamOK, scamMeta = true, "[anti-scam skip (SKIP/AUTO) — не для безопасной торговли]"
 					} else {
 						scamOK, scamMeta = antiScamCheck(mint, bc, liqVault, creator, createAt, extraMint...)
 					}

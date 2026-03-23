@@ -83,9 +83,11 @@ const (
 	CREATOR_BALANCE_CACHE_TTL  = 5 * time.Minute
 
 	// Анти-скам
-	CREATOR_SOL_MIN     = 2.0  // min 2 SOL у дева — только «жирные», не rug
-	CREATOR_SOL_SUSPECT = 80.0
-	MAX_NONCURVE_PCT    = 0.12
+	CREATOR_SOL_MIN       = 2.0  // min 2 SOL у дева — только «жирные», не rug
+	CREATOR_SOL_SUSPECT   = 80.0
+	MAX_NONCURVE_PCT      = 0.12
+	TOP10_HOLDERS_MAX_PCT = 0.30 // топ-10 (excl curve) >30% — кластер, сольют
+	DEV_MAX_TXS_HOUR      = 7    // dev >7 tx/час — serial rugger (создаёт 4+ токенов)
 
 	// Выходы Final Recovery: hard SL -30%; TP только от +150%.
 	STOP_LOSS_HARD   = 0.85 // -15% (было -30% — режем быстрее на pump.fun)
@@ -107,8 +109,8 @@ const (
 	MAX_CREATE_TX_AGE = 30 * time.Minute
 	MAX_READY_TO_SEND_DELAY = 2500 * time.Millisecond
 
-	VELOCITY_PAUSE         = 300 * time.Millisecond // микро-velocity (ранее 500ms — ускорение входа)
-	VELOCITY_MIN_DPROGRESS = 0.0
+	VELOCITY_PAUSE         = 500 * time.Millisecond // 500ms — видим, что другие покупают
+	VELOCITY_MIN_DPROGRESS = 0.02                   // min +2% за паузу — только первая волна
 	VELOCITY_MIN_DREALSOL  = 0.0
 	VELOCITY_MIN_DELTA_DP  = -0.0001 // -0.01% (разрешаем микро-откат на замере)
 	LIVE_FIXED_BUY_SOL     = 0.015 // target fixed buy size
@@ -1100,6 +1102,7 @@ func adaptiveVelocityParams(createAt *time.Time, snap0 *curveSnap) (pause time.D
 			minDSol *= 1.15
 		}
 	}
+	minDP = math.Max(minDP, 0.02) // не ниже +2% — quality over quantity
 	return pause, minDP, minDSol, tag
 }
 
@@ -1604,6 +1607,38 @@ func devSoldInFirstMinute(creator string, createAt *time.Time) (bool, string) {
 	return false, "dev holding"
 }
 
+func devCreatedTooMany(creator string) bool {
+	if creator == "" {
+		return false
+	}
+	data, err := rpc("getSignaturesForAddress", []interface{}{
+		creator, map[string]interface{}{"limit": 30},
+	})
+	if err != nil {
+		return false
+	}
+	var out struct {
+		Result []struct {
+			BlockTime int64 `json:"blockTime"`
+		} `json:"result"`
+	}
+	if json.Unmarshal(data, &out) != nil {
+		return false
+	}
+	now := time.Now().Unix()
+	hourAgo := now - 3600
+	count := 0
+	for _, s := range out.Result {
+		if s.BlockTime >= hourAgo && s.BlockTime <= now {
+			count++
+			if count > DEV_MAX_TXS_HOUR {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 func topHolderOwners(mint string, limit int) ([]string, error) {
 	data, err := rpc("getTokenLargestAccounts", []interface{}{
 		mint, map[string]string{"commitment": "confirmed"},
@@ -1675,6 +1710,56 @@ func bundledBuyersCheck(mint, creator string, createAt *time.Time) (bool, string
 	return true, fmt.Sprintf("bundle ok (%d)", sameBlock)
 }
 
+// Топ-10 холдеров (excl curve) >30% — кластер сольёт в первую секунду
+func rpcTop10HoldersClusterOK(mint, bondingCurve string) (ok bool, detail string) {
+	data, err := rpc("getTokenLargestAccounts", []interface{}{
+		mint, map[string]string{"commitment": "confirmed"},
+	})
+	if err != nil {
+		return true, "" // при ошибке пропускаем
+	}
+	var out struct {
+		Result struct {
+			Value []struct {
+				Address string `json:"address"`
+				Amount  string `json:"amount"`
+			} `json:"value"`
+		} `json:"result"`
+	}
+	if json.Unmarshal(data, &out) != nil || len(out.Result.Value) == 0 {
+		return true, ""
+	}
+	totalStr, err := rpcGetTokenSupplyRaw(mint)
+	if err != nil {
+		return true, ""
+	}
+	total, _ := strconv.ParseFloat(totalStr, 64)
+	if total <= 0 {
+		return true, ""
+	}
+	var top10NonCurve float64
+	n := 0
+	for _, row := range out.Result.Value {
+		if n >= 10 {
+			break
+		}
+		owner, err := rpcParsedTokenAccountOwner(row.Address)
+		if err != nil {
+			continue
+		}
+		if owner == bondingCurve {
+			continue
+		}
+		amt, _ := strconv.ParseFloat(row.Amount, 64)
+		top10NonCurve += amt
+		n++
+	}
+	if total > 0 && top10NonCurve/total > TOP10_HOLDERS_MAX_PCT {
+		return false, fmt.Sprintf("топ-10 холдеров %.0f%% > %.0f%% — кластер сольёт", 100*top10NonCurve/total, 100*TOP10_HOLDERS_MAX_PCT)
+	}
+	return true, ""
+}
+
 // Топ-холдеры: кривая должна держать львиную долю; иначе — раздача/скам-паттерн
 func antiScamThresholds() (creatorMinSOL, creatorMaxSOL, minCurveShare, maxNonCurveShare float64) {
 	creatorMinSOL = CREATOR_SOL_MIN
@@ -1725,8 +1810,8 @@ func rpcHolderDistributionOK(mint, bondingCurve, creator string, minCurveShare, 
 	var curveAmt float64
 	var nonCurve float64
 	lim := len(out.Result.Value)
-	if lim > 6 {
-		lim = 6
+	if lim > 12 {
+		lim = 12
 	}
 	for _, row := range out.Result.Value[:lim] {
 		owner, err := rpcParsedTokenAccountOwner(row.Address)
@@ -1743,6 +1828,9 @@ func rpcHolderDistributionOK(mint, bondingCurve, creator string, minCurveShare, 
 				return false, fmt.Sprintf("создатель держит %.1f%% вне кривой", 100*amt/total)
 			}
 		}
+	}
+	if okTop10, detailTop10 := rpcTop10HoldersClusterOK(mint, bondingCurve); !okTop10 {
+		return false, detailTop10
 	}
 	if curveAmt/total < minCurveShare {
 		return false, fmt.Sprintf("в кривой только %.0f%% саплая (нужно ≥%.0f%%)", 100*curveAmt/total, 100*minCurveShare)
@@ -1784,6 +1872,12 @@ func antiScamCheck(mint, mintAuthorityRef, liquidityVault, creator string, creat
 		if okSocial, socialDetail, cached := socialFromCacheOnly(mint); cached && !okSocial {
 			return false, socialDetail
 		}
+		if okTop10, detailTop10 := rpcTop10HoldersClusterOK(mint, mintAuthorityRef); !okTop10 {
+			return false, detailTop10
+		}
+		if devCreatedTooMany(creator) {
+			return false, "dev serial rugger (>7 tx/час)"
+		}
 		return true, fmt.Sprintf("fast anti-scam | dev %.2f SOL", sol)
 	}
 
@@ -1818,6 +1912,10 @@ func antiScamCheck(mint, mintAuthorityRef, liquidityVault, creator string, creat
 	// creator history
 	go func() {
 		defer wg.Done()
+		if devCreatedTooMany(creator) {
+			results <- filterResult{key: "creator", ok: false, detail: "dev serial rugger (>7 tx/час)"}
+			return
+		}
 		if sold, soldDetail := devSoldInFirstMinute(creator, createAt); sold {
 			results <- filterResult{key: "creator", ok: false, detail: soldDetail}
 			return

@@ -2825,7 +2825,11 @@ func main() {
 		fmt.Println(bold("║   Реальные токены · Реальные цены · Виртуальные деньги  ║"))
 	}
 	fmt.Println(bold("╚══════════════════════════════════════════════════════════╝"))
-	fmt.Println(green("✓ Helius WebSocket — Pump.fun + Raydium LaunchLab (два потока)"))
+	if liveTradingEnabled() {
+		fmt.Println(green("✓ Helius WebSocket — Pump.fun (live поток)"))
+	} else {
+		fmt.Println(green("✓ Helius WebSocket — Pump.fun + Raydium LaunchLab (два потока)"))
+	}
 	fmt.Println(green("✓ Bonding Curve Price — прямо из on-chain данных"))
 	if liveTradingEnabled() {
 		fmt.Printf("%s LIVE кошелёк %s | %s\n", green("✓"), cyan(short(livePub.String())),
@@ -2902,7 +2906,10 @@ func main() {
 	sem := make(chan struct{}, RPC_MAX_CONCURRENT)
 
 	go listenPumpWSS(tokenCh)
-	go listenProgram(LAUNCHLAB_PROGRAM, "Raydium LaunchLab", launchLabInitFromLogs, tokenCh, "launchlab")
+	// В live-режиме торгуем только Pump.fun curve: LaunchLab поток создаёт лишний шум/задержки.
+	if !liveTradingEnabled() {
+		go listenProgram(LAUNCHLAB_PROGRAM, "Raydium LaunchLab", launchLabInitFromLogs, tokenCh, "launchlab")
+	}
 
 	go func() {
 		for tok := range tokenCh {

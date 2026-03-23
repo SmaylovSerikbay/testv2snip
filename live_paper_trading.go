@@ -28,6 +28,23 @@ import (
 // Тестовые флаги окружения (для отладки, не для «боевой» охоты за качеством).
 func envSkipVelocity() bool { return strings.TrimSpace(os.Getenv("SKIP_VELOCITY")) == "1" }
 func envSkipAntiScam() bool { return strings.TrimSpace(os.Getenv("SKIP_ANTI_SCAM")) == "1" }
+func turboModeEnabled() bool {
+	if !(liveTradingEnabled() && envSignalProfile() == "aggressive") {
+		return false
+	}
+	s := strings.TrimSpace(strings.ToLower(os.Getenv("AUTO_TURBO_MODE")))
+	if s == "0" || s == "false" || s == "no" {
+		return false
+	}
+	return true
+}
+func shouldSkipVelocity() bool {
+	if envSkipVelocity() {
+		return true
+	}
+	// В turbo-mode режем velocity-check ради скорости входа.
+	return turboModeEnabled()
+}
 func shouldSkipAntiScam() bool {
 	if envSkipAntiScam() {
 		return true
@@ -856,22 +873,41 @@ func isSignatureConfirmed(sig string) (bool, string, error) {
 
 func waitBuySettlement(sig, mint string, timeout time.Duration) (ok bool, reason string) {
 	deadline := time.Now().Add(timeout)
+	seenInNetwork := false
 	for time.Now().Before(deadline) {
 		confirmed, status, err := isSignatureConfirmed(sig)
-		if err == nil && confirmed {
-			if raw, berr := PumpDirectTokenRawBalance(mint); berr == nil && raw > 0 {
-				return true, "confirmed+" + status
+		if err == nil {
+			if status != "" && status != "rejected" {
+				seenInNetwork = true
+			}
+			if confirmed {
+				if raw, berr := PumpDirectTokenRawBalance(mint); berr == nil && raw > 0 {
+					return true, "confirmed+" + status
+				}
 			}
 		}
+		if raw, berr := PumpDirectTokenRawBalance(mint); berr == nil && raw > 0 {
+			return true, "token_balance_seen"
+		}
 		time.Sleep(500 * time.Millisecond)
+	}
+	if seenInNetwork {
+		return true, "pending_confirmation"
 	}
 	return false, "no_confirmation_or_zero_balance"
 }
 
 func (w *Wallet) verifyBuyAsync(mint, sym, sig string, detectedAt time.Time) {
 	ok, reason := waitBuySettlement(sig, mint, 5*time.Second)
+	if !ok {
+		ok, reason = waitBuySettlement(sig, mint, 25*time.Second)
+	}
 	if ok {
-		if !detectedAt.IsZero() {
+		if reason == "pending_confirmation" {
+			consoleMu.Lock()
+			fmt.Printf("%s BUY PENDING %s | sig=%s | waiting network confirmation\n", yellow("⏳"), sym, gray(sig))
+			consoleMu.Unlock()
+		} else if !detectedAt.IsZero() {
 			consoleMu.Lock()
 			fmt.Printf("%s Transaction Confirmed | %s | +%dms\n",
 				gray("⏱"), "$"+short(mint), time.Since(detectedAt).Milliseconds())
@@ -1064,9 +1100,17 @@ func getCurveSnapshotUnified(bcAddr, source string) (*curveSnap, error) {
 func getCurveSnapshotWithRetry(bcAddr string, source string) (*curveSnap, error) {
 	var last *curveSnap
 	var lastErr error
-	for attempt := 0; attempt < 3; attempt++ {
+	tries := 3
+	if turboModeEnabled() {
+		tries = 2
+	}
+	for attempt := 0; attempt < tries; attempt++ {
 		if attempt > 0 {
-			time.Sleep(time.Duration(50*attempt) * time.Millisecond)
+			pause := 50 * attempt
+			if turboModeEnabled() {
+				pause = 25 * attempt
+			}
+			time.Sleep(time.Duration(pause) * time.Millisecond)
 		}
 		s, err := getCurveSnapshotUnified(bcAddr, source)
 		last, lastErr = s, err
@@ -1083,8 +1127,8 @@ func curveVelocityOK(bc string, snap0 *curveSnap, source string, createAt *time.
 	if snap0 == nil || snap0.Complete {
 		return nil, false, "нет снимка", "velocity"
 	}
-	if envSkipVelocity() {
-		return snap0, true, "SKIP_VELOCITY=1 (без паузы и второго замера)", ""
+	if shouldSkipVelocity() {
+		return snap0, true, "SKIP_VELOCITY/AUTO (без паузы и второго замера)", ""
 	}
 	pause, minDP, minDSol, mode := adaptiveVelocityParams(createAt, snap0)
 	time.Sleep(pause)
@@ -1259,7 +1303,11 @@ func getTransactionJSONParsedFast(sig string) ([]byte, error) {
 	}
 
 	// Быстрый путь для hot-path: сначала processed, чтобы не ждать подтверждение.
-	for attempt := 0; attempt < 3; attempt++ {
+	tries := 3
+	if turboModeEnabled() {
+		tries = 1
+	}
+	for attempt := 0; attempt < tries; attempt++ {
 		data, err := rpc("getTransaction", params("processed"))
 		if err == nil {
 			var wrap struct {
@@ -1269,7 +1317,7 @@ func getTransactionJSONParsedFast(sig string) ([]byte, error) {
 				return data, nil
 			}
 		}
-		if attempt < 2 {
+		if attempt < tries-1 {
 			time.Sleep(time.Duration(60*(attempt+1)) * time.Millisecond)
 		}
 	}
@@ -2917,11 +2965,14 @@ func main() {
 			fmt.Println(yellow("⚠ Jito bundles: ВЫКЛ (идет обычный RPC sendTransaction)"))
 		}
 	}
-	if envSkipVelocity() {
-		fmt.Println(yellow("⚠ SKIP_VELOCITY=1 — нет 2.6с паузы и второго замера; больше входов, больше шума."))
+	if shouldSkipVelocity() {
+		fmt.Println(yellow("⚠ Velocity-check отключён (SKIP/AUTO) — больше входов, больше шума."))
 	}
 	if shouldSkipAntiScam() {
 		fmt.Println(red("⚠ Anti-scam фильтры отключены (SKIP/AUTO) — в live можно слить SOL на мусор."))
+	}
+	if turboModeEnabled() {
+		fmt.Println(yellow("⚠ TURBO mode (live+aggressive): ускоренный hot-path с минимальными проверками."))
 	}
 
 	refreshSolPriceUSD()
@@ -3194,7 +3245,7 @@ func main() {
 					return
 				}
 				atomic.AddInt64(&funnelPassVel, 1)
-				if src == "pump" && snap1.Progress > FAST_HEAVY_CHECK_CURVE_MAX {
+				if src == "pump" && !turboModeEnabled() && snap1.Progress > FAST_HEAVY_CHECK_CURVE_MAX {
 					logRejectLine("late", sym, mint, fmt.Sprintf("fast-gate: curve %.1f%% > %.1f%% до тяжёлых RPC-проверок",
 						snap1.Progress*100, FAST_HEAVY_CHECK_CURVE_MAX*100))
 					if !tok.DetectedAt.IsZero() {

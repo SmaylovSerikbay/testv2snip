@@ -978,6 +978,15 @@ func monitorMaxPriceFails() int {
 	return 8
 }
 
+func monitorFailLogEvery() int {
+	if s := strings.TrimSpace(os.Getenv("MONITOR_FAIL_LOG_EVERY")); s != "" {
+		if v, err := strconv.Atoi(s); err == nil && v >= 1 && v <= 20 {
+			return v
+		}
+	}
+	return 3
+}
+
 func monitorTickInterval() time.Duration {
 	if s := strings.TrimSpace(os.Getenv("MONITOR_TICK_MS")); s != "" {
 		if v, err := strconv.Atoi(s); err == nil && v >= 200 && v <= 3000 {
@@ -2840,17 +2849,19 @@ func monitor(w *Wallet, mint, bcAddr, sym, source string) {
 	consecutiveFails := 0
 	confirmedStopTicks := 0
 	maxPriceFails := monitorMaxPriceFails()
+	failLogEvery := monitorFailLogEvery()
 	quickWindow := quickPumpWindow()
 	quickTP := quickPumpTakeProfitMult()
 	var lastMult float64
 	var lastPrint time.Time
+	var lastFailPrint time.Time
 	const monitorPrintMinMove = 0.0025 // ~0.25% к цене входа — новая строка
 	monitorHeartbeat := 12 * time.Second
 
 	for {
 		select {
 		case <-timeout.C:
-			snap, _ := getCurveSnapshotUnified(bcAddr, source)
+			snap, _ := getCurveSnapshotWithRetry(bcAddr, source)
 			px := 0.0
 			if snap != nil {
 				px = snap.PriceUSD
@@ -2870,7 +2881,7 @@ func monitor(w *Wallet, mint, bcAddr, sym, source string) {
 				return
 			}
 
-			snap, err := getCurveSnapshotUnified(bcAddr, source)
+			snap, err := getCurveSnapshotWithRetry(bcAddr, source)
 			if err != nil || snap == nil || snap.PriceUSD <= 0 {
 				consecutiveFails++
 				pos.mu.Lock()
@@ -2885,7 +2896,12 @@ func monitor(w *Wallet, mint, bcAddr, sym, source string) {
 				if livePos && openedFor < 20*time.Second && consecutiveFails > maxPriceFails {
 					consecutiveFails = maxPriceFails
 				}
-				fmt.Printf("  %s %-18s | ошибка цены (%d/%d)\n", gray("?"), sym, consecutiveFails, maxPriceFails)
+				now := time.Now()
+				shouldPrint := consecutiveFails <= 2 || (consecutiveFails%failLogEvery == 0)
+				if now.Sub(lastFailPrint) >= 1200*time.Millisecond && shouldPrint {
+					fmt.Printf("  %s %-18s | ошибка цены (%d/%d)\n", gray("?"), sym, consecutiveFails, maxPriceFails)
+					lastFailPrint = now
+				}
 				continue
 			}
 			consecutiveFails = 0

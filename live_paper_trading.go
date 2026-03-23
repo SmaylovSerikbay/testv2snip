@@ -65,8 +65,10 @@ const (
 	// Оценка сети на одну подпись (бумага); live — по факту RPC / pump
 	SOLANA_TX_LAMPORTS = 12_000.0
 
-	PRICE_TICK = 1500 * time.Millisecond // 1.5s — чаще ловим памп (было 3s)
-	MAX_HOLD   = 3 * time.Minute
+	PRICE_TICK   = 1500 * time.Millisecond // 1.5s — чаще ловим памп
+	MAX_HOLD     = 30 * time.Second        // 30 сек — не ждём 3 мин, если монета мёртвая
+	FAST_EXIT_AFTER = 30 * time.Second     // если за 30с нет +5% — выходим
+	FAST_EXIT_MIN_MULT = 1.05              // +5%
 	// Сервисные интервалы/лимиты RPC для защиты от -32429.
 	BALANCE_CHECK_INTERVAL = 30 * time.Second
 	RPC_RETRY_BASE_DELAY  = 2 * time.Second
@@ -81,7 +83,7 @@ const (
 	CREATOR_BALANCE_CACHE_TTL  = 5 * time.Minute
 
 	// Анти-скам
-	CREATOR_SOL_MIN     = 0.04 // не слишком режем поток, но отсеиваем совсем пустых
+	CREATOR_SOL_MIN     = 2.0  // min 2 SOL у дева — только «жирные», не rug
 	CREATOR_SOL_SUSPECT = 80.0
 	MAX_NONCURVE_PCT    = 0.12
 
@@ -90,7 +92,7 @@ const (
 	STOP_CONFIRM_LVL = 0.85 // -15%
 	STOP_CONFIRM_N   = 1
 	SELL_SLIPPAGE_GUARD = 0.10 // >10% ожидаемого slip на выходе — подождать следующий тик
-	TAKE_PROFIT      = 1.15 // +15% (было 25% — пампы короткие, фиксируем раньше)
+	TAKE_PROFIT      = 1.10 // +10% — 10 быстрых сделок по ~$0.50, не ждём x10
 	TRAIL_ACTIVATE   = 1.15 // трейлинг после +15% (было +40%)
 	TRAILING         = 0.12 // откат 12% от пика (было 16%)
 	TRAIL_MIN_AGE    = 5 * time.Second  // был 10s — трейл раньше
@@ -1686,7 +1688,7 @@ func antiScamThresholds() (creatorMinSOL, creatorMaxSOL, minCurveShare, maxNonCu
 		minCurveShare = 0.62
 		maxNonCurveShare = math.Min(maxNonCurveShare, 0.10)
 	case "aggressive":
-		creatorMinSOL = math.Min(creatorMinSOL, 0.02)
+		creatorMinSOL = math.Min(creatorMinSOL, 2.0) // не ниже 2 SOL
 		minCurveShare = 0.45
 		maxNonCurveShare = math.Max(maxNonCurveShare, 0.18)
 	}
@@ -2433,7 +2435,11 @@ func monitor(w *Wallet, mint, bcAddr, sym, source string) {
 			if snap != nil {
 				px = snap.PriceUSD
 			}
-			w.closePos(mint, fmt.Sprintf("ТАЙМАУТ %.0f мин", MAX_HOLD.Minutes()), px)
+			holdStr := fmt.Sprintf("%.0fс", MAX_HOLD.Seconds())
+			if MAX_HOLD >= time.Minute {
+				holdStr = fmt.Sprintf("%.0f мин", MAX_HOLD.Minutes())
+			}
+			w.closePos(mint, fmt.Sprintf("ТАЙМАУТ %s", holdStr), px)
 			return
 
 		case <-ticker.C:
@@ -2536,7 +2542,12 @@ func monitor(w *Wallet, mint, bcAddr, sym, source string) {
 				w.closePos(mint, "БРЕЙК-ИВН после импульса", price)
 				return
 			}
-			// SCRATCH: флэт >2 мин — освобождаем капитал (не ждём 3 мин таймаута)
+			// Fast Exit: за 30с нет +5% — выходим, не ждём пока сольёт
+			if time.Since(opened) >= FAST_EXIT_AFTER && mult < FAST_EXIT_MIN_MULT {
+				w.closePos(mint, fmt.Sprintf("FAST EXIT (нет +5%% за %.0fс, spot %.1f%%)", FAST_EXIT_AFTER.Seconds(), (mult-1)*100), price)
+				return
+			}
+			// SCRATCH: флэт >2 мин — освобождаем капитал (если не вылетели по FAST EXIT)
 			if time.Since(opened) >= SCRATCH_AFTER && mult < SCRATCH_IF_BELOW {
 				w.closePos(mint, fmt.Sprintf("СКРЕТЧ (флэт %.0f мин, spot %.1f%%)", SCRATCH_AFTER.Minutes(), (mult-1)*100), price)
 				return

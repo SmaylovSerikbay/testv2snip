@@ -30,6 +30,9 @@ func liveReserveSOLValue() float64 {
 			return v
 		}
 	}
+	if ultraFastEntryMode() {
+		return 0.002
+	}
 	return liveReserveSOL
 }
 

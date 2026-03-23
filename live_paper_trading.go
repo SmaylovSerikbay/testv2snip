@@ -1014,13 +1014,17 @@ func quickPumpTakeProfitMult() float64 {
 }
 
 func liveFixedBuySOLValue() float64 {
-	// Совместимость: FIXED_STAKE и FIXED_STAKE_SOL.
-	for _, k := range []string{"FIXED_STAKE_SOL", "FIXED_STAKE"} {
+	// Совместимость: несколько имён переменных для фикс-ставки.
+	for _, k := range []string{"FIXED_STAKE_SOL", "FIXED_STAKE", "LIVE_FIXED_BUY_SOL", "BUY_SOL"} {
 		if s := strings.TrimSpace(os.Getenv(k)); s != "" {
 			if v, err := strconv.ParseFloat(s, 64); err == nil && v >= 0.001 && v <= 1.0 {
 				return v
 			}
 		}
+	}
+	// Safety fallback: в ultra-fast режиме используем мелкую ставку по умолчанию.
+	if ultraFastEntryMode() {
+		return 0.005
 	}
 	return LIVE_FIXED_BUY_SOL
 }
@@ -2376,6 +2380,9 @@ func (w *Wallet) open(tok NewToken, sym string, spot float64) bool {
 		w.mu.Lock()
 		if len(w.Pos) >= MAX_POSITIONS {
 			w.mu.Unlock()
+			consoleMu.Lock()
+			fmt.Printf("%s open reject %s | position_limit=%d\n", yellow("⚠"), sym, MAX_POSITIONS)
+			consoleMu.Unlock()
 			return false
 		}
 		w.mu.Unlock()
@@ -2421,6 +2428,9 @@ func (w *Wallet) open(tok NewToken, sym string, spot float64) bool {
 // openLive — реальный свап SOL→токен только через Pump.fun bonding curve (pump_direct).
 func (w *Wallet) openLive(tok NewToken, sym string, spot float64, capitalUSD float64) bool {
 	if abortIfTooLate(tok, "open_live_start") {
+		consoleMu.Lock()
+		fmt.Printf("%s open reject %s | latency_guard\n", yellow("⚠"), sym)
+		consoleMu.Unlock()
 		return false
 	}
 	if !liveUsePumpDirect(tok) {
@@ -2438,6 +2448,9 @@ func (w *Wallet) openLive(tok NewToken, sym string, spot float64, capitalUSD flo
 	w.mu.Unlock()
 	solBal := memBalanceUSD / solPrice
 	if solBal <= 0 {
+		consoleMu.Lock()
+		fmt.Printf("%s open reject %s | zero_balance\n", yellow("⚠"), sym)
+		consoleMu.Unlock()
 		return false
 	}
 	reserve := liveReserveSOLValue()
@@ -2449,12 +2462,16 @@ func (w *Wallet) openLive(tok NewToken, sym string, spot float64, capitalUSD flo
 	}
 	if solForSwap <= 0.001 {
 		consoleMu.Lock()
-		fmt.Println(yellow("⚠ LIVE: мало SOL после резерва под комиссии"))
+		fmt.Printf("%s open reject %s | мало SOL после резерва (bal=%.4f SOL reserve=%.4f)\n",
+			yellow("⚠"), sym, solBal, reserve)
 		consoleMu.Unlock()
 		return false
 	}
 	lamports := uint64(solForSwap * 1e9)
 	if lamports < 50_000 {
+		consoleMu.Lock()
+		fmt.Printf("%s open reject %s | lamports_too_low=%d\n", yellow("⚠"), sym, lamports)
+		consoleMu.Unlock()
 		return false
 	}
 	var tokenRaw uint64
@@ -2471,11 +2488,9 @@ func (w *Wallet) openLive(tok NewToken, sym string, spot float64, capitalUSD flo
 		tokenRaw, sig, solIn, sentAt, err = PumpDirectBuy(tok.Mint, lamports)
 	}
 	if err != nil {
-		if !hotPathSilent() {
-			consoleMu.Lock()
-			fmt.Printf("%s %v\n", red("❌ Pump buy:"), err)
-			consoleMu.Unlock()
-		}
+		consoleMu.Lock()
+		fmt.Printf("%s Pump buy %s | %v\n", red("❌"), sym, err)
+		consoleMu.Unlock()
 		syncWalletBalanceUSDFresh(w)
 		return false
 	}
@@ -2510,6 +2525,9 @@ func (w *Wallet) openLive(tok NewToken, sym string, spot float64, capitalUSD flo
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	if len(w.Pos) >= MAX_POSITIONS {
+		consoleMu.Lock()
+		fmt.Printf("%s open reject %s | position_limit=%d\n", yellow("⚠"), sym, MAX_POSITIONS)
+		consoleMu.Unlock()
 		return false
 	}
 	w.Pos[tok.Mint] = &Position{

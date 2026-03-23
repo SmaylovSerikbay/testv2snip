@@ -193,6 +193,10 @@ var (
 	funnelOpenOK    int64 // open() = true
 	funnelOpenFail  int64 // open() = false (редко: баланс/лимит)
 	liveBuyInFlight int32 // защита от параллельных buy в live
+	feeGuardState   struct {
+		mu    sync.Mutex
+		until time.Time
+	}
 )
 
 // Подписи ключей в минутной сводке (рус./кратко)
@@ -1061,6 +1065,42 @@ func liveFixedBuySOLValue() float64 {
 		return 0.005
 	}
 	return LIVE_FIXED_BUY_SOL
+}
+
+func minFeeReserveSOLValue() float64 {
+	if s := strings.TrimSpace(os.Getenv("MIN_FEE_RESERVE_SOL")); s != "" {
+		if v, err := strconv.ParseFloat(s, 64); err == nil && v >= 0.001 && v <= 0.05 {
+			return v
+		}
+	}
+	if ultraFastEntryMode() {
+		return 0.004
+	}
+	return 0.003
+}
+
+func isInsufficientFeeErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	s := strings.ToLower(err.Error())
+	return strings.Contains(s, "insufficient funds for fee") ||
+		strings.Contains(s, "insufficientfundsforfee")
+}
+
+func feeGuardActive() bool {
+	feeGuardState.mu.Lock()
+	defer feeGuardState.mu.Unlock()
+	return time.Now().Before(feeGuardState.until)
+}
+
+func activateFeeGuard(d time.Duration, reason string) {
+	feeGuardState.mu.Lock()
+	feeGuardState.until = time.Now().Add(d)
+	feeGuardState.mu.Unlock()
+	consoleMu.Lock()
+	fmt.Printf("%s fee-guard %ds: %s\n", yellow("⚠"), int(d.Seconds()), reason)
+	consoleMu.Unlock()
 }
 
 func printHotPathTrace(sym, src, status, detail string, parseMs, curveMs, checksMs int64, totalMs int64) {
@@ -2467,6 +2507,12 @@ func (w *Wallet) openLive(tok NewToken, sym string, spot float64, capitalUSD flo
 		consoleMu.Unlock()
 		return false
 	}
+	if feeGuardActive() {
+		consoleMu.Lock()
+		fmt.Printf("%s open reject %s | fee_guard_active\n", yellow("⚠"), sym)
+		consoleMu.Unlock()
+		return false
+	}
 	if !liveUsePumpDirect(tok) {
 		consoleMu.Lock()
 		fmt.Println(yellow("⚠ LIVE: только Pump.fun на кривой — LaunchLab/другие источники в live отключены (бумага без изменений)."))
@@ -2477,17 +2523,20 @@ func (w *Wallet) openLive(tok NewToken, sym string, spot float64, capitalUSD flo
 	if solPrice < 1 {
 		return false
 	}
-	w.mu.Lock()
-	memBalanceUSD := w.Balance
-	w.mu.Unlock()
-	solBal := memBalanceUSD / solPrice
+	solBal, balErr := rpcRefreshBalanceSOLCached(livePub.String())
+	if balErr != nil {
+		w.mu.Lock()
+		memBalanceUSD := w.Balance
+		w.mu.Unlock()
+		solBal = memBalanceUSD / solPrice
+	}
 	if solBal <= 0 {
 		consoleMu.Lock()
 		fmt.Printf("%s open reject %s | zero_balance\n", yellow("⚠"), sym)
 		consoleMu.Unlock()
 		return false
 	}
-	reserve := liveReserveSOLValue()
+	reserve := math.Max(liveReserveSOLValue(), minFeeReserveSOLValue())
 	_ = capitalUSD
 	availableAfterReserve := solBal - reserve
 	solForSwap := liveFixedBuySOLValue()
@@ -2532,6 +2581,9 @@ func (w *Wallet) openLive(tok NewToken, sym string, spot float64, capitalUSD flo
 		consoleMu.Lock()
 		fmt.Printf("%s Pump buy %s | %v\n", red("❌"), sym, err)
 		consoleMu.Unlock()
+		if isInsufficientFeeErr(err) {
+			activateFeeGuard(45*time.Second, "insufficient funds for fee on buy")
+		}
 		syncWalletBalanceUSDFresh(w)
 		return false
 	}
@@ -2685,6 +2737,9 @@ func (w *Wallet) closePosLive(pos *Position, reason string, spot float64) {
 		consoleMu.Lock()
 		fmt.Printf("%s %v\n", red("❌ Pump sell:"), err)
 		consoleMu.Unlock()
+		if isInsufficientFeeErr(err) {
+			activateFeeGuard(60*time.Second, "insufficient funds for fee on sell (need SOL for exit tx)")
+		}
 		syncWalletBalanceUSD(w)
 		w.mu.Lock()
 		w.Pos[pos.Mint] = pos

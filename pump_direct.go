@@ -51,19 +51,19 @@ type buyLatencyBreakdown struct {
 
 const (
 	minMicroLamportsPerCU uint64 = 100_000
-	pumpComputeUnitLimit    uint32 = 600_000
+	pumpComputeUnitLimit  uint32 = 600_000
 )
 
 var (
-	pumpBuySlippageBps       uint64 = 2000 // buy 20%
-	pumpSellSlippageBps      uint64 = 2000 // sell 20%
+	pumpBuySlippageBps       uint64 = 2000    // buy 20%
+	pumpSellSlippageBps      uint64 = 2000    // sell 20%
 	pumpPriorityFeeLamports  uint64 = 200_000 // 0.0002 SOL (выживание малого банка)
 	jitoMinTipLamports       uint64 = 500_000 // 0.0005 SOL — "входной билет" для включения бандла в блок
-	pumpPriorityMaxFeeBps    uint64 = 100 // максимум приоритета как доля от размера сделки (1.0%)
+	pumpPriorityMaxFeeBps    uint64 = 100     // максимум приоритета как доля от размера сделки (1.0%)
 	pumpSellRetryPriorityFee uint64 = 8_000_000
-	pumpDirectRPC     *solanarpc.Client
-	pumpDirectRPCOnce sync.Once
-	priorityFeeCache struct {
+	pumpDirectRPC            *solanarpc.Client
+	pumpDirectRPCOnce        sync.Once
+	priorityFeeCache         struct {
 		mu       sync.Mutex
 		lamports uint64
 		ts       time.Time
@@ -73,9 +73,9 @@ var (
 		v  buyLatencyBreakdown
 	}
 	recentBlockhashCache struct {
-		mu       sync.Mutex
+		mu        sync.Mutex
 		blockhash solana.Hash
-		ts       time.Time
+		ts        time.Time
 	}
 	jitoLastSend struct {
 		mu sync.Mutex
@@ -318,7 +318,10 @@ func sendPumpTransaction(ctx context.Context, rpcClient *solanarpc.Client, tx *s
 
 	if useJitoInRace {
 		// Race: Jito и RPC одновременно — первый успех побеждает (~50ms вместо 300ms+)
-		type result struct{ ok bool; err error }
+		type result struct {
+			ok  bool
+			err error
+		}
 		jitoCh := make(chan result, 1)
 		rpcCh := make(chan result, 1)
 
@@ -778,17 +781,17 @@ func swapPumpFun(ctx context.Context, rpcClient *solanarpc.Client, wallet solana
 	}
 
 	var (
-		tokenProgram solana.PublicKey
-		mintDecimals uint8
-		feeRecipient solana.PublicKey
-		feeBps       uint64
+		tokenProgram  solana.PublicKey
+		mintDecimals  uint8
+		feeRecipient  solana.PublicKey
+		feeBps        uint64
 		creatorFeeBps uint64
-		vTok         uint64
-		vSol         uint64
-		realToken    uint64
-		complete     bool
-		creator      solana.PublicKey
-		firstErr     error
+		vTok          uint64
+		vSol          uint64
+		realToken     uint64
+		complete      bool
+		creator       solana.PublicKey
+		firstErr      error
 	)
 	var wg sync.WaitGroup
 	var errMu sync.Mutex

@@ -26,8 +26,8 @@ import (
 )
 
 // Тестовые флаги окружения (для отладки, не для «боевой» охоты за качеством).
-func envSkipVelocity() bool   { return strings.TrimSpace(os.Getenv("SKIP_VELOCITY")) == "1" }
-func envSkipAntiScam() bool   { return strings.TrimSpace(os.Getenv("SKIP_ANTI_SCAM")) == "1" }
+func envSkipVelocity() bool { return strings.TrimSpace(os.Getenv("SKIP_VELOCITY")) == "1" }
+func envSkipAntiScam() bool { return strings.TrimSpace(os.Getenv("SKIP_ANTI_SCAM")) == "1" }
 func velocityPause() time.Duration {
 	if s := strings.TrimSpace(os.Getenv("VELOCITY_PAUSE_MS")); s != "" {
 		if ms, err := strconv.Atoi(s); err == nil && ms >= 150 && ms <= 800 {
@@ -65,56 +65,56 @@ const (
 	// Оценка сети на одну подпись (бумага); live — по факту RPC / pump
 	SOLANA_TX_LAMPORTS = 12_000.0
 
-	PRICE_TICK   = 1500 * time.Millisecond // 1.5s — чаще ловим памп
-	MAX_HOLD     = 30 * time.Second        // 30 сек — не ждём 3 мин, если монета мёртвая
-	FAST_EXIT_AFTER = 30 * time.Second     // если за 30с нет +5% — выходим
-	FAST_EXIT_MIN_MULT = 1.05              // +5%
+	PRICE_TICK         = 1500 * time.Millisecond // 1.5s — чаще ловим памп
+	MAX_HOLD           = 30 * time.Second        // 30 сек — не ждём 3 мин, если монета мёртвая
+	FAST_EXIT_AFTER    = 30 * time.Second        // если за 30с нет +5% — выходим
+	FAST_EXIT_MIN_MULT = 1.05                    // +5%
 	// Сервисные интервалы/лимиты RPC для защиты от -32429.
 	BALANCE_CHECK_INTERVAL = 30 * time.Second
-	RPC_RETRY_BASE_DELAY  = 2 * time.Second
-	RPC_MAX_RETRIES       = 4
-	RPC_MAX_CONCURRENT    = 3
+	RPC_RETRY_BASE_DELAY   = 2 * time.Second
+	RPC_MAX_RETRIES        = 4
+	RPC_MAX_CONCURRENT     = 3
 
 	// Recovery Mode ($3.9): узкое окно + ликвидность, чтобы не брать «пустые» мёртвые пулы.
-	SNIPER_CURVE_MIN = 0.002 // 0.2%
-	SNIPER_CURVE_MAX = 0.15  // 15%
-	MIN_REAL_SOL     = 1.00  // минимум 1.0 SOL в кривой (ранние импульсы)
-	FAST_HEAVY_CHECK_CURVE_MAX = 0.05 // тяжёлые RPC-фильтры только до 5% кривой
+	SNIPER_CURVE_MIN           = 0.002 // 0.2%
+	SNIPER_CURVE_MAX           = 0.15  // 15%
+	MIN_REAL_SOL               = 1.00  // минимум 1.0 SOL в кривой (ранние импульсы)
+	FAST_HEAVY_CHECK_CURVE_MAX = 0.05  // тяжёлые RPC-фильтры только до 5% кривой
 	CREATOR_BALANCE_CACHE_TTL  = 5 * time.Minute
 
 	// Анти-скам
-	CREATOR_SOL_MIN       = 2.0  // min 2 SOL у дева — только «жирные», не rug
+	CREATOR_SOL_MIN       = 2.0 // min 2 SOL у дева — только «жирные», не rug
 	CREATOR_SOL_SUSPECT   = 80.0
 	MAX_NONCURVE_PCT      = 0.12
 	TOP10_HOLDERS_MAX_PCT = 0.30 // топ-10 (excl curve) >30% — кластер, сольют
 	DEV_MAX_TXS_HOUR      = 7    // dev >7 tx/час — serial rugger (создаёт 4+ токенов)
 
 	// Выходы Final Recovery: hard SL -30%; TP только от +150%.
-	STOP_LOSS_HARD   = 0.85 // -15% (было -30% — режем быстрее на pump.fun)
-	STOP_CONFIRM_LVL = 0.85 // -15%
-	STOP_CONFIRM_N   = 1
-	SELL_SLIPPAGE_GUARD = 0.10 // >10% ожидаемого slip на выходе — подождать следующий тик
-	TAKE_PROFIT      = 1.10 // +10% — 10 быстрых сделок по ~$0.50, не ждём x10
-	TRAIL_ACTIVATE   = 1.15 // трейлинг после +15% (было +40%)
-	TRAILING         = 0.12 // откат 12% от пика (было 16%)
-	TRAIL_MIN_AGE    = 5 * time.Second  // был 10s — трейл раньше
-	TRAIL_MIN_PROFIT = 1.05             // пол +5% (было +10%)
-	BREAKEVEN_ARM    = 1.10
-	SCRATCH_AFTER    = 2 * time.Minute  // не зависаем в флэте слишком долго
-	SCRATCH_IF_BELOW = 0.97             // скретч только если совсем плоско
-	NO_IMPULSE_AFTER = 4 * time.Minute // «нет импульса» — после умеренной консолидации
-	NO_IMPULSE_NEED  = 1.04            // пик должен хотя бы +4% к входу, иначе выход
+	STOP_LOSS_HARD      = 0.85 // -15% (было -30% — режем быстрее на pump.fun)
+	STOP_CONFIRM_LVL    = 0.85 // -15%
+	STOP_CONFIRM_N      = 1
+	SELL_SLIPPAGE_GUARD = 0.10            // >10% ожидаемого slip на выходе — подождать следующий тик
+	TAKE_PROFIT         = 1.10            // +10% — 10 быстрых сделок по ~$0.50, не ждём x10
+	TRAIL_ACTIVATE      = 1.15            // трейлинг после +15% (было +40%)
+	TRAILING            = 0.12            // откат 12% от пика (было 16%)
+	TRAIL_MIN_AGE       = 5 * time.Second // был 10s — трейл раньше
+	TRAIL_MIN_PROFIT    = 1.05            // пол +5% (было +10%)
+	BREAKEVEN_ARM       = 1.10
+	SCRATCH_AFTER       = 2 * time.Minute // не зависаем в флэте слишком долго
+	SCRATCH_IF_BELOW    = 0.97            // скретч только если совсем плоско
+	NO_IMPULSE_AFTER    = 4 * time.Minute // «нет импульса» — после умеренной консолидации
+	NO_IMPULSE_NEED     = 1.04            // пик должен хотя бы +4% к входу, иначе выход
 
 	// Если create-транзакция старше — не считаем «только что залистились» (защита от кривых сигналов)
-	MAX_CREATE_TX_AGE = 30 * time.Minute
+	MAX_CREATE_TX_AGE       = 30 * time.Minute
 	MAX_READY_TO_SEND_DELAY = 2500 * time.Millisecond
 
 	VELOCITY_PAUSE         = 500 * time.Millisecond // 500ms — видим, что другие покупают
 	VELOCITY_MIN_DPROGRESS = 0.02                   // min +2% за паузу — только первая волна
 	VELOCITY_MIN_DREALSOL  = 0.0
 	VELOCITY_MIN_DELTA_DP  = -0.0001 // -0.01% (разрешаем микро-откат на замере)
-	LIVE_FIXED_BUY_SOL     = 0.015 // target fixed buy size
-	LIVE_BUY_BALANCE_SHARE = 0.85  // or 85% of available SOL after reserve
+	LIVE_FIXED_BUY_SOL     = 0.015   // target fixed buy size
+	LIVE_BUY_BALANCE_SHARE = 0.85    // or 85% of available SOL after reserve
 	ACTIVE_POSITIONS_FILE  = "current_trades.json"
 
 	// Логи: false = не печатать каждый отсев (только сводка раз в минуту + успешный ВХОД)
@@ -332,11 +332,11 @@ var (
 // ════════════════════════════════════════════════════
 
 type NewToken struct {
-	Mint         string
-	BondingCurve string // pump: bonding curve PDA | launchlab: pool state PDA
-	Sig          string
-	Source       string // "pump" | "launchlab" (пусто = pump)
-	DetectedAt   time.Time
+	Mint            string
+	BondingCurve    string // pump: bonding curve PDA | launchlab: pool state PDA
+	Sig             string
+	Source          string // "pump" | "launchlab" (пусто = pump)
+	DetectedAt      time.Time
 	FiltersPassedAt time.Time
 }
 
@@ -366,11 +366,11 @@ type Position struct {
 	OpenedAt       time.Time
 	BreakevenArmed bool
 	// Боевой режим: фактические лампорты на входе и raw-баланс SPL для продажи
-	Live          bool
-	TokenRaw      uint64
-	BuyLamports   uint64
-	HalfTaken     bool
-	Source        string // pump | launchlab
+	Live        bool
+	TokenRaw    uint64
+	BuyLamports uint64
+	HalfTaken   bool
+	Source      string // pump | launchlab
 }
 
 // snapshotPosition — копия полей без mutex (для closePos из горутины мониторинга).
@@ -1882,8 +1882,8 @@ func antiScamCheck(mint, mintAuthorityRef, liquidityVault, creator string, creat
 	}
 
 	type filterResult struct {
-		key   string
-		ok    bool
+		key    string
+		ok     bool
 		detail string
 	}
 	results := make(chan filterResult, 5)
@@ -2428,7 +2428,7 @@ func (w *Wallet) stats() {
 		title = "LIVE WALLET — MAINNET (Pump.fun)"
 	}
 	fmt.Println("\n" + bold("┌──────────────────────────────────────────────┐"))
-	fmt.Println(bold("│  "+title+"                    │"))
+	fmt.Println(bold("│  " + title + "                    │"))
 	fmt.Println(bold("├──────────────────────────────────────────────┤"))
 	fmt.Printf("│  Баланс:   %-33s│\n", bs)
 	fmt.Printf("│  PnL:      %-33s│\n", ps)
@@ -3243,7 +3243,7 @@ func parseLaunchLabCreateTx(sig string) (mint, creator string, createBlockTime *
 		BlockTime *int64 `json:"blockTime"`
 		Meta      struct {
 			PostTokenBalances []postTokenBal `json:"postTokenBalances"`
-			LogMessages       []string         `json:"logMessages"`
+			LogMessages       []string       `json:"logMessages"`
 		} `json:"meta"`
 		Transaction struct {
 			Message struct {

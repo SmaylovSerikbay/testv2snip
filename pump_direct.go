@@ -1292,6 +1292,38 @@ func PumpDirectSellFraction(mintStr string, fraction float64) (sig string, soldR
 	return s.String(), soldRaw, out, nil
 }
 
+// PumpDirectTokenRawBalance — текущий raw-баланс токена в ATA live-кошелька.
+func PumpDirectTokenRawBalance(mintStr string) (uint64, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 6*time.Second)
+	defer cancel()
+	mint, err := solana.PublicKeyFromBase58(mintStr)
+	if err != nil {
+		return 0, err
+	}
+	owner := livePrivKey.PublicKey()
+	tokenProgram, err := mintTokenProgram(ctx, rpcPumpDirect(), mint)
+	if err != nil {
+		return 0, err
+	}
+	ata, _, err := solana.FindProgramAddress(
+		[][]byte{owner.Bytes(), tokenProgram.Bytes(), mint.Bytes()},
+		solana.SPLAssociatedTokenAccountProgramID,
+	)
+	if err != nil {
+		return 0, err
+	}
+	bal, err := rpcPumpDirect().GetTokenAccountBalance(ctx, ata, solanarpc.CommitmentProcessed)
+	if err != nil || bal == nil || bal.Value == nil {
+		// Нет ATA/баланса — считаем что позиции нет.
+		return 0, nil
+	}
+	raw, err := strconv.ParseUint(bal.Value.Amount, 10, 64)
+	if err != nil {
+		return 0, err
+	}
+	return raw, nil
+}
+
 // PumpDirectEstimateSellSlippage — оценка проскальзывания продажи относительно spot цены.
 // Возвращает долю (0.15 = 15% хуже spot).
 func PumpDirectEstimateSellSlippage(mintStr string, tokenRaw uint64, spotUSD float64) (float64, error) {

@@ -483,6 +483,19 @@ func (w *Wallet) loadActivePositions() {
 		if pp.Mint == "" || pp.BondingCurve == "" || !pp.Live {
 			continue
 		}
+		// Не поднимаем сильно старые сделки после рестарта: они блокируют новые входы при MAX_POSITIONS=1.
+		if pp.OpenedAt.IsZero() || time.Since(pp.OpenedAt) > (MAX_HOLD+90*time.Second) {
+			continue
+		}
+		// Если в кошельке уже нет токенов — позиция закрыта, но могла остаться в файле после аварийного рестарта.
+		if strings.TrimSpace(pp.Source) != "launchlab" {
+			if raw, err := PumpDirectTokenRawBalance(pp.Mint); err == nil {
+				if raw == 0 {
+					continue
+				}
+				pp.TokenRaw = raw
+			}
+		}
 		w.Pos[pp.Mint] = &Position{
 			Mint:           pp.Mint,
 			BondingCurve:   pp.BondingCurve,

@@ -1184,49 +1184,27 @@ func parseCreateTx(sig string) (mint, creator string, createBlockTime *time.Time
 	if err != nil {
 		return "", "", nil
 	}
-
-	var wrap struct {
-		Result json.RawMessage `json:"result"`
-	}
-	if json.Unmarshal(data, &wrap) != nil || string(wrap.Result) == "null" {
-		return "", "", nil
-	}
-
-	var r struct {
-		BlockTime *int64 `json:"blockTime"`
-		Meta      struct {
-			PostTokenBalances []postTokenBal `json:"postTokenBalances"`
-			LogMessages       []string       `json:"logMessages"`
-		} `json:"meta"`
-		Transaction struct {
-			Message struct {
-				AccountKeys []json.RawMessage `json:"accountKeys"`
-			} `json:"message"`
-		} `json:"transaction"`
-	}
-	if err := json.Unmarshal(wrap.Result, &r); err != nil {
-		return "", "", nil
-	}
-	if r.BlockTime != nil && *r.BlockTime > 0 {
-		t := time.Unix(*r.BlockTime, 0)
-		createBlockTime = &t
-	}
-
-	isCreate := false
-	for _, l := range r.Meta.LogMessages {
-		// Только Create pump.fun — не InitializeMint чужих SPL (SOL/USDC и т.д.)
-		if contains(l, "Instruction: Create") {
-			isCreate = true
-			break
+	mint, creator, createBlockTime, isCreate := parseTxMintCreator(data, func(logs []string) bool {
+		for _, l := range logs {
+			if contains(l, "Instruction: Create") {
+				return true
+			}
 		}
-	}
+		return false
+	})
 	if !isCreate {
 		return "", "", createBlockTime
 	}
-
-	mint = pickMintFromPostBalances(r.Meta.PostTokenBalances)
-
-	creator = firstSignerFromKeys(r.Transaction.Message.AccountKeys)
+	if mint == "" {
+		mint, creator, createBlockTime = refillMintFromConfirmed(sig, creator, createBlockTime, func(logs []string) bool {
+			for _, l := range logs {
+				if contains(l, "Instruction: Create") {
+					return true
+				}
+			}
+			return false
+		})
+	}
 	return mint, creator, createBlockTime
 }
 
@@ -1260,6 +1238,71 @@ func getTransactionJSONParsedFast(sig string) ([]byte, error) {
 
 	// Fallback для совместимости со старыми/медленными узлами.
 	return rpc("getTransaction", params("confirmed"))
+}
+
+func parseTxMintCreator(data []byte, wantLogs func([]string) bool) (mint, creator string, createBlockTime *time.Time, wanted bool) {
+	var wrap struct {
+		Result json.RawMessage `json:"result"`
+	}
+	if json.Unmarshal(data, &wrap) != nil || string(wrap.Result) == "null" {
+		return "", "", nil, false
+	}
+	var r struct {
+		BlockTime *int64 `json:"blockTime"`
+		Meta      struct {
+			PostTokenBalances []postTokenBal `json:"postTokenBalances"`
+			LogMessages       []string       `json:"logMessages"`
+		} `json:"meta"`
+		Transaction struct {
+			Message struct {
+				AccountKeys []json.RawMessage `json:"accountKeys"`
+			} `json:"message"`
+		} `json:"transaction"`
+	}
+	if err := json.Unmarshal(wrap.Result, &r); err != nil {
+		return "", "", nil, false
+	}
+	if r.BlockTime != nil && *r.BlockTime > 0 {
+		t := time.Unix(*r.BlockTime, 0)
+		createBlockTime = &t
+	}
+	if !wantLogs(r.Meta.LogMessages) {
+		return "", firstSignerFromKeys(r.Transaction.Message.AccountKeys), createBlockTime, false
+	}
+	mint = pickMintFromPostBalances(r.Meta.PostTokenBalances)
+	creator = firstSignerFromKeys(r.Transaction.Message.AccountKeys)
+	return mint, creator, createBlockTime, true
+}
+
+func refillMintFromConfirmed(sig, creator string, createBlockTime *time.Time, wantLogs func([]string) bool) (mintOut, creatorOut string, blockTimeOut *time.Time) {
+	creatorOut = creator
+	blockTimeOut = createBlockTime
+	for attempt := 0; attempt < 3; attempt++ {
+		data, err := rpc("getTransaction", []interface{}{
+			sig,
+			map[string]interface{}{
+				"encoding":                       "jsonParsed",
+				"maxSupportedTransactionVersion": 0,
+				"commitment":                     "confirmed",
+			},
+		})
+		if err == nil {
+			mint, parsedCreator, bt, ok := parseTxMintCreator(data, wantLogs)
+			if creatorOut == "" && parsedCreator != "" {
+				creatorOut = parsedCreator
+			}
+			if blockTimeOut == nil && bt != nil {
+				blockTimeOut = bt
+			}
+			if ok && mint != "" {
+				return mint, creatorOut, blockTimeOut
+			}
+		}
+		if attempt < 2 {
+			time.Sleep(time.Duration(80*(attempt+1)) * time.Millisecond)
+		}
+	}
+	return "", creatorOut, blockTimeOut
 }
 
 func formatCreateAge(t *time.Time) string {
@@ -3340,36 +3383,13 @@ func parseLaunchLabCreateTx(sig string) (mint, creator string, createBlockTime *
 	if err != nil {
 		return "", "", nil
 	}
-	var wrap struct {
-		Result json.RawMessage `json:"result"`
-	}
-	if json.Unmarshal(data, &wrap) != nil || string(wrap.Result) == "null" {
-		return "", "", nil
-	}
-	var r struct {
-		BlockTime *int64 `json:"blockTime"`
-		Meta      struct {
-			PostTokenBalances []postTokenBal `json:"postTokenBalances"`
-			LogMessages       []string       `json:"logMessages"`
-		} `json:"meta"`
-		Transaction struct {
-			Message struct {
-				AccountKeys []json.RawMessage `json:"accountKeys"`
-			} `json:"message"`
-		} `json:"transaction"`
-	}
-	if err := json.Unmarshal(wrap.Result, &r); err != nil {
-		return "", "", nil
-	}
-	if r.BlockTime != nil && *r.BlockTime > 0 {
-		t := time.Unix(*r.BlockTime, 0)
-		createBlockTime = &t
-	}
-	if !launchLabInitFromLogs(r.Meta.LogMessages) {
+	mint, creator, createBlockTime, isInit := parseTxMintCreator(data, launchLabInitFromLogs)
+	if !isInit {
 		return "", "", createBlockTime
 	}
-	mint = pickMintFromPostBalances(r.Meta.PostTokenBalances)
-	creator = firstSignerFromKeys(r.Transaction.Message.AccountKeys)
+	if mint == "" {
+		mint, creator, createBlockTime = refillMintFromConfirmed(sig, creator, createBlockTime, launchLabInitFromLogs)
+	}
 	return mint, creator, createBlockTime
 }
 

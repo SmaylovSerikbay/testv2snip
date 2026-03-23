@@ -4,11 +4,10 @@ package main
 import (
 	"bytes"
 	"context"
-	"encoding/base64"
-	"io"
 	"encoding/binary"
 	"encoding/json"
 	"fmt"
+	"io"
 	"math/big"
 	"net/http"
 	"os"
@@ -20,8 +19,13 @@ import (
 
 	"github.com/gagliardetto/solana-go"
 	computebudget "github.com/gagliardetto/solana-go/programs/compute-budget"
+	"github.com/gagliardetto/solana-go/programs/system"
 	solanarpc "github.com/gagliardetto/solana-go/rpc"
+	"github.com/mr-tron/base58"
 )
+
+// Jito tip account (один из восьми — можно выбрать любой)
+const jitoTipAccount = "96gYZGLnJYVFmbjzopPSU6QiEV5fGqZNyN9nmNhvrZU5"
 
 // Программа комиссий Pump (IDL).
 var pumpFeeProgramPK = solana.MustPublicKeyFromBase58("pfeeUxB6jkeY1Hxd7CsFCAjcbHA9rWtchMGdZ6VojVZ")
@@ -332,12 +336,13 @@ func sendJitoBundle(ctx context.Context, blockEngineURL string, tx *solana.Trans
 	if err != nil {
 		return solana.Signature{}, time.Time{}, fmt.Errorf("marshal tx: %w", err)
 	}
-	b64Tx := base64.StdEncoding.EncodeToString(rawTx)
+	// Jito block-engine ожидает base58; base64 даёт "transaction #0 could not be decoded"
+	encodedTx := base58.Encode(rawTx)
 	payload := map[string]interface{}{
 		"jsonrpc": "2.0",
 		"id":      1,
 		"method":  "sendBundle",
-		"params":  []interface{}{[]string{b64Tx}},
+		"params":  []interface{}{[]string{encodedTx}},
 	}
 	body, err := json.Marshal(payload)
 	if err != nil {
@@ -902,6 +907,10 @@ func swapPumpFun(ctx context.Context, rpcClient *solanarpc.Client, wallet solana
 	all := append([]solana.Instruction{}, cuLimitIx, cuPriceIx)
 	all = append(all, preIxs...)
 	all = append(all, buyIx)
+	if jitoURL := strings.TrimSpace(os.Getenv("JITO_BLOCK_ENGINE_URL")); jitoURL != "" && jitoMinTipLamports > 0 {
+		tipIx := system.NewTransferInstruction(jitoMinTipLamports, owner, solana.MustPublicKeyFromBase58(jitoTipAccount)).Build()
+		all = append(all, tipIx)
+	}
 
 	tx, err := solana.NewTransaction(all, cachedBH, solana.TransactionPayer(owner))
 	if err != nil {
@@ -1101,6 +1110,10 @@ func swapPumpFunSellAmount(ctx context.Context, rpcClient *solanarpc.Client, wal
 	}
 
 	all := []solana.Instruction{cuLimitIx, cuPriceIx, sellIx}
+	if jitoURL := strings.TrimSpace(os.Getenv("JITO_BLOCK_ENGINE_URL")); jitoURL != "" && jitoMinTipLamports > 0 {
+		tipIx := system.NewTransferInstruction(jitoMinTipLamports, owner, solana.MustPublicKeyFromBase58(jitoTipAccount)).Build()
+		all = append(all, tipIx)
+	}
 	tx, err := solana.NewTransaction(all, cachedBH, solana.TransactionPayer(owner))
 	if err != nil {
 		return solana.Signature{}, 0, err

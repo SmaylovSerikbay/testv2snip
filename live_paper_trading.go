@@ -187,11 +187,12 @@ var (
 
 // Воронка входа (накопительно с запуска) — видно, до какого шага доходят токены
 var (
-	funnelInWindow int64 // прошли кривую+ликвидность, до velocity
-	funnelPassVel  int64 // прошли velocity
-	funnelPassScam int64 // прошли анти-скам
-	funnelOpenOK   int64 // open() = true
-	funnelOpenFail int64 // open() = false (редко: баланс/лимит)
+	funnelInWindow  int64 // прошли кривую+ликвидность, до velocity
+	funnelPassVel   int64 // прошли velocity
+	funnelPassScam  int64 // прошли анти-скам
+	funnelOpenOK    int64 // open() = true
+	funnelOpenFail  int64 // open() = false (редко: баланс/лимит)
+	liveBuyInFlight int32 // защита от параллельных buy в live
 )
 
 // Подписи ключей в минутной сводке (рус./кратко)
@@ -2474,6 +2475,13 @@ func (w *Wallet) openLive(tok NewToken, sym string, spot float64, capitalUSD flo
 		consoleMu.Unlock()
 		return false
 	}
+	if !atomic.CompareAndSwapInt32(&liveBuyInFlight, 0, 1) {
+		consoleMu.Lock()
+		fmt.Printf("%s open reject %s | buy_in_flight\n", yellow("⚠"), sym)
+		consoleMu.Unlock()
+		return false
+	}
+	defer atomic.StoreInt32(&liveBuyInFlight, 0)
 	var tokenRaw uint64
 	var sig string
 	var solIn uint64

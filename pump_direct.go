@@ -95,9 +95,14 @@ var (
 			IdleConnTimeout:     90 * time.Second,
 		},
 	}
+	mintInfoFastPathState struct {
+		mu           sync.Mutex
+		disabledTill time.Time
+	}
 )
 
 const jitoRateLimitCooldown = 12 * time.Second
+const mintInfoFastPathCooldown = 10 * time.Minute
 
 func initPumpDirectFromEnv() {
 	if s := strings.TrimSpace(os.Getenv("PUMP_SLIPPAGE_BPS")); s != "" {
@@ -228,7 +233,21 @@ func skipMintInfoInFastBuy() bool {
 	if s == "0" || s == "false" || s == "no" {
 		return false
 	}
+	mintInfoFastPathState.mu.Lock()
+	disabled := time.Now().Before(mintInfoFastPathState.disabledTill)
+	mintInfoFastPathState.mu.Unlock()
+	if disabled {
+		return false
+	}
 	return true
+}
+
+func disableMintInfoFastPath(reason string) {
+	now := time.Now()
+	mintInfoFastPathState.mu.Lock()
+	mintInfoFastPathState.disabledTill = now.Add(mintInfoFastPathCooldown)
+	mintInfoFastPathState.mu.Unlock()
+	fmt.Printf("⚠ fast buy path cooldown %s: %s\n", mintInfoFastPathCooldown.String(), reason)
 }
 
 func preferJitoBundleFirst() bool {
@@ -1441,6 +1460,7 @@ func PumpDirectBuy(mintStr string, spendLamports uint64) (tokenRaw uint64, sig s
 	if err != nil && isIncorrectProgramIDErr(err) && skipMintInfoInFastBuy() {
 		// Fast-path мог промахнуться с token program (Tokenkeg vs Token-2022).
 		// Повторяем с обязательным чтением mint account.
+		disableMintInfoFastPath("incorrect program id on ATA/mint path")
 		fmt.Printf("⚠ buy fallback %s: retry with mint info (token program)\n", mintStr[:8]+"..")
 		s, expectedOut, spendBudget, sentAt, err = swapPumpFun(ctx, rpcPumpDirect(), livePrivKey, mint, spendLamports, true)
 	}

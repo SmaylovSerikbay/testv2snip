@@ -71,7 +71,7 @@ var (
 		ts       time.Time
 	}
 	jitoHTTPClient = &http.Client{
-		Timeout: 6 * time.Second,
+		Timeout: 1200 * time.Millisecond,
 		Transport: &http.Transport{
 			MaxIdleConns:        64,
 			MaxIdleConnsPerHost: 64,
@@ -287,7 +287,10 @@ func refreshDynamicPriorityFeeFromRPC() {
 
 func sendPumpTransaction(ctx context.Context, rpcClient *solanarpc.Client, tx *solana.Transaction) (solana.Signature, time.Time, error) {
 	if j := strings.TrimSpace(os.Getenv("JITO_BLOCK_ENGINE_URL")); j != "" {
-		if sig, sentAt, err := sendJitoBundle(ctx, j, tx); err == nil {
+		jitoCtx, cancel := context.WithTimeout(ctx, 900*time.Millisecond)
+		sig, sentAt, err := sendJitoBundle(jitoCtx, j, tx)
+		cancel()
+		if err == nil {
 			return sig, sentAt, nil
 		}
 	}

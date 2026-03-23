@@ -781,6 +781,20 @@ func hotPathSilent() bool {
 	return true
 }
 
+func abortIfTooLate(tok NewToken, stage string) bool {
+	if tok.DetectedAt.IsZero() {
+		return false
+	}
+	d := time.Since(tok.DetectedAt)
+	if d <= MAX_READY_TO_SEND_DELAY {
+		return false
+	}
+	consoleMu.Lock()
+	fmt.Printf("❌ TRADE ABORTED: Latency too high (%d ms) stage=%s\n", d.Milliseconds(), stage)
+	consoleMu.Unlock()
+	return true
+}
+
 // ════════════════════════════════════════════════════
 //  PUMP.FUN BONDING CURVE — реальная цена on-chain
 //
@@ -1890,11 +1904,7 @@ func (w *Wallet) open(tok NewToken, sym string, spot float64) bool {
 
 // openLive — реальный свап SOL→токен только через Pump.fun bonding curve (pump_direct).
 func (w *Wallet) openLive(tok NewToken, sym string, spot float64, capitalUSD float64) bool {
-	if !tok.DetectedAt.IsZero() && time.Since(tok.DetectedAt) > MAX_READY_TO_SEND_DELAY {
-		ms := time.Since(tok.DetectedAt).Milliseconds()
-		consoleMu.Lock()
-		fmt.Printf("❌ TRADE ABORTED: Latency too high (%d ms)\n", ms)
-		consoleMu.Unlock()
+	if abortIfTooLate(tok, "open_live_start") {
 		return false
 	}
 	if !liveUsePumpDirect(tok) {
@@ -2580,6 +2590,9 @@ func main() {
 				var err error
 				if src == "launchlab" {
 					mint, creator, createAt = parseLaunchLabCreateTx(tok.Sig)
+					if abortIfTooLate(tok, "parse_launchlab_create_tx") {
+						return
+					}
 					if mint == "" {
 						logRejectLine("no_mint", "?", "", "launchlab: нет mint в tx")
 						return
@@ -2591,6 +2604,9 @@ func main() {
 					}
 				} else {
 					mint, creator, createAt = parseCreateTx(tok.Sig)
+					if abortIfTooLate(tok, "parse_pump_create_tx") {
+						return
+					}
 					if mint == "" {
 						logRejectLine("no_mint", "?", "", "нет mint в create tx")
 						return
@@ -2639,6 +2655,9 @@ func main() {
 				}
 
 				snap0, err := getCurveSnapshotWithRetry(bc, src)
+				if abortIfTooLate(tok, "curve_snapshot") {
+					return
+				}
 				if err != nil || snap0 == nil || snap0.PriceUSD <= 0 {
 					logRejectLine("no_price", sym, mint, "нет цены (кривая / pool)")
 					return
@@ -2665,6 +2684,9 @@ func main() {
 
 				atomic.AddInt64(&funnelInWindow, 1)
 				snap1, vOK, vDetail, vKey := curveVelocityOK(bc, snap0, src, createAt)
+				if abortIfTooLate(tok, "velocity_check") {
+					return
+				}
 				if !vOK {
 					if vKey == "" {
 						vKey = "velocity"
@@ -2699,6 +2721,9 @@ func main() {
 				} else {
 					ok, scamMeta = antiScamCheck(mint, bc, liqVault, creator, createAt, extraMint...)
 				}
+				if abortIfTooLate(tok, "anti_scam_check") {
+					return
+				}
 				if !ok {
 					logRejectLine("scam", sym, mint, "фильтр: "+scamMeta)
 					return
@@ -2712,9 +2737,7 @@ func main() {
 						consoleMu.Unlock()
 					}
 					if delta > MAX_READY_TO_SEND_DELAY {
-						consoleMu.Lock()
-						fmt.Printf("❌ TRADE ABORTED: Latency too high (%d ms)\n", delta.Milliseconds())
-						consoleMu.Unlock()
+						abortIfTooLate(tok, "before_open")
 						return
 					}
 				}

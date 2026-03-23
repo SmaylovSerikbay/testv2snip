@@ -76,9 +76,9 @@ const (
 	RPC_MAX_CONCURRENT     = 8
 
 	// Recovery Mode ($3.9): узкое окно + ликвидность, чтобы не брать «пустые» мёртвые пулы.
-	SNIPER_CURVE_MIN           = 0.002 // 0.2%
-	SNIPER_CURVE_MAX           = 0.15  // 15%
-	MIN_REAL_SOL               = 1.00  // минимум 1.0 SOL в кривой (ранние импульсы)
+	SNIPER_CURVE_MIN           = 0.0  // 0.0%
+	SNIPER_CURVE_MAX           = 0.25 // 25%
+	MIN_REAL_SOL               = 0.30 // минимум 0.3 SOL в кривой
 	FAST_HEAVY_CHECK_CURVE_MAX = 0.05  // тяжёлые RPC-фильтры только до 5% кривой
 	CREATOR_BALANCE_CACHE_TTL  = 5 * time.Minute
 
@@ -109,7 +109,7 @@ const (
 	MAX_CREATE_TX_AGE       = 30 * time.Minute
 	MAX_READY_TO_SEND_DELAY = 4000 * time.Millisecond
 
-	VELOCITY_PAUSE         = 200 * time.Millisecond // меньше внутренней задержки на входе
+	VELOCITY_PAUSE         = 300 * time.Millisecond // быстрее реакция на импульс
 	VELOCITY_MIN_DPROGRESS = 0.02                   // min +2% за паузу — только первая волна
 	VELOCITY_MIN_DREALSOL  = 0.0
 	VELOCITY_MIN_DELTA_DP  = -0.0001 // -0.01% (разрешаем микро-откат на замере)

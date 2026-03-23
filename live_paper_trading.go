@@ -786,6 +786,49 @@ func isRateLimitErr(err error) bool {
 		strings.Contains(s, "rate limit")
 }
 
+func isSignatureConfirmed(sig string) (bool, string, error) {
+	data, err := rpc("getSignatureStatuses", []interface{}{
+		[]string{sig},
+		map[string]bool{"searchTransactionHistory": true},
+	})
+	if err != nil {
+		return false, "", err
+	}
+	var out struct {
+		Result struct {
+			Value []struct {
+				ConfirmationStatus string      `json:"confirmationStatus"`
+				Err                interface{} `json:"err"`
+			} `json:"value"`
+		} `json:"result"`
+	}
+	if json.Unmarshal(data, &out) != nil || len(out.Result.Value) == 0 {
+		return false, "", fmt.Errorf("bad getSignatureStatuses")
+	}
+	v := out.Result.Value[0]
+	if v.Err != nil {
+		return false, "rejected", nil
+	}
+	if v.ConfirmationStatus == "confirmed" || v.ConfirmationStatus == "finalized" {
+		return true, v.ConfirmationStatus, nil
+	}
+	return false, v.ConfirmationStatus, nil
+}
+
+func waitBuySettlement(sig, mint string, timeout time.Duration) (ok bool, reason string) {
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		confirmed, status, err := isSignatureConfirmed(sig)
+		if err == nil && confirmed {
+			if raw, berr := PumpDirectTokenRawBalance(mint); berr == nil && raw > 0 {
+				return true, "confirmed+" + status
+			}
+		}
+		time.Sleep(500 * time.Millisecond)
+	}
+	return false, "no_confirmation_or_zero_balance"
+}
+
 func hotPathSilent() bool {
 	s := strings.TrimSpace(strings.ToLower(os.Getenv("HOT_PATH_SILENT")))
 	if s == "0" || s == "false" || s == "no" {
@@ -2031,6 +2074,13 @@ func (w *Wallet) openLive(tok NewToken, sym string, spot float64, capitalUSD flo
 				gray("⏱"), d1, d2, d3)
 		}
 		consoleMu.Unlock()
+	}
+	if ok, reason := waitBuySettlement(sig, tok.Mint, 5*time.Second); !ok {
+		consoleMu.Lock()
+		fmt.Printf("%s BUY FAILED %s | sig=%s | reason=%s\n", red("❌"), sym, gray(sig), reason)
+		consoleMu.Unlock()
+		syncWalletBalanceUSDFresh(w)
+		return false
 	}
 	syncWalletBalanceUSDFresh(w)
 	tokens := float64(tokenRaw) / 1e6 // pump: 6 decimals

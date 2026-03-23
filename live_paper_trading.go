@@ -58,7 +58,7 @@ const (
 	SOLANA_TX_LAMPORTS = 12_000.0
 
 	PRICE_TICK = 3 * time.Second
-	MAX_HOLD   = 10 * time.Minute
+	MAX_HOLD   = 3 * time.Minute
 	// Сервисные интервалы/лимиты RPC для защиты от -32429.
 	BALANCE_CHECK_INTERVAL = 10 * time.Second
 	RPC_RETRY_BASE_DELAY  = 2 * time.Second
@@ -80,7 +80,7 @@ const (
 	STOP_CONFIRM_LVL = 0.70 // -30%
 	STOP_CONFIRM_N   = 1
 	SELL_SLIPPAGE_GUARD = 0.10 // >10% ожидаемого slip на выходе — подождать следующий тик
-	TAKE_PROFIT      = 2.5 // +150%
+	TAKE_PROFIT      = 1.25 // +25%
 	TRAIL_ACTIVATE   = 1.40 // трейлинг стартует после +40%
 	TRAILING         = 0.16
 	TRAIL_MIN_AGE    = 10 * time.Second
@@ -98,7 +98,9 @@ const (
 	VELOCITY_MIN_DPROGRESS = 0.0
 	VELOCITY_MIN_DREALSOL  = 0.0
 	VELOCITY_MIN_DELTA_DP  = -0.0001 // -0.01% (разрешаем микро-откат на замере)
-	LIVE_FIXED_BUY_SOL     = 0.013 // fixed buy for final recovery mode
+	LIVE_FIXED_BUY_SOL     = 0.015 // target fixed buy size
+	LIVE_BUY_BALANCE_SHARE = 0.85  // or 85% of available SOL after reserve
+	ACTIVE_POSITIONS_FILE  = "active_positions.json"
 
 	// Логи: false = не печатать каждый отсев (только сводка раз в минуту + успешный ВХОД)
 	VERBOSE_REJECT_LOGS = false
@@ -404,6 +406,106 @@ type Wallet struct {
 	ExitLoss map[string]int
 }
 
+type persistedPosition struct {
+	Mint           string    `json:"mint"`
+	BondingCurve   string    `json:"bonding_curve"`
+	Symbol         string    `json:"symbol"`
+	EntryPrice     float64   `json:"entry_price"`
+	Tokens         float64   `json:"tokens"`
+	PeakPrice      float64   `json:"peak_price"`
+	CapitalUSD     float64   `json:"capital_usd"`
+	OpenedAt       time.Time `json:"opened_at"`
+	BreakevenArmed bool      `json:"breakeven_armed"`
+	Live           bool      `json:"live"`
+	TokenRaw       uint64    `json:"token_raw"`
+	BuyLamports    uint64    `json:"buy_lamports"`
+	HalfTaken      bool      `json:"half_taken"`
+	Source         string    `json:"source"`
+}
+
+func (w *Wallet) saveActivePositionsLocked() {
+	if !liveTradingEnabled() {
+		return
+	}
+	list := make([]persistedPosition, 0, len(w.Pos))
+	for _, p := range w.Pos {
+		if p == nil || !p.Live {
+			continue
+		}
+		list = append(list, persistedPosition{
+			Mint:           p.Mint,
+			BondingCurve:   p.BondingCurve,
+			Symbol:         p.Symbol,
+			EntryPrice:     p.EntryPrice,
+			Tokens:         p.Tokens,
+			PeakPrice:      p.PeakPrice,
+			CapitalUSD:     p.CapitalUSD,
+			OpenedAt:       p.OpenedAt,
+			BreakevenArmed: p.BreakevenArmed,
+			Live:           p.Live,
+			TokenRaw:       p.TokenRaw,
+			BuyLamports:    p.BuyLamports,
+			HalfTaken:      p.HalfTaken,
+			Source:         p.Source,
+		})
+	}
+	raw, err := json.MarshalIndent(list, "", "  ")
+	if err != nil {
+		return
+	}
+	_ = os.WriteFile(ACTIVE_POSITIONS_FILE, raw, 0o644)
+}
+
+func (w *Wallet) loadActivePositions() {
+	if !liveTradingEnabled() {
+		return
+	}
+	raw, err := os.ReadFile(ACTIVE_POSITIONS_FILE)
+	if err != nil || len(raw) == 0 {
+		return
+	}
+	var list []persistedPosition
+	if json.Unmarshal(raw, &list) != nil {
+		return
+	}
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	for _, pp := range list {
+		if pp.Mint == "" || pp.BondingCurve == "" || !pp.Live {
+			continue
+		}
+		w.Pos[pp.Mint] = &Position{
+			Mint:           pp.Mint,
+			BondingCurve:   pp.BondingCurve,
+			Symbol:         pp.Symbol,
+			EntryPrice:     pp.EntryPrice,
+			Tokens:         pp.Tokens,
+			PeakPrice:      pp.PeakPrice,
+			CapitalUSD:     pp.CapitalUSD,
+			OpenedAt:       pp.OpenedAt,
+			BreakevenArmed: pp.BreakevenArmed,
+			Live:           pp.Live,
+			TokenRaw:       pp.TokenRaw,
+			BuyLamports:    pp.BuyLamports,
+			HalfTaken:      pp.HalfTaken,
+			Source:         pp.Source,
+		}
+	}
+}
+
+func (w *Wallet) activePositionSnapshots() []*Position {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	out := make([]*Position, 0, len(w.Pos))
+	for _, p := range w.Pos {
+		if p == nil {
+			continue
+		}
+		out = append(out, snapshotPosition(p))
+	}
+	return out
+}
+
 func newWallet() *Wallet {
 	w := &Wallet{
 		Balance:  PAPER_BALANCE,
@@ -415,6 +517,7 @@ func newWallet() *Wallet {
 	if liveTradingEnabled() {
 		syncWalletBalanceUSD(w)
 		w.Start = w.Balance
+		w.loadActivePositions()
 	}
 	return w
 }
@@ -1669,7 +1772,11 @@ func (w *Wallet) openLive(tok NewToken, sym string, spot float64, capitalUSD flo
 	}
 	reserve := liveReserveSOL
 	_ = capitalUSD
+	maxByBalance := (solBal - reserve) * LIVE_BUY_BALANCE_SHARE
 	solForSwap := LIVE_FIXED_BUY_SOL
+	if maxByBalance < solForSwap {
+		solForSwap = maxByBalance
+	}
 	if solForSwap > solBal-reserve {
 		solForSwap = solBal - reserve
 	}
@@ -1722,6 +1829,7 @@ func (w *Wallet) openLive(tok NewToken, sym string, spot float64, capitalUSD flo
 		BuyLamports:  solIn,
 		Source:       tokenSource(tok),
 	}
+	w.saveActivePositionsLocked()
 	bal := w.Balance
 	fmt.Printf("\n%s ВХОД LIVE %-18s | ~$%.2f SOL→токен | eff $%.10f | raw %d | %s | баланс $%.2f\n",
 		cyan("→"), sym, capitalEff, entry, tokenRaw, gray(sig), bal)
@@ -1767,6 +1875,7 @@ func (w *Wallet) closePos(mint, reason string, spot float64) {
 	} else {
 		w.ExitWin[bk]++
 	}
+	w.saveActivePositionsLocked()
 	bal := w.Balance
 	w.mu.Unlock()
 
@@ -1792,6 +1901,7 @@ func (w *Wallet) closePosLive(pos *Position, reason string, spot float64) {
 		syncWalletBalanceUSD(w)
 		w.mu.Lock()
 		w.Pos[pos.Mint] = pos
+		w.saveActivePositionsLocked()
 		w.mu.Unlock()
 		return
 	}
@@ -1804,6 +1914,7 @@ func (w *Wallet) closePosLive(pos *Position, reason string, spot float64) {
 			consoleMu.Unlock()
 			w.mu.Lock()
 			w.Pos[pos.Mint] = pos
+			w.saveActivePositionsLocked()
 			w.mu.Unlock()
 			return
 		}
@@ -1820,6 +1931,7 @@ func (w *Wallet) closePosLive(pos *Position, reason string, spot float64) {
 		syncWalletBalanceUSD(w)
 		w.mu.Lock()
 		w.Pos[pos.Mint] = pos
+		w.saveActivePositionsLocked()
 		w.mu.Unlock()
 		return
 	}
@@ -1846,6 +1958,7 @@ func (w *Wallet) closePosLive(pos *Position, reason string, spot float64) {
 	} else {
 		w.ExitWin[bk]++
 	}
+	w.saveActivePositionsLocked()
 	bal := w.Balance
 	w.mu.Unlock()
 
@@ -2096,6 +2209,7 @@ func monitor(w *Wallet, mint, bcAddr, sym, source string) {
 						p2.CapitalUSD = p2.CapitalUSD * 0.5
 						p2.HalfTaken = true
 					}
+					w.saveActivePositionsLocked()
 					w.mu.Unlock()
 					fmt.Printf("  %s %-18s | partial +100%%: sold 50%% | out %.4f SOL | %s\n",
 						green("↗"), sym, float64(solOut)/1e9, gray(sig))
@@ -2224,10 +2338,18 @@ func main() {
 		bold("▶"), cyan("SNIPER"), SNIPER_CURVE_MIN*100, SNIPER_CURVE_MAX*100, MIN_REAL_SOL,
 		VELOCITY_PAUSE, VELOCITY_MIN_DPROGRESS*100, VELOCITY_MIN_DREALSOL, envSignalProfile())
 	wallet := newWallet()
+	restored := wallet.activePositionSnapshots()
+	if liveTradingEnabled() && len(restored) > 0 {
+		fmt.Printf("%s Восстановлено активных позиций из %s: %d\n",
+			yellow("↺"), ACTIVE_POSITIONS_FILE, len(restored))
+		for _, p := range restored {
+			go monitor(wallet, p.Mint, p.BondingCurve, p.Symbol, p.Source)
+		}
+	}
 	if liveTradingEnabled() {
 		fixedUSD := LIVE_FIXED_BUY_SOL * getSolUSD()
-		fmt.Printf("%s Баланс: %s (ончейн) | Ставка: fixed %.3f SOL (~$%.2f) | Макс позиций: %d\n",
-			bold("▶"), green(fmt.Sprintf("$%.2f", wallet.Balance)), LIVE_FIXED_BUY_SOL, fixedUSD, MAX_POSITIONS)
+		fmt.Printf("%s Баланс: %s (ончейн) | Ставка: до %.3f SOL (лимит %.0f%% от доступного) (~$%.2f) | Макс позиций: %d\n",
+			bold("▶"), green(fmt.Sprintf("$%.2f", wallet.Balance)), LIVE_FIXED_BUY_SOL, LIVE_BUY_BALANCE_SHARE*100, fixedUSD, MAX_POSITIONS)
 	} else {
 		fmt.Printf("%s Баланс: %s | Ставка: %.2f%% от банка (min $%.2f) → сейчас ~$%.2f на сделку | Макс позиций: %d\n",
 			bold("▶"), green(fmt.Sprintf("$%.2f", PAPER_BALANCE)), BET_PCT_OF_BALANCE*100, MIN_STAKE_USD,

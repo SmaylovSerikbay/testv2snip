@@ -325,6 +325,7 @@ type NewToken struct {
 	Sig          string
 	Source       string // "pump" | "launchlab" (пусто = pump)
 	DetectedAt   time.Time
+	FiltersPassedAt time.Time
 }
 
 // postTokenBal — элемент meta.postTokenBalances в getTransaction (jsonParsed)
@@ -618,6 +619,17 @@ type balCacheEntry struct {
 var balanceCache struct {
 	mu sync.Mutex
 	m  map[string]balCacheEntry
+}
+
+type metadataCacheEntry struct {
+	ok     bool
+	detail string
+	ts     time.Time
+}
+
+var metadataCache struct {
+	mu sync.Mutex
+	m  map[string]metadataCacheEntry
 }
 
 // Курс SOL/USD (CoinGecko, иначе fallback в getSolUSD)
@@ -1368,8 +1380,21 @@ func rpcTokenMetadataURI(mint string) (string, error) {
 }
 
 func hasSocialLinksInMetadata(mint string) (bool, string) {
+	metadataCache.mu.Lock()
+	if metadataCache.m == nil {
+		metadataCache.m = make(map[string]metadataCacheEntry)
+	}
+	if e, ok := metadataCache.m[mint]; ok && time.Since(e.ts) <= 20*time.Minute {
+		metadataCache.mu.Unlock()
+		return e.ok, e.detail
+	}
+	metadataCache.mu.Unlock()
+
 	uri, err := rpcTokenMetadataURI(mint)
 	if err != nil {
+		metadataCache.mu.Lock()
+		metadataCache.m[mint] = metadataCacheEntry{ok: false, detail: "metadata URI недоступен", ts: time.Now()}
+		metadataCache.mu.Unlock()
 		return false, "metadata URI недоступен"
 	}
 	resp, err := httpClient.Get(uri)
@@ -1377,19 +1402,31 @@ func hasSocialLinksInMetadata(mint string) (bool, string) {
 		if resp != nil {
 			resp.Body.Close()
 		}
+		metadataCache.mu.Lock()
+		metadataCache.m[mint] = metadataCacheEntry{ok: false, detail: "metadata JSON недоступен", ts: time.Now()}
+		metadataCache.mu.Unlock()
 		return false, "metadata JSON недоступен"
 	}
 	defer resp.Body.Close()
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
+		metadataCache.mu.Lock()
+		metadataCache.m[mint] = metadataCacheEntry{ok: false, detail: "metadata JSON read error", ts: time.Now()}
+		metadataCache.mu.Unlock()
 		return false, "metadata JSON read error"
 	}
 	s := strings.ToLower(string(body))
 	hasTg := strings.Contains(s, "t.me/") || strings.Contains(s, "telegram")
 	hasTw := strings.Contains(s, "twitter.com/") || strings.Contains(s, "x.com/")
 	if !hasTg && !hasTw {
+		metadataCache.mu.Lock()
+		metadataCache.m[mint] = metadataCacheEntry{ok: false, detail: "нет Telegram/Twitter в metadata", ts: time.Now()}
+		metadataCache.mu.Unlock()
 		return false, "нет Telegram/Twitter в metadata"
 	}
+	metadataCache.mu.Lock()
+	metadataCache.m[mint] = metadataCacheEntry{ok: true, detail: "social ok", ts: time.Now()}
+	metadataCache.mu.Unlock()
 	return true, "social ok"
 }
 
@@ -1870,11 +1907,11 @@ func (w *Wallet) openLive(tok NewToken, sym string, spot float64, capitalUSD flo
 	if solPrice < 1 {
 		return false
 	}
-	solBal, err := rpcGetBalanceSOLCached(livePub.String(), BALANCE_CHECK_INTERVAL)
-	if err != nil {
-		consoleMu.Lock()
-		fmt.Println(red("❌ RPC баланс: " + err.Error()))
-		consoleMu.Unlock()
+	w.mu.Lock()
+	memBalanceUSD := w.Balance
+	w.mu.Unlock()
+	solBal := memBalanceUSD / solPrice
+	if solBal <= 0 {
 		return false
 	}
 	reserve := liveReserveSOL
@@ -1897,6 +1934,7 @@ func (w *Wallet) openLive(tok NewToken, sym string, spot float64, capitalUSD flo
 	var sig string
 	var solIn uint64
 	var sentAt time.Time
+	var err error
 	if !hotPathSilent() {
 		fmt.Println(gray("⏳ Pump.fun: прямая покупка на кривой…"))
 	}
@@ -1922,6 +1960,13 @@ func (w *Wallet) openLive(tok NewToken, sym string, spot float64, capitalUSD flo
 		lat := getLastBuyLatency()
 		fmt.Printf("%s latency breakdown | filters=%dms | blockhash(cache)=%dms | signing=%dms | sending=%dms\n",
 			gray("⏱"), lat.FiltersMs, lat.BlockhashMs, lat.SigningMs, lat.SendingMs)
+		if !tok.FiltersPassedAt.IsZero() {
+			d1 := tok.FiltersPassedAt.Sub(tok.DetectedAt).Milliseconds()
+			d2 := sentAt.Sub(tok.FiltersPassedAt).Milliseconds()
+			d3 := int64(lat.SendingMs)
+			fmt.Printf("%s dt_detect_to_filter=%dms | dt_filter_to_sign=%dms | dt_sign_to_send=%dms\n",
+				gray("⏱"), d1, d2, d3)
+		}
 		consoleMu.Unlock()
 	}
 	syncWalletBalanceUSDFresh(w)
@@ -2472,11 +2517,19 @@ func main() {
 			refreshDynamicPriorityFeeFromRPC()
 		}
 	}()
-
 	fmt.Printf("\n%s Режим: %s | кривая: %.1f%%–%.1f%% | min SOL: %.2f | velocity(base): %v (Δ≥%.2f%% или +%.3f SOL) | profile=%s | ончейн-фильтры\n",
 		bold("▶"), cyan("SNIPER"), SNIPER_CURVE_MIN*100, SNIPER_CURVE_MAX*100, MIN_REAL_SOL,
 		VELOCITY_PAUSE, VELOCITY_MIN_DPROGRESS*100, VELOCITY_MIN_DREALSOL, envSignalProfile())
 	wallet := newWallet()
+	if liveTradingEnabled() {
+		go func() {
+			t := time.NewTicker(BALANCE_CHECK_INTERVAL)
+			defer t.Stop()
+			for range t.C {
+				syncWalletBalanceUSDFresh(wallet)
+			}
+		}()
+	}
 	restored := wallet.activePositionSnapshots()
 	if liveTradingEnabled() && len(restored) > 0 {
 		fmt.Printf("%s Восстановлено активных позиций из %s: %d\n",
@@ -2665,6 +2718,7 @@ func main() {
 						return
 					}
 				}
+				tok.FiltersPassedAt = time.Now()
 
 				atomic.AddInt64(&funnelPassScam, 1)
 				price := snap1.PriceUSD

@@ -987,6 +987,30 @@ func monitorFailLogEvery() int {
 	return 3
 }
 
+func noPriceProfitLockFails() int {
+	if s := strings.TrimSpace(os.Getenv("NO_PRICE_PROFIT_LOCK_FAILS")); s != "" {
+		if v, err := strconv.Atoi(s); err == nil && v >= 1 && v <= 30 {
+			return v
+		}
+	}
+	if ultraFastEntryMode() {
+		return 3
+	}
+	return 5
+}
+
+func noPriceProfitLockMinMult() float64 {
+	if s := strings.TrimSpace(os.Getenv("NO_PRICE_PROFIT_LOCK_MIN_PCT")); s != "" {
+		if v, err := strconv.ParseFloat(s, 64); err == nil && v >= 0.1 && v <= 50 {
+			return 1 + v/100.0
+		}
+	}
+	if ultraFastEntryMode() {
+		return 1.004 // +0.4% достаточно, чтобы не отдавать уже пойманный микро-плюс
+	}
+	return 1.01
+}
+
 func monitorTickInterval() time.Duration {
 	if s := strings.TrimSpace(os.Getenv("MONITOR_TICK_MS")); s != "" {
 		if v, err := strconv.Atoi(s); err == nil && v >= 200 && v <= 3000 {
@@ -2850,11 +2874,15 @@ func monitor(w *Wallet, mint, bcAddr, sym, source string) {
 	confirmedStopTicks := 0
 	maxPriceFails := monitorMaxPriceFails()
 	failLogEvery := monitorFailLogEvery()
+	lockFails := noPriceProfitLockFails()
+	lockMinMult := noPriceProfitLockMinMult()
 	quickWindow := quickPumpWindow()
 	quickTP := quickPumpTakeProfitMult()
 	var lastMult float64
 	var lastPrint time.Time
 	var lastFailPrint time.Time
+	var lastGoodPrice float64
+	var lastGoodAt time.Time
 	const monitorPrintMinMove = 0.0025 // ~0.25% к цене входа — новая строка
 	monitorHeartbeat := 12 * time.Second
 
@@ -2887,7 +2915,21 @@ func monitor(w *Wallet, mint, bcAddr, sym, source string) {
 				pos.mu.Lock()
 				openedFor := time.Since(pos.OpenedAt)
 				livePos := pos.Live
+				entry := pos.EntryPrice
+				peak := pos.PeakPrice
 				pos.mu.Unlock()
+				// Если уже был зафиксирован плюс и внезапно пропала цена — выходим сразу, не отдаём прибыль.
+				if livePos && consecutiveFails >= lockFails && entry > 0 {
+					lastGoodMult := 0.0
+					if lastGoodPrice > 0 {
+						lastGoodMult = lastGoodPrice / entry
+					}
+					if lastGoodMult >= lockMinMult || peak >= entry*lockMinMult {
+						stale := time.Since(lastGoodAt).Round(100 * time.Millisecond)
+						w.closePos(mint, fmt.Sprintf("LOCK PROFIT (нет цены x%d, stale=%v)", consecutiveFails, stale), 0)
+						return
+					}
+				}
 				// В live/turbo первые секунды часто дают RPC-пустоту; не закрываем слишком рано.
 				if consecutiveFails > maxPriceFails && !(livePos && openedFor < 20*time.Second) {
 					w.closePos(mint, "ТОКЕН УМЕР (нет данных)", 0)
@@ -2905,6 +2947,8 @@ func monitor(w *Wallet, mint, bcAddr, sym, source string) {
 				continue
 			}
 			consecutiveFails = 0
+			lastGoodPrice = snap.PriceUSD
+			lastGoodAt = time.Now()
 
 			price := snap.PriceUSD
 			progress := snap.Progress

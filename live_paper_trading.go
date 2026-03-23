@@ -58,7 +58,7 @@ const (
 	SOLANA_TX_LAMPORTS = 12_000.0
 
 	PRICE_TICK = 3 * time.Second
-	MAX_HOLD   = 7 * time.Minute
+	MAX_HOLD   = 10 * time.Minute
 	// Сервисные интервалы/лимиты RPC для защиты от -32429.
 	BALANCE_CHECK_INTERVAL = 10 * time.Second
 	RPC_RETRY_BASE_DELAY  = 2 * time.Second
@@ -79,6 +79,7 @@ const (
 	STOP_LOSS_HARD   = 0.70 // -30%
 	STOP_CONFIRM_LVL = 0.70 // -30%
 	STOP_CONFIRM_N   = 1
+	SELL_SLIPPAGE_GUARD = 0.10 // >10% ожидаемого slip на выходе — подождать следующий тик
 	TAKE_PROFIT      = 2.5 // +150%
 	TRAIL_ACTIVATE   = 1.40 // трейлинг стартует после +40%
 	TRAILING         = 0.16
@@ -1784,7 +1785,6 @@ func (w *Wallet) closePos(mint, reason string, spot float64) {
 }
 
 func (w *Wallet) closePosLive(pos *Position, reason string, spot float64) {
-	_ = spot
 	if !liveUsePumpDirectClose(pos) {
 		consoleMu.Lock()
 		fmt.Println(yellow("⚠ LIVE выход: только Pump.fun на кривой — эта позиция не pump; закрой вручную на DEX."))
@@ -1794,6 +1794,19 @@ func (w *Wallet) closePosLive(pos *Position, reason string, spot float64) {
 		w.Pos[pos.Mint] = pos
 		w.mu.Unlock()
 		return
+	}
+	// Не продаём в слишком плохой тик: если ожидаемое проскальзывание > 10%, ждём следующий цикл.
+	if spot > 0 {
+		if estSlip, err := PumpDirectEstimateSellSlippage(pos.Mint, pos.TokenRaw, spot); err == nil && estSlip > SELL_SLIPPAGE_GUARD {
+			consoleMu.Lock()
+			fmt.Printf("%s wait better tick: est sell slippage %.1f%% > %.0f%%\n",
+				yellow("⏸"), estSlip*100, SELL_SLIPPAGE_GUARD*100)
+			consoleMu.Unlock()
+			w.mu.Lock()
+			w.Pos[pos.Mint] = pos
+			w.mu.Unlock()
+			return
+		}
 	}
 	var sig string
 	var solOut uint64
@@ -2110,13 +2123,12 @@ func monitor(w *Wallet, mint, bcAddr, sym, source string) {
 			} else {
 				confirmedStopTicks = 0
 			}
-			// "Fake stop-out" защита: требуется 2 подряд тика ниже -20%,
-			// либо мгновенный hard-stop при -25%.
+			// "Fake stop-out" защита: подтверждение/порог по recovery настройкам.
 			if price <= entry*STOP_LOSS_HARD || confirmedStopTicks >= STOP_CONFIRM_N {
 				if price <= entry*STOP_LOSS_HARD {
-					w.closePos(mint, "СТОП -25% (hard)", price)
+					w.closePos(mint, "СТОП -30% (hard)", price)
 				} else {
-					w.closePos(mint, "СТОП подтверждён (-20% x2)", price)
+					w.closePos(mint, "СТОП подтверждён (-30%)", price)
 				}
 				return
 			}

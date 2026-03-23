@@ -1026,3 +1026,46 @@ func PumpDirectSellFraction(mintStr string, fraction float64) (sig string, soldR
 	}
 	return s.String(), soldRaw, out, nil
 }
+
+// PumpDirectEstimateSellSlippage — оценка проскальзывания продажи относительно spot цены.
+// Возвращает долю (0.15 = 15% хуже spot).
+func PumpDirectEstimateSellSlippage(mintStr string, tokenRaw uint64, spotUSD float64) (float64, error) {
+	if tokenRaw == 0 || spotUSD <= 0 {
+		return 0, fmt.Errorf("bad inputs")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+	defer cancel()
+	mint, err := solana.PublicKeyFromBase58(mintStr)
+	if err != nil {
+		return 0, err
+	}
+	bondingCurve, _, err := derivePumpBondingCurve(mint)
+	if err != nil {
+		return 0, err
+	}
+	bcInfo, err := rpcPumpDirect().GetAccountInfoWithOpts(ctx, bondingCurve, &solanarpc.GetAccountInfoOpts{
+		Encoding:   solana.EncodingBase64,
+		Commitment: solanarpc.CommitmentProcessed,
+	})
+	if err != nil || bcInfo == nil || bcInfo.Value == nil {
+		return 0, fmt.Errorf("bonding curve")
+	}
+	vTok, vSol, _, _, _, _, _, err := parsePumpBondingCurveData(bcInfo.Value.Data.GetBinary())
+	if err != nil {
+		return 0, err
+	}
+	grossSol := pumpGrossSolForSell(tokenRaw, vSol, vTok)
+	if grossSol == 0 {
+		return 0, fmt.Errorf("gross=0")
+	}
+	expectedUSD := (float64(tokenRaw) / 1e6) * spotUSD
+	if expectedUSD <= 0 {
+		return 0, fmt.Errorf("expected=0")
+	}
+	grossUSD := (float64(grossSol) / 1e9) * getSolUSD()
+	slip := 1.0 - (grossUSD / expectedUSD)
+	if slip < 0 {
+		slip = 0
+	}
+	return slip, nil
+}

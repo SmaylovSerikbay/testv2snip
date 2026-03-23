@@ -28,6 +28,14 @@ import (
 // Тестовые флаги окружения (для отладки, не для «боевой» охоты за качеством).
 func envSkipVelocity() bool   { return strings.TrimSpace(os.Getenv("SKIP_VELOCITY")) == "1" }
 func envSkipAntiScam() bool   { return strings.TrimSpace(os.Getenv("SKIP_ANTI_SCAM")) == "1" }
+func velocityPause() time.Duration {
+	if s := strings.TrimSpace(os.Getenv("VELOCITY_PAUSE_MS")); s != "" {
+		if ms, err := strconv.Atoi(s); err == nil && ms >= 150 && ms <= 800 {
+			return time.Duration(ms) * time.Millisecond
+		}
+	}
+	return VELOCITY_PAUSE
+}
 func envSignalProfile() string {
 	p := strings.TrimSpace(strings.ToLower(os.Getenv("SIGNAL_PROFILE")))
 	switch p {
@@ -97,7 +105,7 @@ const (
 	MAX_CREATE_TX_AGE = 30 * time.Minute
 	MAX_READY_TO_SEND_DELAY = 2500 * time.Millisecond
 
-	VELOCITY_PAUSE         = 500 * time.Millisecond // микро-velocity: быстрее вход
+	VELOCITY_PAUSE         = 300 * time.Millisecond // микро-velocity (ранее 500ms — ускорение входа)
 	VELOCITY_MIN_DPROGRESS = 0.0
 	VELOCITY_MIN_DREALSOL  = 0.0
 	VELOCITY_MIN_DELTA_DP  = -0.0001 // -0.01% (разрешаем микро-откат на замере)
@@ -1050,7 +1058,7 @@ func curveVelocityOK(bc string, snap0 *curveSnap, source string, createAt *time.
 }
 
 func adaptiveVelocityParams(createAt *time.Time, snap0 *curveSnap) (pause time.Duration, minDP, minDSol float64, tag string) {
-	pause = VELOCITY_PAUSE
+	pause = velocityPause()
 	minDP = VELOCITY_MIN_DPROGRESS
 	minDSol = VELOCITY_MIN_DREALSOL
 
@@ -2645,7 +2653,7 @@ func main() {
 	}()
 	fmt.Printf("\n%s Режим: %s | кривая: %.1f%%–%.1f%% | min SOL: %.2f | velocity(base): %v (Δ≥%.2f%% или +%.3f SOL) | profile=%s | ончейн-фильтры\n",
 		bold("▶"), cyan("SNIPER"), SNIPER_CURVE_MIN*100, SNIPER_CURVE_MAX*100, MIN_REAL_SOL,
-		VELOCITY_PAUSE, VELOCITY_MIN_DPROGRESS*100, VELOCITY_MIN_DREALSOL, envSignalProfile())
+		velocityPause(), VELOCITY_MIN_DPROGRESS*100, VELOCITY_MIN_DREALSOL, envSignalProfile())
 	wallet := newWallet()
 	if liveTradingEnabled() {
 		go func() {
@@ -2799,24 +2807,6 @@ func main() {
 				}
 
 				atomic.AddInt64(&funnelInWindow, 1)
-				snap1, vOK, vDetail, vKey := curveVelocityOK(bc, snap0, src, createAt)
-				if abortIfTooLate(tok, "velocity_check") {
-					return
-				}
-				if !vOK {
-					if vKey == "" {
-						vKey = "velocity"
-					}
-					logRejectLine(vKey, sym, mint, "velocity: "+vDetail)
-					return
-				}
-
-				atomic.AddInt64(&funnelPassVel, 1)
-				if src == "pump" && snap1.Progress > FAST_HEAVY_CHECK_CURVE_MAX {
-					logRejectLine("late", sym, mint, fmt.Sprintf("fast-gate: curve %.1f%% > %.1f%% до тяжёлых RPC-проверок",
-						snap1.Progress*100, FAST_HEAVY_CHECK_CURVE_MAX*100))
-					return
-				}
 				liqVault := bc
 				if src == "launchlab" {
 					vault, err := launchLabBaseVault(bc, mint)
@@ -2830,17 +2820,47 @@ func main() {
 				if src == "launchlab" {
 					extraMint = []string{LAUNCHLAB_PROGRAM}
 				}
-				var ok bool
+				// velocity и antiScam параллельно — экономия ~200ms
+				var snap1 *curveSnap
+				var vOK bool
+				var vDetail, vKey string
+				var scamOK bool
 				var scamMeta string
-				if envSkipAntiScam() {
-					ok, scamMeta = true, "[SKIP_ANTI_SCAM тест — не для реальной торговли]"
-				} else {
-					ok, scamMeta = antiScamCheck(mint, bc, liqVault, creator, createAt, extraMint...)
+				var wg sync.WaitGroup
+				wg.Add(2)
+				go func() {
+					defer wg.Done()
+					snap1, vOK, vDetail, vKey = curveVelocityOK(bc, snap0, src, createAt)
+				}()
+				go func() {
+					defer wg.Done()
+					if envSkipAntiScam() {
+						scamOK, scamMeta = true, "[SKIP_ANTI_SCAM тест — не для реальной торговли]"
+					} else {
+						scamOK, scamMeta = antiScamCheck(mint, bc, liqVault, creator, createAt, extraMint...)
+					}
+				}()
+				wg.Wait()
+				if abortIfTooLate(tok, "velocity_check") {
+					return
+				}
+				if !vOK {
+					if vKey == "" {
+						vKey = "velocity"
+					}
+					logRejectLine(vKey, sym, mint, "velocity: "+vDetail)
+					return
+				}
+				atomic.AddInt64(&funnelPassVel, 1)
+				if src == "pump" && snap1.Progress > FAST_HEAVY_CHECK_CURVE_MAX {
+					logRejectLine("late", sym, mint, fmt.Sprintf("fast-gate: curve %.1f%% > %.1f%% до тяжёлых RPC-проверок",
+						snap1.Progress*100, FAST_HEAVY_CHECK_CURVE_MAX*100))
+					return
 				}
 				if abortIfTooLate(tok, "anti_scam_check") {
 					return
 				}
-				if !ok {
+				if !scamOK {
 					logRejectLine("scam", sym, mint, "фильтр: "+scamMeta)
 					return
 				}

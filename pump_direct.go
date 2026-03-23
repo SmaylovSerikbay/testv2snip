@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/base64"
+	"io"
 	"encoding/binary"
 	"encoding/json"
 	"fmt"
@@ -53,7 +54,7 @@ var (
 	pumpBuySlippageBps       uint64 = 2000 // buy 20%
 	pumpSellSlippageBps      uint64 = 2000 // sell 20%
 	pumpPriorityFeeLamports  uint64 = 200_000 // 0.0002 SOL (выживание малого банка)
-	jitoMinTipLamports       uint64 = 200_000 // минимальный tip при Jito
+	jitoMinTipLamports       uint64 = 500_000 // 0.0005 SOL — "входной билет" для включения бандла в блок
 	pumpPriorityMaxFeeBps    uint64 = 100 // максимум приоритета как доля от размера сделки (1.0%)
 	pumpSellRetryPriorityFee uint64 = 8_000_000
 	pumpDirectRPC     *solanarpc.Client
@@ -303,7 +304,9 @@ func sendPumpTransaction(ctx context.Context, rpcClient *solanarpc.Client, tx *s
 			go func(url string, txCopy *solana.Transaction) {
 				bgCtx, cancel := context.WithTimeout(context.Background(), 250*time.Millisecond)
 				defer cancel()
-				_, _, _ = sendJitoBundle(bgCtx, url, txCopy)
+				if _, _, err := sendJitoBundle(bgCtx, url, txCopy); err != nil {
+					fmt.Printf("❌ Jito bundle (async): %v\n", err)
+				}
 			}(j, tx)
 			return txSig, time.Now(), nil
 		}
@@ -351,6 +354,13 @@ func sendJitoBundle(ctx context.Context, blockEngineURL string, tx *solana.Trans
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		bodyBytes, _ := io.ReadAll(io.LimitReader(resp.Body, 2048))
+		bodyStr := strings.TrimSpace(string(bodyBytes))
+		if bodyStr != "" {
+			fmt.Printf("❌ Jito API error | status=%s | body=%s\n", resp.Status, bodyStr)
+		} else {
+			fmt.Printf("❌ Jito API error | status=%s\n", resp.Status)
+		}
 		return solana.Signature{}, time.Time{}, fmt.Errorf("jito status: %s", resp.Status)
 	}
 	sig := solana.Signature{}

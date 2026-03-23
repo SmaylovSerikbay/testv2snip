@@ -863,11 +863,11 @@ func encodePumpSellData(tokenAmount, minSolOut uint64) []byte {
 	return buf
 }
 
-func swapPumpFun(ctx context.Context, rpcClient *solanarpc.Client, wallet solana.PrivateKey, mint solana.PublicKey, spendableLamports uint64) (solana.Signature, uint64, uint64, time.Time, error) {
+func swapPumpFun(ctx context.Context, rpcClient *solanarpc.Client, wallet solana.PrivateKey, mint solana.PublicKey, spendableLamports uint64, forceMintInfo bool) (solana.Signature, uint64, uint64, time.Time, error) {
 	owner := wallet.PublicKey()
 	startAt := time.Now()
 	fastMode := fastHotBuyMode()
-	skipMintInfo := fastMode && skipMintInfoInFastBuy()
+	skipMintInfo := fastMode && skipMintInfoInFastBuy() && !forceMintInfo
 	var balBefore uint64
 	if !fastMode {
 		var err error
@@ -1333,6 +1333,15 @@ func isPumpOverflow6024(err error) bool {
 		strings.Contains(s, "Overflow")
 }
 
+func isIncorrectProgramIDErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	s := strings.ToLower(err.Error())
+	return strings.Contains(s, "incorrectprogramid") ||
+		strings.Contains(s, "incorrect program id for instruction")
+}
+
 // swapPumpFunSellWithFallback — при 6024 пробует меньший объём, чтобы не застревать в позиции.
 func swapPumpFunSellWithFallback(
 	ctx context.Context,
@@ -1428,7 +1437,13 @@ func PumpDirectBuy(mintStr string, spendLamports uint64) (tokenRaw uint64, sig s
 	if err != nil {
 		return 0, "", 0, time.Time{}, err
 	}
-	s, expectedOut, spendBudget, sentAt, err := swapPumpFun(ctx, rpcPumpDirect(), livePrivKey, mint, spendLamports)
+	s, expectedOut, spendBudget, sentAt, err := swapPumpFun(ctx, rpcPumpDirect(), livePrivKey, mint, spendLamports, false)
+	if err != nil && isIncorrectProgramIDErr(err) && skipMintInfoInFastBuy() {
+		// Fast-path мог промахнуться с token program (Tokenkeg vs Token-2022).
+		// Повторяем с обязательным чтением mint account.
+		fmt.Printf("⚠ buy fallback %s: retry with mint info (token program)\n", mintStr[:8]+"..")
+		s, expectedOut, spendBudget, sentAt, err = swapPumpFun(ctx, rpcPumpDirect(), livePrivKey, mint, spendLamports, true)
+	}
 	if err != nil {
 		return 0, "", 0, time.Time{}, err
 	}

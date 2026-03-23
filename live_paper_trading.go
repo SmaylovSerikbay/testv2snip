@@ -740,6 +740,11 @@ func curveVelocityOK(bc string, snap0 *curveSnap, source string, createAt *time.
 	}
 	dP := s1.Progress - snap0.Progress
 	dSol := s1.RealSolSOL - snap0.RealSolSOL
+	// Для aggressive: если есть любой положительный приток по кривой или SOL, пропускаем.
+	// Это осознанно увеличивает поток сделок ценой большего шума.
+	if envSignalProfile() == "aggressive" && (dP > 0 || dSol > 0) {
+		return s1, true, fmt.Sprintf("soft-pass aggressive: Δ%.2f%% / +%.3f SOL за %v", dP*100, dSol, pause), ""
+	}
 	if dP < minDP && dSol < minDSol {
 		return s1, false, fmt.Sprintf("мало притока (Δ%.2f%% / +%.3f SOL за %v; проф=%s, need≈Δ%.2f%% или +%.3f SOL)",
 			dP*100, dSol, pause, mode, minDP*100, minDSol), "vel_low"

@@ -45,6 +45,20 @@ func shouldSkipVelocity() bool {
 	// В turbo-mode режем velocity-check ради скорости входа.
 	return turboModeEnabled()
 }
+func ultraFastEntryMode() bool {
+	if !liveTradingEnabled() {
+		return false
+	}
+	s := strings.TrimSpace(strings.ToLower(os.Getenv("ULTRA_FAST_ENTRY")))
+	if s == "0" || s == "false" || s == "no" {
+		return false
+	}
+	if s == "1" || s == "true" || s == "yes" {
+		return true
+	}
+	// По умолчанию в live+aggressive turbo включаем максимально быстрый вход.
+	return turboModeEnabled()
+}
 func shouldSkipAntiScam() bool {
 	if envSkipAntiScam() {
 		return true
@@ -949,6 +963,54 @@ func hotPathTraceEnabled() bool {
 		return false
 	}
 	return true
+}
+
+func monitorMaxPriceFails() int {
+	if s := strings.TrimSpace(os.Getenv("MONITOR_MAX_PRICE_FAILS")); s != "" {
+		if v, err := strconv.Atoi(s); err == nil && v >= 3 && v <= 60 {
+			return v
+		}
+	}
+	if turboModeEnabled() {
+		return 14
+	}
+	return 8
+}
+
+func monitorTickInterval() time.Duration {
+	if s := strings.TrimSpace(os.Getenv("MONITOR_TICK_MS")); s != "" {
+		if v, err := strconv.Atoi(s); err == nil && v >= 200 && v <= 3000 {
+			return time.Duration(v) * time.Millisecond
+		}
+	}
+	if ultraFastEntryMode() {
+		return 400 * time.Millisecond
+	}
+	return PRICE_TICK
+}
+
+func quickPumpWindow() time.Duration {
+	if s := strings.TrimSpace(os.Getenv("QUICK_PUMP_WINDOW_MS")); s != "" {
+		if v, err := strconv.Atoi(s); err == nil && v >= 300 && v <= 10000 {
+			return time.Duration(v) * time.Millisecond
+		}
+	}
+	if ultraFastEntryMode() {
+		return 1500 * time.Millisecond
+	}
+	return 0
+}
+
+func quickPumpTakeProfitMult() float64 {
+	if s := strings.TrimSpace(os.Getenv("QUICK_PUMP_TP_PCT")); s != "" {
+		if v, err := strconv.ParseFloat(s, 64); err == nil && v >= 10 && v <= 300 {
+			return 1 + v/100.0
+		}
+	}
+	if ultraFastEntryMode() {
+		return 1.35 // +35% в первые ~1.5с, потом стандартный TP
+	}
+	return TAKE_PROFIT
 }
 
 func printHotPathTrace(sym, src, status, detail string, parseMs, curveMs, checksMs int64, totalMs int64) {
@@ -2730,7 +2792,7 @@ func runPaperSelfTest() {
 // ════════════════════════════════════════════════════
 
 func monitor(w *Wallet, mint, bcAddr, sym, source string) {
-	ticker := time.NewTicker(PRICE_TICK)
+	ticker := time.NewTicker(monitorTickInterval())
 	timeout := time.NewTimer(MAX_HOLD)
 	defer ticker.Stop()
 	defer timeout.Stop()
@@ -2739,6 +2801,9 @@ func monitor(w *Wallet, mint, bcAddr, sym, source string) {
 
 	consecutiveFails := 0
 	confirmedStopTicks := 0
+	maxPriceFails := monitorMaxPriceFails()
+	quickWindow := quickPumpWindow()
+	quickTP := quickPumpTakeProfitMult()
 	var lastMult float64
 	var lastPrint time.Time
 	const monitorPrintMinMove = 0.0025 // ~0.25% к цене входа — новая строка
@@ -2770,11 +2835,16 @@ func monitor(w *Wallet, mint, bcAddr, sym, source string) {
 			snap, err := getCurveSnapshotUnified(bcAddr, source)
 			if err != nil || snap == nil || snap.PriceUSD <= 0 {
 				consecutiveFails++
-				if consecutiveFails > 5 {
-					w.closePos(mint, "ТОКЕН УМЕР (нет данных)", pos.EntryPrice*0.5)
+				pos.mu.Lock()
+				openedFor := time.Since(pos.OpenedAt)
+				livePos := pos.Live
+				pos.mu.Unlock()
+				// В live/turbo первые секунды часто дают RPC-пустоту; не закрываем слишком рано.
+				if consecutiveFails > maxPriceFails && !(livePos && openedFor < 20*time.Second) {
+					w.closePos(mint, "ТОКЕН УМЕР (нет данных)", 0)
 					return
 				}
-				fmt.Printf("  %s %-18s | ошибка цены (%d/5)\n", gray("?"), sym, consecutiveFails)
+				fmt.Printf("  %s %-18s | ошибка цены (%d/%d)\n", gray("?"), sym, consecutiveFails, maxPriceFails)
 				continue
 			}
 			consecutiveFails = 0
@@ -2819,7 +2889,13 @@ func monitor(w *Wallet, mint, bcAddr, sym, source string) {
 					cyan("◈"), sym, ps, price, mult, progress*100)
 			}
 
-			if mult >= TAKE_PROFIT {
+			age := time.Since(opened)
+			if quickWindow > 0 && livePos && age <= quickWindow {
+				if mult >= quickTP {
+					w.closePos(mint, fmt.Sprintf("QUICK PUMP ТЕЙК ~+%.0f%% (%.1fs)", (quickTP-1)*100, quickWindow.Seconds()), price)
+					return
+				}
+			} else if mult >= TAKE_PROFIT {
 				w.closePos(mint, fmt.Sprintf("ТЕЙК ~+%.0f%% spot", (TAKE_PROFIT-1)*100), price)
 				return
 			}
@@ -2974,6 +3050,11 @@ func main() {
 	if turboModeEnabled() {
 		fmt.Println(yellow("⚠ TURBO mode (live+aggressive): ускоренный hot-path с минимальными проверками."))
 	}
+	if ultraFastEntryMode() {
+		fmt.Println(red("⚠ ULTRA_FAST_ENTRY: вход сразу после parse mint (без curve/velocity/scam-гейтов)."))
+		fmt.Printf("%s ULTRA monitor: tick=%v | quick_tp=~+%.0f%% в первые %.1fs\n",
+			yellow("⚠"), monitorTickInterval(), (quickPumpTakeProfitMult()-1)*100, quickPumpWindow().Seconds())
+	}
 
 	refreshSolPriceUSD()
 	refreshDynamicPriorityFeeFromRPC()
@@ -3122,6 +3203,36 @@ func main() {
 					fmt.Printf("%s Token Detected | %s | %s | %s\n",
 						gray("⏱"), sym, src, tok.DetectedAt.Format(time.RFC3339Nano))
 					consoleMu.Unlock()
+				}
+				if src == "pump" && ultraFastEntryMode() {
+					atomic.AddInt64(&funnelInWindow, 1)
+					atomic.AddInt64(&funnelPassVel, 1)
+					atomic.AddInt64(&funnelPassScam, 1)
+					tok.FiltersPassedAt = time.Now()
+					if !tok.DetectedAt.IsZero() {
+						total := time.Since(tok.DetectedAt).Milliseconds()
+						printHotPathTrace(sym, src, "pass:ultra_fast", "skip curve/velocity/scam", parseDone.Sub(traceStart).Milliseconds(), 0, 0, total)
+					}
+					if wallet.open(tok, sym, 0) {
+						atomic.AddInt64(&funnelOpenOK, 1)
+						if !hotPathSilent() {
+							consoleMu.Lock()
+							fmt.Printf("\n%s %-18s | %s | ULTRA_FAST_ENTRY → ВХОД\n",
+								green("✓"), sym, gray("skip curve/velocity/scam"))
+							if createAt != nil {
+								fmt.Printf("   %s %s\n", gray("⏱"), formatCreateAge(createAt))
+							}
+							fmt.Printf("   %s %s\n", gray("DEX"), cyan(dexScreenerURL(mint)))
+							consoleMu.Unlock()
+						}
+						go monitor(wallet, mint, bc, sym, src)
+					} else {
+						atomic.AddInt64(&funnelOpenFail, 1)
+						consoleMu.Lock()
+						fmt.Println(yellow("⚠ ВХОД отклонён open(): баланс, лимит, не pump в live, или RPC"))
+						consoleMu.Unlock()
+					}
+					return
 				}
 
 				if createAt != nil && time.Since(*createAt) > MAX_CREATE_TX_AGE {

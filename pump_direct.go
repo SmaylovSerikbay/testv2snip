@@ -81,6 +81,12 @@ var (
 		mu sync.Mutex
 		ts time.Time
 	}
+	jitoRateLimitState struct {
+		mu         sync.Mutex
+		until      time.Time
+		lastLogAt  time.Time
+		lastReason string
+	}
 	jitoHTTPClient = &http.Client{
 		Timeout: 500 * time.Millisecond,
 		Transport: &http.Transport{
@@ -90,6 +96,8 @@ var (
 		},
 	}
 )
+
+const jitoRateLimitCooldown = 12 * time.Second
 
 func initPumpDirectFromEnv() {
 	if s := strings.TrimSpace(os.Getenv("PUMP_SLIPPAGE_BPS")); s != "" {
@@ -215,6 +223,22 @@ func fastHotBuyMode() bool {
 	return true
 }
 
+func skipMintInfoInFastBuy() bool {
+	s := strings.TrimSpace(strings.ToLower(os.Getenv("PUMP_SKIP_MINT_INFO")))
+	if s == "0" || s == "false" || s == "no" {
+		return false
+	}
+	return true
+}
+
+func preferJitoBundleFirst() bool {
+	s := strings.TrimSpace(strings.ToLower(os.Getenv("JITO_PREFER_BUNDLE")))
+	if s == "0" || s == "false" || s == "no" {
+		return false
+	}
+	return true
+}
+
 func applySlippagePump(amount uint64, slippageBps uint64) uint64 {
 	if amount == 0 || slippageBps >= 10_000 {
 		return 0
@@ -307,18 +331,73 @@ func refreshDynamicPriorityFeeFromRPC() {
 
 const jitoMinInterval = 2 * time.Second // не чаще 1 раз в 2 сек — иначе 429 Too Many Requests
 
+func jitoRateLimitedNow() bool {
+	jitoRateLimitState.mu.Lock()
+	defer jitoRateLimitState.mu.Unlock()
+	return time.Now().Before(jitoRateLimitState.until)
+}
+
+func markJitoRateLimited(reason string) {
+	now := time.Now()
+	jitoRateLimitState.mu.Lock()
+	jitoRateLimitState.until = now.Add(jitoRateLimitCooldown)
+	shouldLog := now.Sub(jitoRateLimitState.lastLogAt) > 5*time.Second || jitoRateLimitState.lastReason != reason
+	jitoRateLimitState.lastLogAt = now
+	jitoRateLimitState.lastReason = reason
+	jitoRateLimitState.mu.Unlock()
+	if shouldLog {
+		fmt.Printf("⚠ Jito cooldown %ds: %s; fallback на RPC\n", int(jitoRateLimitCooldown.Seconds()), reason)
+	}
+}
+
+func shouldUseJitoPath() bool {
+	j := strings.TrimSpace(os.Getenv("JITO_BLOCK_ENGINE_URL"))
+	if j == "" {
+		return false
+	}
+	if jitoRateLimitedNow() {
+		return false
+	}
+	jitoLastSend.mu.Lock()
+	elapsed := time.Since(jitoLastSend.ts)
+	jitoLastSend.mu.Unlock()
+	return elapsed >= jitoMinInterval
+}
+
 func sendPumpTransaction(ctx context.Context, rpcClient *solanarpc.Client, tx *solana.Transaction) (solana.Signature, time.Time, error) {
 	txSig := solana.Signature{}
 	if len(tx.Signatures) > 0 {
 		txSig = tx.Signatures[0]
 	}
 	j := strings.TrimSpace(os.Getenv("JITO_BLOCK_ENGINE_URL"))
-	useJitoInRace := j != "" && func() bool {
-		jitoLastSend.mu.Lock()
-		elapsed := time.Since(jitoLastSend.ts)
-		jitoLastSend.mu.Unlock()
-		return elapsed >= jitoMinInterval
-	}()
+	useJitoInRace := shouldUseJitoPath()
+	if useJitoInRace && preferJitoBundleFirst() {
+		jitoCtx, cancel := context.WithTimeout(context.Background(), 350*time.Millisecond)
+		_, _, jErr := sendJitoBundle(jitoCtx, j, tx)
+		cancel()
+		if jErr == nil {
+			jitoLastSend.mu.Lock()
+			jitoLastSend.ts = time.Now()
+			jitoLastSend.mu.Unlock()
+			return txSig, time.Now(), nil
+		}
+		rpcCtx, cancelRPC := context.WithTimeout(ctx, 5*time.Second)
+		defer cancelRPC()
+		sig, rErr := rpcClient.SendTransactionWithOpts(rpcCtx, tx, solanarpc.TransactionOpts{
+			SkipPreflight: false, PreflightCommitment: solanarpc.CommitmentProcessed,
+		})
+		if rErr == nil {
+			return sig, time.Now(), nil
+		}
+		rpcCtx2, cancelRPC2 := context.WithTimeout(ctx, 6*time.Second)
+		defer cancelRPC2()
+		if sig2, err2 := rpcClient.SendTransactionWithOpts(rpcCtx2, tx, solanarpc.TransactionOpts{
+			SkipPreflight: true, PreflightCommitment: solanarpc.CommitmentProcessed,
+		}); err2 == nil {
+			return sig2, time.Now(), nil
+		}
+		return solana.Signature{}, time.Time{}, fmt.Errorf("jito: %v; rpc: %w", jErr, rErr)
+	}
 
 	if useJitoInRace {
 		// Race: Jito и RPC одновременно — первый успех побеждает (~50ms вместо 300ms+)
@@ -341,7 +420,7 @@ func sendPumpTransaction(ctx context.Context, rpcClient *solanarpc.Client, tx *s
 			}
 		}()
 		go func() {
-			rpcCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
+			rpcCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 			defer cancel()
 			_, err := rpcClient.SendTransactionWithOpts(rpcCtx, tx, solanarpc.TransactionOpts{
 				SkipPreflight: false, PreflightCommitment: solanarpc.CommitmentProcessed,
@@ -367,6 +446,16 @@ func sendPumpTransaction(ctx context.Context, rpcClient *solanarpc.Client, tx *s
 			if jitoDone && rpcDone {
 				if jitoRes.err != nil && !strings.Contains(jitoRes.err.Error(), "429") {
 					fmt.Printf("⚠ Jito: %v\n", jitoRes.err)
+				}
+				if rpcRes.err != nil && jitoRes.err != nil {
+					// Последняя попытка: отправка без preflight, чтобы не терять вход из-за перегруза.
+					rpcCtx, cancel := context.WithTimeout(ctx, 6*time.Second)
+					defer cancel()
+					if sig, err := rpcClient.SendTransactionWithOpts(rpcCtx, tx, solanarpc.TransactionOpts{
+						SkipPreflight: true, PreflightCommitment: solanarpc.CommitmentProcessed,
+					}); err == nil {
+						return sig, time.Now(), nil
+					}
 				}
 				if rpcRes.err != nil {
 					return solana.Signature{}, time.Time{}, fmt.Errorf("SendTransactionWithOpts: %w", rpcRes.err)
@@ -416,6 +505,12 @@ func sendJitoBundle(ctx context.Context, blockEngineURL string, tx *solana.Trans
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		bodyBytes, _ := io.ReadAll(io.LimitReader(resp.Body, 2048))
 		bodyStr := strings.TrimSpace(string(bodyBytes))
+		if resp.StatusCode == http.StatusTooManyRequests ||
+			strings.Contains(bodyStr, "globally rate limited") ||
+			strings.Contains(bodyStr, "Network congested") ||
+			strings.Contains(bodyStr, "Too Many Requests") {
+			markJitoRateLimited("429/rate limited")
+		}
 		if bodyStr != "" {
 			fmt.Printf("❌ Jito API error | status=%s | body=%s\n", resp.Status, bodyStr)
 		} else {
@@ -765,6 +860,7 @@ func swapPumpFun(ctx context.Context, rpcClient *solanarpc.Client, wallet solana
 	owner := wallet.PublicKey()
 	startAt := time.Now()
 	fastMode := fastHotBuyMode()
+	skipMintInfo := fastMode && skipMintInfoInFastBuy()
 	var balBefore uint64
 	if !fastMode {
 		var err error
@@ -809,17 +905,24 @@ func swapPumpFun(ctx context.Context, rpcClient *solanarpc.Client, wallet solana
 		}
 		errMu.Unlock()
 	}
-	wg.Add(3)
-	go func() {
-		defer wg.Done()
-		tp, md, e := mintMetaFromMintData(ctx, rpcClient, mint)
-		if e != nil {
-			setErr(e)
-			return
-		}
-		tokenProgram = tp
-		mintDecimals = md
-	}()
+	if skipMintInfo {
+		// Максимально быстрый путь: не дёргаем mint account (getAccountInfo) до покупки.
+		tokenProgram = solana.TokenProgramID
+		mintDecimals = 6
+	} else {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			tp, md, e := mintMetaFromMintData(ctx, rpcClient, mint)
+			if e != nil {
+				setErr(e)
+				return
+			}
+			tokenProgram = tp
+			mintDecimals = md
+		}()
+	}
+	wg.Add(2)
 	go func() {
 		defer wg.Done()
 		gInfo, e := rpcClient.GetAccountInfoWithOpts(ctx, globalPK, &solanarpc.GetAccountInfoOpts{Encoding: solana.EncodingBase64, Commitment: solanarpc.CommitmentProcessed})
@@ -962,7 +1065,7 @@ func swapPumpFun(ctx context.Context, rpcClient *solanarpc.Client, wallet solana
 	all := append([]solana.Instruction{}, cuLimitIx, cuPriceIx)
 	all = append(all, preIxs...)
 	all = append(all, buyIx)
-	if jitoURL := strings.TrimSpace(os.Getenv("JITO_BLOCK_ENGINE_URL")); jitoURL != "" && jitoMinTipLamports > 0 {
+	if shouldUseJitoPath() && jitoMinTipLamports > 0 {
 		tipIx := system.NewTransferInstruction(jitoMinTipLamports, owner, solana.MustPublicKeyFromBase58(jitoTipAccount)).Build()
 		all = append(all, tipIx)
 	}
@@ -1165,7 +1268,7 @@ func swapPumpFunSellAmount(ctx context.Context, rpcClient *solanarpc.Client, wal
 	}
 
 	all := []solana.Instruction{cuLimitIx, cuPriceIx, sellIx}
-	if jitoURL := strings.TrimSpace(os.Getenv("JITO_BLOCK_ENGINE_URL")); jitoURL != "" && jitoMinTipLamports > 0 {
+	if shouldUseJitoPath() && jitoMinTipLamports > 0 {
 		tipIx := system.NewTransferInstruction(jitoMinTipLamports, owner, solana.MustPublicKeyFromBase58(jitoTipAccount)).Build()
 		all = append(all, tipIx)
 	}

@@ -112,8 +112,8 @@ const (
 
 	PRICE_TICK         = 1500 * time.Millisecond // 1.5s — чаще ловим памп
 	MAX_HOLD           = 30 * time.Second        // 30 сек — не ждём 3 мин, если монета мёртвая
-	FAST_EXIT_AFTER    = 30 * time.Second        // если за 30с нет +5% — выходим
-	FAST_EXIT_MIN_MULT = 1.05                    // +5%
+	FAST_EXIT_AFTER    = 120 * time.Second       // если за 120с нет роста — выходим
+	FAST_EXIT_MIN_MULT = 1.00                    // 0% (без плюса)
 	// Сервисные интервалы/лимиты RPC для защиты от -32429.
 	BALANCE_CHECK_INTERVAL = 30 * time.Second
 	RPC_RETRY_BASE_DELAY   = 250 * time.Millisecond
@@ -139,7 +139,7 @@ const (
 	STOP_CONFIRM_LVL    = 0.90 // -10%
 	STOP_CONFIRM_N      = 1
 	SELL_SLIPPAGE_GUARD = 0.10            // >10% ожидаемого slip на выходе — подождать следующий тик
-	TAKE_PROFIT         = 1.20            // +20% — фиксируем весь объём
+	TAKE_PROFIT         = 1.50            // +50% — фиксируем весь объём
 	TRAIL_ACTIVATE      = 1.15            // трейлинг после +15% (было +40%)
 	TRAILING            = 0.12            // откат 12% от пика (было 16%)
 	TRAIL_MIN_AGE       = 5 * time.Second // был 10s — трейл раньше
@@ -3038,7 +3038,7 @@ func monitor(w *Wallet, mint, bcAddr, sym, source string) {
 			}
 			// Fast Exit: за 30с нет +5% — выходим, не ждём пока сольёт
 			if time.Since(opened) >= FAST_EXIT_AFTER && mult < FAST_EXIT_MIN_MULT {
-				w.closePos(mint, fmt.Sprintf("FAST EXIT (нет +5%% за %.0fс, spot %.1f%%)", FAST_EXIT_AFTER.Seconds(), (mult-1)*100), price)
+				w.closePos(mint, fmt.Sprintf("FAST EXIT (нет +%.0f%% за %.0fс, spot %.1f%%)", (FAST_EXIT_MIN_MULT-1)*100, FAST_EXIT_AFTER.Seconds(), (mult-1)*100), price)
 				return
 			}
 			// SCRATCH: флэт >2 мин — освобождаем капитал (если не вылетели по FAST EXIT)

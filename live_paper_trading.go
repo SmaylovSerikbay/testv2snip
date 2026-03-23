@@ -52,32 +52,32 @@ const (
 
 	// Pump.fun: Global fee_basis_points = 100 → 1% с покупки и с продажи (документация программы)
 	PUMP_FEE_BPS = 100
-	// Проскальзывание: ниже — меньше «налога» на бумажный PnL
-	SLIPPAGE_BPS = 35
+	// Проскальзывание для paper-оценки (live для pump берётся из pump_direct.go отдельно).
+	SLIPPAGE_BPS = 49
 	// Оценка сети на одну подпись (бумага); live — по факту RPC / pump
 	SOLANA_TX_LAMPORTS = 12_000.0
 
 	PRICE_TICK = 3 * time.Second
 	MAX_HOLD   = 7 * time.Minute
 
-	// ── Снайпер: баланс «чистота/частота», чтобы были реальные входы за сессию
-	SNIPER_CURVE_MIN = 0.006 // ≥0.6% по кривой
-	SNIPER_CURVE_MAX = 0.10  // ≤10%
-	MIN_REAL_SOL     = 0.08  // минимум реального SOL в кривой
+	// Recovery Mode ($3.9): узкое окно + ликвидность, чтобы не брать «пустые» мёртвые пулы.
+	SNIPER_CURVE_MIN = 0.002 // 0.2%
+	SNIPER_CURVE_MAX = 0.15  // 15%
+	MIN_REAL_SOL     = 3.0   // минимум 3 SOL в кривой
 
 	// Анти-скам
 	CREATOR_SOL_MIN     = 0.04 // не слишком режем поток, но отсеиваем совсем пустых
 	CREATOR_SOL_SUSPECT = 80.0
 	MAX_NONCURVE_PCT    = 0.12
 
-	// Выходы: ловим импульс, но не держим бесконечно
-	STOP_LOSS        = 0.90
-	TAKE_PROFIT      = 2.0 // полный выход ~+100% spot (икс-зона; бумага)
-	TRAIL_ACTIVATE   = 1.12 // трейлинг после уверенного плюса
-	TRAILING         = 0.10 // чуть плотнее, чтобы не отдавать откат
-	TRAIL_MIN_AGE    = 25 * time.Second
-	TRAIL_MIN_PROFIT = 1.06 // пол трейлинга не ниже ~+6% к входу
-	BREAKEVEN_ARM    = 1.06
+	// Выходы Recovery: SL -20%; трейлинг с +50%; на +200% — полный выход.
+	STOP_LOSS        = 0.80
+	TAKE_PROFIT      = 3.0 // +200%
+	TRAIL_ACTIVATE   = 1.50
+	TRAILING         = 0.16
+	TRAIL_MIN_AGE    = 10 * time.Second
+	TRAIL_MIN_PROFIT = 1.10
+	BREAKEVEN_ARM    = 1.10
 	SCRATCH_AFTER    = 2 * time.Minute  // не зависаем в флэте слишком долго
 	SCRATCH_IF_BELOW = 0.97             // скретч только если совсем плоско
 	NO_IMPULSE_AFTER = 4 * time.Minute // «нет импульса» — после умеренной консолидации
@@ -86,9 +86,10 @@ const (
 	// Если create-транзакция старше — не считаем «только что залистились» (защита от кривых сигналов)
 	MAX_CREATE_TX_AGE = 30 * time.Minute
 
-	VELOCITY_PAUSE         = 1400 * time.Millisecond // ещё короче: быстрее ловим ранний импульс
-	VELOCITY_MIN_DPROGRESS = 0.00008                 // ~0.008 п.п. за окно
-	VELOCITY_MIN_DREALSOL  = 0.0004                  // +0.0004 SOL за окно
+	VELOCITY_PAUSE         = 800 * time.Millisecond // микро-velocity
+	VELOCITY_MIN_DPROGRESS = 0.0
+	VELOCITY_MIN_DREALSOL  = 0.0
+	LIVE_FIXED_BUY_SOL     = 0.022 // fixed buy for recovery mode
 
 	// Логи: false = не печатать каждый отсев (только сводка раз в минуту + успешный ВХОД)
 	VERBOSE_REJECT_LOGS = false
@@ -340,6 +341,7 @@ type Position struct {
 	Live          bool
 	TokenRaw      uint64
 	BuyLamports   uint64
+	HalfTaken     bool
 	Source        string // pump | launchlab
 }
 
@@ -358,6 +360,7 @@ func snapshotPosition(p *Position) *Position {
 		Live:           p.Live,
 		TokenRaw:       p.TokenRaw,
 		BuyLamports:    p.BuyLamports,
+		HalfTaken:      p.HalfTaken,
 		Source:         p.Source,
 	}
 }
@@ -726,10 +729,6 @@ func curveVelocityOK(bc string, snap0 *curveSnap, source string, createAt *time.
 	if snap0 == nil || snap0.Complete {
 		return nil, false, "нет снимка", "velocity"
 	}
-	// Для aggressive профиля — максимальная скорость входа без дополнительной задержки.
-	if envSignalProfile() == "aggressive" {
-		return snap0, true, "aggressive: zero-delay pass", ""
-	}
 	if envSkipVelocity() {
 		return snap0, true, "SKIP_VELOCITY=1 (без паузы и второго замера)", ""
 	}
@@ -744,10 +743,9 @@ func curveVelocityOK(bc string, snap0 *curveSnap, source string, createAt *time.
 	}
 	dP := s1.Progress - snap0.Progress
 	dSol := s1.RealSolSOL - snap0.RealSolSOL
-	// Для aggressive: если есть любой положительный приток по кривой или SOL, пропускаем.
-	// Это осознанно увеличивает поток сделок ценой большего шума.
-	if envSignalProfile() == "aggressive" && (dP > 0 || dSol > 0) {
-		return s1, true, fmt.Sprintf("soft-pass aggressive: Δ%.2f%% / +%.3f SOL за %v", dP*100, dSol, pause), ""
+	// Recovery logic: за 800ms динамика должна быть строго вверх.
+	if dP <= 0 {
+		return s1, false, fmt.Sprintf("micro-velocity вниз/флэт (Δ%.3f%% за %v)", dP*100, pause), "vel_low"
 	}
 	if dP < minDP && dSol < minDSol {
 		return s1, false, fmt.Sprintf("мало притока (Δ%.2f%% / +%.3f SOL за %v; проф=%s, need≈Δ%.2f%% или +%.3f SOL)",
@@ -1082,6 +1080,221 @@ func rpcParsedTokenAccountOwner(tokenAccAddr string) (owner string, err error) {
 	return out.Result.Value.Data.Parsed.Info.Owner, nil
 }
 
+func rpcTokenMetadataURI(mint string) (string, error) {
+	mintPK, err := solana.PublicKeyFromBase58(mint)
+	if err != nil {
+		return "", err
+	}
+	metadataProgram := solana.MustPublicKeyFromBase58("metaqbxxUerdq28cj1RbAWkYQm3ybzjb6a8bt518x1s")
+	pda, _, err := solana.FindProgramAddress(
+		[][]byte{[]byte("metadata"), metadataProgram.Bytes(), mintPK.Bytes()},
+		metadataProgram,
+	)
+	if err != nil {
+		return "", err
+	}
+	data, err := rpc("getAccountInfo", []interface{}{
+		pda.String(), map[string]interface{}{"encoding": "base64"},
+	})
+	if err != nil {
+		return "", err
+	}
+	var out struct {
+		Result struct {
+			Value *struct {
+				Data []interface{} `json:"data"`
+			} `json:"value"`
+		} `json:"result"`
+	}
+	if err := json.Unmarshal(data, &out); err != nil {
+		return "", err
+	}
+	if out.Result.Value == nil || len(out.Result.Value.Data) < 1 {
+		return "", fmt.Errorf("no metadata account")
+	}
+	rawB64, _ := out.Result.Value.Data[0].(string)
+	if rawB64 == "" {
+		return "", fmt.Errorf("empty metadata data")
+	}
+	raw, err := base64.StdEncoding.DecodeString(rawB64)
+	if err != nil {
+		return "", err
+	}
+	// Metaplex Metadata V1 layout: key(1) + updateAuth(32) + mint(32) + name + symbol + uri (borsh string/u32-len).
+	off := 1 + 32 + 32
+	readStr := func() (string, bool) {
+		if off+4 > len(raw) {
+			return "", false
+		}
+		n := int(binary.LittleEndian.Uint32(raw[off : off+4]))
+		off += 4
+		if n < 0 || off+n > len(raw) {
+			return "", false
+		}
+		s := strings.TrimSpace(strings.Trim(string(raw[off:off+n]), "\x00"))
+		off += n
+		return s, true
+	}
+	if _, ok := readStr(); !ok { // name
+		return "", fmt.Errorf("metadata parse name")
+	}
+	if _, ok := readStr(); !ok { // symbol
+		return "", fmt.Errorf("metadata parse symbol")
+	}
+	uri, ok := readStr()
+	if !ok || uri == "" {
+		return "", fmt.Errorf("metadata uri missing")
+	}
+	return strings.TrimSpace(uri), nil
+}
+
+func hasSocialLinksInMetadata(mint string) (bool, string) {
+	uri, err := rpcTokenMetadataURI(mint)
+	if err != nil {
+		return false, "metadata URI недоступен"
+	}
+	resp, err := httpClient.Get(uri)
+	if err != nil || resp.StatusCode != 200 {
+		if resp != nil {
+			resp.Body.Close()
+		}
+		return false, "metadata JSON недоступен"
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return false, "metadata JSON read error"
+	}
+	s := strings.ToLower(string(body))
+	hasTg := strings.Contains(s, "t.me/") || strings.Contains(s, "telegram")
+	hasTw := strings.Contains(s, "twitter.com/") || strings.Contains(s, "x.com/")
+	if !hasTg && !hasTw {
+		return false, "нет Telegram/Twitter в metadata"
+	}
+	return true, "social ok"
+}
+
+func devSoldInFirstMinute(creator string, createAt *time.Time) (bool, string) {
+	if creator == "" || createAt == nil {
+		return false, "skip dev-sold check"
+	}
+	data, err := rpc("getSignaturesForAddress", []interface{}{
+		creator, map[string]interface{}{"limit": 20},
+	})
+	if err != nil {
+		return false, "dev sigs RPC"
+	}
+	var out struct {
+		Result []struct {
+			Signature string `json:"signature"`
+			BlockTime int64  `json:"blockTime"`
+		} `json:"result"`
+	}
+	if err := json.Unmarshal(data, &out); err != nil {
+		return false, "dev sigs parse"
+	}
+	until := createAt.Add(1 * time.Minute).Unix()
+	start := createAt.Unix()
+	for _, s := range out.Result {
+		if s.BlockTime < start || s.BlockTime > until {
+			continue
+		}
+		txRaw, err := rpc("getTransaction", []interface{}{
+			s.Signature, map[string]interface{}{"encoding": "jsonParsed", "maxSupportedTransactionVersion": 0},
+		})
+		if err != nil {
+			continue
+		}
+		var tx struct {
+			Result *struct {
+				Meta *struct {
+					LogMessages []string `json:"logMessages"`
+				} `json:"meta"`
+			} `json:"result"`
+		}
+		if json.Unmarshal(txRaw, &tx) != nil || tx.Result == nil || tx.Result.Meta == nil {
+			continue
+		}
+		for _, l := range tx.Result.Meta.LogMessages {
+			if strings.Contains(l, "Instruction: Sell") {
+				return true, "dev sold in first minute"
+			}
+		}
+	}
+	return false, "dev holding"
+}
+
+func topHolderOwners(mint string, limit int) ([]string, error) {
+	data, err := rpc("getTokenLargestAccounts", []interface{}{
+		mint, map[string]string{"commitment": "confirmed"},
+	})
+	if err != nil {
+		return nil, err
+	}
+	var out struct {
+		Result struct {
+			Value []struct {
+				Address string `json:"address"`
+			} `json:"value"`
+		} `json:"result"`
+	}
+	if err := json.Unmarshal(data, &out); err != nil {
+		return nil, err
+	}
+	if limit > len(out.Result.Value) {
+		limit = len(out.Result.Value)
+	}
+	owners := make([]string, 0, limit)
+	seen := map[string]bool{}
+	for _, row := range out.Result.Value[:limit] {
+		owner, err := rpcParsedTokenAccountOwner(row.Address)
+		if err != nil || owner == "" || seen[owner] {
+			continue
+		}
+		seen[owner] = true
+		owners = append(owners, owner)
+	}
+	return owners, nil
+}
+
+func bundledBuyersCheck(mint, creator string, createAt *time.Time) (bool, string) {
+	if createAt == nil {
+		return true, "no create time"
+	}
+	owners, err := topHolderOwners(mint, 8)
+	if err != nil {
+		return false, "bundle RPC"
+	}
+	blockTs := createAt.Unix()
+	sameBlock := 0
+	for _, o := range owners {
+		if o == creator {
+			continue
+		}
+		data, err := rpc("getSignaturesForAddress", []interface{}{
+			o, map[string]interface{}{"limit": 1},
+		})
+		if err != nil {
+			continue
+		}
+		var out struct {
+			Result []struct {
+				BlockTime int64 `json:"blockTime"`
+			} `json:"result"`
+		}
+		if json.Unmarshal(data, &out) != nil || len(out.Result) == 0 {
+			continue
+		}
+		if out.Result[0].BlockTime == blockTs {
+			sameBlock++
+		}
+	}
+	if sameBlock > 5 {
+		return false, fmt.Sprintf("bundled attack: %d top holders в блоке dev", sameBlock)
+	}
+	return true, fmt.Sprintf("bundle ok (%d)", sameBlock)
+}
+
 // Топ-холдеры: кривая должна держать львиную долю; иначе — раздача/скам-паттерн
 func antiScamThresholds() (creatorMinSOL, creatorMaxSOL, minCurveShare, maxNonCurveShare float64) {
 	creatorMinSOL = CREATOR_SOL_MIN
@@ -1162,7 +1375,7 @@ func rpcHolderDistributionOK(mint, bondingCurve, creator string, minCurveShare, 
 
 // mintAuthorityRef — pump: bonding curve PDA; launchlab: pool PDA (для сравнения с mintAuthority).
 // liquidityVault — аккаунт, где лежит основная ликвидность (pump: та же кривая; launchlab: pool_vault base).
-func antiScamCheck(mint, mintAuthorityRef, liquidityVault, creator string, extraMintAuth ...string) (ok bool, detail string) {
+func antiScamCheck(mint, mintAuthorityRef, liquidityVault, creator string, createAt *time.Time, extraMintAuth ...string) (ok bool, detail string) {
 	if creator == "" {
 		return false, "нет pubkey создателя"
 	}
@@ -1187,11 +1400,22 @@ func antiScamCheck(mint, mintAuthorityRef, liquidityVault, creator string, extra
 	if badFreeze {
 		return false, "freezeAuthority (заморозка счетов)"
 	}
+	okSocial, socialDetail := hasSocialLinksInMetadata(mint)
+	if !okSocial {
+		return false, socialDetail
+	}
+	if sold, soldDetail := devSoldInFirstMinute(creator, createAt); sold {
+		return false, soldDetail
+	}
+	okBundle, bundleDetail := bundledBuyersCheck(mint, creator, createAt)
+	if !okBundle {
+		return false, bundleDetail
+	}
 	ok2, hd := rpcHolderDistributionOK(mint, liquidityVault, creator, minCurveShare, maxNonCurveShare)
 	if !ok2 {
 		return false, hd
 	}
-	return true, hd + fmt.Sprintf(" | dev %.2f SOL", sol)
+	return true, hd + fmt.Sprintf(" | %s | %s | dev %.2f SOL", socialDetail, bundleDetail, sol)
 }
 
 // ════════════════════════════════════════════════════
@@ -1374,7 +1598,8 @@ func (w *Wallet) openLive(tok NewToken, sym string, spot float64, capitalUSD flo
 		return false
 	}
 	reserve := liveReserveSOL
-	solForSwap := capitalUSD / solPrice
+	_ = capitalUSD
+	solForSwap := LIVE_FIXED_BUY_SOL
 	if solForSwap > solBal-reserve {
 		solForSwap = solBal - reserve
 	}
@@ -1750,6 +1975,9 @@ func monitor(w *Wallet, mint, bcAddr, sym, source string) {
 			peak := pos.PeakPrice
 			breakeven := pos.BreakevenArmed
 			opened := pos.OpenedAt
+			livePos := pos.Live
+			halfTaken := pos.HalfTaken
+			tokenRaw := pos.TokenRaw
 			pos.mu.Unlock()
 
 			mult := price / entry
@@ -1770,6 +1998,25 @@ func monitor(w *Wallet, mint, bcAddr, sym, source string) {
 			if mult >= TAKE_PROFIT {
 				w.closePos(mint, fmt.Sprintf("ТЕЙК ~+%.0f%% spot", (TAKE_PROFIT-1)*100), price)
 				return
+			}
+			// Recovery: на +100% фиксируем половину, остаток ведём трейлингом.
+			if livePos && !halfTaken && mult >= 2.0 && tokenRaw > 10 {
+				if sig, soldRaw, solOut, err := PumpDirectSellFraction(mint, 0.5); err == nil && soldRaw > 0 {
+					w.mu.Lock()
+					if p2, ok := w.Pos[mint]; ok {
+						if p2.TokenRaw > soldRaw {
+							p2.TokenRaw -= soldRaw
+						} else {
+							p2.TokenRaw = 0
+						}
+						p2.Tokens = p2.Tokens * 0.5
+						p2.CapitalUSD = p2.CapitalUSD * 0.5
+						p2.HalfTaken = true
+					}
+					w.mu.Unlock()
+					fmt.Printf("  %s %-18s | partial +100%%: sold 50%% | out %.4f SOL | %s\n",
+						green("↗"), sym, float64(solOut)/1e9, gray(sig))
+				}
 			}
 
 			// Трейлинг: только после TRAIL_MIN_AGE; стоп = max(откат от пика, мин. +4% к входу)
@@ -2033,7 +2280,7 @@ func main() {
 				if envSkipAntiScam() {
 					ok, scamMeta = true, "[SKIP_ANTI_SCAM тест — не для реальной торговли]"
 				} else {
-					ok, scamMeta = antiScamCheck(mint, bc, liqVault, creator, extraMint...)
+					ok, scamMeta = antiScamCheck(mint, bc, liqVault, creator, createAt, extraMint...)
 				}
 				if !ok {
 					logRejectLine("scam", sym, mint, "фильтр: "+scamMeta)

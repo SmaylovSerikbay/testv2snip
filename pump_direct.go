@@ -36,8 +36,9 @@ const (
 )
 
 var (
-	pumpSlippageBps          uint64 = 4000 // 40% bps для min_out на кривой; PUMP_SLIPPAGE_BPS в .env
-	pumpPriorityFeeLamports  uint64 = 120_000
+	pumpBuySlippageBps       uint64 = 3000 // buy 30%
+	pumpSellSlippageBps      uint64 = 4000 // sell 40%
+	pumpPriorityFeeLamports  uint64 = 5_000_000 // 0.005 SOL
 	pumpPriorityMaxFeeBps    uint64 = 120 // максимум приоритета как доля от размера сделки (1.2%)
 	pumpSellRetryPriorityFee uint64 = 8_000_000
 	pumpDirectRPC     *solanarpc.Client
@@ -47,7 +48,18 @@ var (
 func initPumpDirectFromEnv() {
 	if s := strings.TrimSpace(os.Getenv("PUMP_SLIPPAGE_BPS")); s != "" {
 		if v, err := strconv.ParseUint(s, 10, 64); err == nil && v < 10000 {
-			pumpSlippageBps = v
+			pumpBuySlippageBps = v
+			pumpSellSlippageBps = v
+		}
+	}
+	if s := strings.TrimSpace(os.Getenv("PUMP_BUY_SLIPPAGE_BPS")); s != "" {
+		if v, err := strconv.ParseUint(s, 10, 64); err == nil && v < 10000 {
+			pumpBuySlippageBps = v
+		}
+	}
+	if s := strings.TrimSpace(os.Getenv("PUMP_SELL_SLIPPAGE_BPS")); s != "" {
+		if v, err := strconv.ParseUint(s, 10, 64); err == nil && v < 10000 {
+			pumpSellSlippageBps = v
 		}
 	}
 	if s := strings.TrimSpace(os.Getenv("PRIORITY_FEE_LAMPORTS")); s != "" {
@@ -510,7 +522,7 @@ func swapPumpFun(ctx context.Context, rpcClient *solanarpc.Client, wallet solana
 	}
 
 	expectedOut, minOut := pumpComputeMinTokensOut(
-		spendableBudget, vSol, vTok, realToken, feeBps, creatorFeeBps, pumpSlippageBps,
+		spendableBudget, vSol, vTok, realToken, feeBps, creatorFeeBps, pumpBuySlippageBps,
 	)
 	minOut = pumpExtraHaircutMinOut(minOut, pumpMinOutExtraHaircutBps)
 	if pumpEnvForceMinOutOne() {
@@ -967,9 +979,50 @@ func PumpDirectSellAll(mintStr string) (sig string, solOutLamports uint64, err e
 	if err != nil {
 		return "", 0, err
 	}
-	s, gross, err := swapPumpFunSellAll(ctx, rpcPumpDirect(), livePrivKey, mint, pumpSlippageBps)
+	s, gross, err := swapPumpFunSellAll(ctx, rpcPumpDirect(), livePrivKey, mint, pumpSellSlippageBps)
 	if err != nil {
 		return "", 0, err
 	}
 	return s.String(), gross, nil
+}
+
+func PumpDirectSellFraction(mintStr string, fraction float64) (sig string, soldRaw uint64, solOutLamports uint64, err error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	defer cancel()
+	mint, err := solana.PublicKeyFromBase58(mintStr)
+	if err != nil {
+		return "", 0, 0, err
+	}
+	owner := livePrivKey.PublicKey()
+	tokenProgram, err := mintTokenProgram(ctx, rpcPumpDirect(), mint)
+	if err != nil {
+		return "", 0, 0, err
+	}
+	ata, _, err := solana.FindProgramAddress(
+		[][]byte{owner.Bytes(), tokenProgram.Bytes(), mint.Bytes()},
+		solana.SPLAssociatedTokenAccountProgramID,
+	)
+	if err != nil {
+		return "", 0, 0, err
+	}
+	bal, err := rpcPumpDirect().GetTokenAccountBalance(ctx, ata, solanarpc.CommitmentProcessed)
+	if err != nil || bal == nil || bal.Value == nil {
+		return "", 0, 0, fmt.Errorf("token balance: %w", err)
+	}
+	raw, err := strconv.ParseUint(bal.Value.Amount, 10, 64)
+	if err != nil || raw == 0 {
+		return "", 0, 0, fmt.Errorf("zero token balance")
+	}
+	if fraction <= 0 || fraction > 1 {
+		return "", 0, 0, fmt.Errorf("fraction out of range")
+	}
+	soldRaw = uint64(float64(raw) * fraction)
+	if soldRaw == 0 {
+		soldRaw = 1
+	}
+	s, out, err := swapPumpFunSellWithFallback(ctx, rpcPumpDirect(), livePrivKey, mint, soldRaw, pumpSellSlippageBps)
+	if err != nil {
+		return "", 0, 0, err
+	}
+	return s.String(), soldRaw, out, nil
 }

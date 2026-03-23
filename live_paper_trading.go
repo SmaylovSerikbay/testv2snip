@@ -65,7 +65,7 @@ const (
 	// Оценка сети на одну подпись (бумага); live — по факту RPC / pump
 	SOLANA_TX_LAMPORTS = 12_000.0
 
-	PRICE_TICK = 3 * time.Second
+	PRICE_TICK = 1500 * time.Millisecond // 1.5s — чаще ловим памп (было 3s)
 	MAX_HOLD   = 3 * time.Minute
 	// Сервисные интервалы/лимиты RPC для защиты от -32429.
 	BALANCE_CHECK_INTERVAL = 30 * time.Second
@@ -86,15 +86,15 @@ const (
 	MAX_NONCURVE_PCT    = 0.12
 
 	// Выходы Final Recovery: hard SL -30%; TP только от +150%.
-	STOP_LOSS_HARD   = 0.70 // -30%
-	STOP_CONFIRM_LVL = 0.70 // -30%
+	STOP_LOSS_HARD   = 0.85 // -15% (было -30% — режем быстрее на pump.fun)
+	STOP_CONFIRM_LVL = 0.85 // -15%
 	STOP_CONFIRM_N   = 1
 	SELL_SLIPPAGE_GUARD = 0.10 // >10% ожидаемого slip на выходе — подождать следующий тик
-	TAKE_PROFIT      = 1.25 // +25%
-	TRAIL_ACTIVATE   = 1.40 // трейлинг стартует после +40%
-	TRAILING         = 0.16
-	TRAIL_MIN_AGE    = 10 * time.Second
-	TRAIL_MIN_PROFIT = 1.10
+	TAKE_PROFIT      = 1.15 // +15% (было 25% — пампы короткие, фиксируем раньше)
+	TRAIL_ACTIVATE   = 1.15 // трейлинг после +15% (было +40%)
+	TRAILING         = 0.12 // откат 12% от пика (было 16%)
+	TRAIL_MIN_AGE    = 5 * time.Second  // был 10s — трейл раньше
+	TRAIL_MIN_PROFIT = 1.05             // пол +5% (было +10%)
 	BREAKEVEN_ARM    = 1.10
 	SCRATCH_AFTER    = 2 * time.Minute  // не зависаем в флэте слишком долго
 	SCRATCH_IF_BELOW = 0.97             // скретч только если совсем плоско
@@ -2536,6 +2536,11 @@ func monitor(w *Wallet, mint, bcAddr, sym, source string) {
 				w.closePos(mint, "БРЕЙК-ИВН после импульса", price)
 				return
 			}
+			// SCRATCH: флэт >2 мин — освобождаем капитал (не ждём 3 мин таймаута)
+			if time.Since(opened) >= SCRATCH_AFTER && mult < SCRATCH_IF_BELOW {
+				w.closePos(mint, fmt.Sprintf("СКРЕТЧ (флэт %.0f мин, spot %.1f%%)", SCRATCH_AFTER.Minutes(), (mult-1)*100), price)
+				return
+			}
 			// Final Recovery: не выходим по "слабому импульсу"/"нет импульса", даём позиции разыграться.
 			if price <= entry*STOP_CONFIRM_LVL {
 				confirmedStopTicks++
@@ -2544,10 +2549,11 @@ func monitor(w *Wallet, mint, bcAddr, sym, source string) {
 			}
 			// "Fake stop-out" защита: подтверждение/порог по recovery настройкам.
 			if price <= entry*STOP_LOSS_HARD || confirmedStopTicks >= STOP_CONFIRM_N {
+				pct := (1 - STOP_LOSS_HARD) * 100
 				if price <= entry*STOP_LOSS_HARD {
-					w.closePos(mint, "СТОП -30% (hard)", price)
+					w.closePos(mint, fmt.Sprintf("СТОП -%.0f%% (hard)", pct), price)
 				} else {
-					w.closePos(mint, "СТОП подтверждён (-30%)", price)
+					w.closePos(mint, fmt.Sprintf("СТОП подтверждён (-%.0f%%)", pct), price)
 				}
 				return
 			}

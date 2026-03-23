@@ -50,9 +50,10 @@ const (
 )
 
 var (
-	pumpBuySlippageBps       uint64 = 3000 // buy 30%
-	pumpSellSlippageBps      uint64 = 4000 // sell 40%
-	pumpPriorityFeeLamports  uint64 = 900_000 // 0.0009 SOL (минимально-жизнеспособный дефолт)
+	pumpBuySlippageBps       uint64 = 2000 // buy 20%
+	pumpSellSlippageBps      uint64 = 2000 // sell 20%
+	pumpPriorityFeeLamports  uint64 = 200_000 // 0.0002 SOL (выживание малого банка)
+	jitoMinTipLamports       uint64 = 200_000 // минимальный tip при Jito
 	pumpPriorityMaxFeeBps    uint64 = 100 // максимум приоритета как доля от размера сделки (1.0%)
 	pumpSellRetryPriorityFee uint64 = 8_000_000
 	pumpDirectRPC     *solanarpc.Client
@@ -106,6 +107,11 @@ func initPumpDirectFromEnv() {
 	if s := strings.TrimSpace(os.Getenv("PUMP_PRIORITY_MAX_FEE_BPS")); s != "" {
 		if v, err := strconv.ParseUint(s, 10, 64); err == nil && v <= 2_000 {
 			pumpPriorityMaxFeeBps = v
+		}
+	}
+	if s := strings.TrimSpace(os.Getenv("JITO_MIN_TIP_LAMPORTS")); s != "" {
+		if v, err := strconv.ParseUint(s, 10, 64); err == nil {
+			jitoMinTipLamports = v
 		}
 	}
 }
@@ -222,8 +228,8 @@ func choosePriorityFeeLamports(baseTradeLamports uint64) uint64 {
 	if dyn, ok := cachedDynamicPriorityFeeLamports(); ok && dyn > 0 {
 		fee = dyn
 	}
-	if strings.TrimSpace(os.Getenv("JITO_BLOCK_ENGINE_URL")) != "" && fee < 1_000_000 {
-		fee = 1_000_000 // 0.001 SOL минимум для быстрого попадания в bundle
+	if strings.TrimSpace(os.Getenv("JITO_BLOCK_ENGINE_URL")) != "" && fee < jitoMinTipLamports {
+		fee = jitoMinTipLamports
 	}
 	if baseTradeLamports > 0 && pumpPriorityMaxFeeBps > 0 {
 		capFee := (baseTradeLamports * pumpPriorityMaxFeeBps) / 10_000
@@ -231,8 +237,8 @@ func choosePriorityFeeLamports(baseTradeLamports uint64) uint64 {
 			fee = capFee
 		}
 	}
-	if strings.TrimSpace(os.Getenv("JITO_BLOCK_ENGINE_URL")) != "" && fee < 1_000_000 {
-		fee = 1_000_000
+	if strings.TrimSpace(os.Getenv("JITO_BLOCK_ENGINE_URL")) != "" && fee < jitoMinTipLamports {
+		fee = jitoMinTipLamports
 	}
 	return fee
 }

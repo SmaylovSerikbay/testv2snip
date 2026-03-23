@@ -829,6 +829,29 @@ func waitBuySettlement(sig, mint string, timeout time.Duration) (ok bool, reason
 	return false, "no_confirmation_or_zero_balance"
 }
 
+func (w *Wallet) verifyBuyAsync(mint, sym, sig string, detectedAt time.Time) {
+	ok, reason := waitBuySettlement(sig, mint, 5*time.Second)
+	if ok {
+		if !detectedAt.IsZero() {
+			consoleMu.Lock()
+			fmt.Printf("%s Transaction Confirmed | %s | +%dms\n",
+				gray("⏱"), "$"+short(mint), time.Since(detectedAt).Milliseconds())
+			consoleMu.Unlock()
+		}
+		return
+	}
+	consoleMu.Lock()
+	fmt.Printf("%s BUY FAILED %s | sig=%s | reason=%s\n", red("❌"), sym, gray(sig), reason)
+	consoleMu.Unlock()
+	w.mu.Lock()
+	if _, exists := w.Pos[mint]; exists {
+		delete(w.Pos, mint)
+		w.saveActivePositionsLocked()
+	}
+	w.mu.Unlock()
+	syncWalletBalanceUSDFresh(w)
+}
+
 func hotPathSilent() bool {
 	s := strings.TrimSpace(strings.ToLower(os.Getenv("HOT_PATH_SILENT")))
 	if s == "0" || s == "false" || s == "no" {
@@ -2075,13 +2098,6 @@ func (w *Wallet) openLive(tok NewToken, sym string, spot float64, capitalUSD flo
 		}
 		consoleMu.Unlock()
 	}
-	if ok, reason := waitBuySettlement(sig, tok.Mint, 5*time.Second); !ok {
-		consoleMu.Lock()
-		fmt.Printf("%s BUY FAILED %s | sig=%s | reason=%s\n", red("❌"), sym, gray(sig), reason)
-		consoleMu.Unlock()
-		syncWalletBalanceUSDFresh(w)
-		return false
-	}
 	syncWalletBalanceUSDFresh(w)
 	tokens := float64(tokenRaw) / 1e6 // pump: 6 decimals
 	entry := spot
@@ -2109,10 +2125,7 @@ func (w *Wallet) openLive(tok NewToken, sym string, spot float64, capitalUSD flo
 		BuyLamports:  solIn,
 		Source:       tokenSource(tok),
 	}
-	if !tok.DetectedAt.IsZero() {
-		fmt.Printf("%s Transaction Confirmed | %s | +%dms\n",
-			gray("⏱"), "$"+short(tok.Mint), time.Since(tok.DetectedAt).Milliseconds())
-	}
+	go w.verifyBuyAsync(tok.Mint, sym, sig, tok.DetectedAt)
 	w.saveActivePositionsLocked()
 	bal := w.Balance
 	fmt.Printf("\n%s ВХОД LIVE %-18s | ~$%.2f SOL→токен | eff $%.10f | raw %d | %s | баланс $%.2f\n",

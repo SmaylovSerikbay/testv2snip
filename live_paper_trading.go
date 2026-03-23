@@ -71,9 +71,9 @@ const (
 	FAST_EXIT_MIN_MULT = 1.05                    // +5%
 	// Сервисные интервалы/лимиты RPC для защиты от -32429.
 	BALANCE_CHECK_INTERVAL = 30 * time.Second
-	RPC_RETRY_BASE_DELAY   = 2 * time.Second
+	RPC_RETRY_BASE_DELAY   = 250 * time.Millisecond
 	RPC_MAX_RETRIES        = 4
-	RPC_MAX_CONCURRENT     = 3
+	RPC_MAX_CONCURRENT     = 8
 
 	// Recovery Mode ($3.9): узкое окно + ликвидность, чтобы не брать «пустые» мёртвые пулы.
 	SNIPER_CURVE_MIN           = 0.002 // 0.2%
@@ -107,9 +107,9 @@ const (
 
 	// Если create-транзакция старше — не считаем «только что залистились» (защита от кривых сигналов)
 	MAX_CREATE_TX_AGE       = 30 * time.Minute
-	MAX_READY_TO_SEND_DELAY = 2500 * time.Millisecond
+	MAX_READY_TO_SEND_DELAY = 4000 * time.Millisecond
 
-	VELOCITY_PAUSE         = 500 * time.Millisecond // 500ms — видим, что другие покупают
+	VELOCITY_PAUSE         = 200 * time.Millisecond // меньше внутренней задержки на входе
 	VELOCITY_MIN_DPROGRESS = 0.02                   // min +2% за паузу — только первая волна
 	VELOCITY_MIN_DREALSOL  = 0.0
 	VELOCITY_MIN_DELTA_DP  = -0.0001 // -0.01% (разрешаем микро-откат на замере)
@@ -889,6 +889,11 @@ func abortIfTooLate(tok NewToken, stage string) bool {
 		return false
 	}
 	consoleMu.Lock()
+	if stage == "velocity_check" {
+		fmt.Printf("⚠️ LATENCY WARNING: High latency (%d ms) stage=%s, continuing\n", d.Milliseconds(), stage)
+		consoleMu.Unlock()
+		return false
+	}
 	fmt.Printf("❌ TRADE ABORTED: Latency too high (%d ms) stage=%s\n", d.Milliseconds(), stage)
 	consoleMu.Unlock()
 	return true
@@ -1014,9 +1019,9 @@ func getCurveSnapshotUnified(bcAddr, source string) (*curveSnap, error) {
 func getCurveSnapshotWithRetry(bcAddr string, source string) (*curveSnap, error) {
 	var last *curveSnap
 	var lastErr error
-	for attempt := 0; attempt < 4; attempt++ {
+	for attempt := 0; attempt < 3; attempt++ {
 		if attempt > 0 {
-			time.Sleep(time.Duration(120*attempt) * time.Millisecond)
+			time.Sleep(time.Duration(50*attempt) * time.Millisecond)
 		}
 		s, err := getCurveSnapshotUnified(bcAddr, source)
 		last, lastErr = s, err
@@ -1157,14 +1162,7 @@ func pickMintFromPostBalances(balances []postTokenBal) string {
 // ════════════════════════════════════════════════════
 
 func parseCreateTx(sig string) (mint, creator string, createBlockTime *time.Time) {
-	data, err := rpc("getTransaction", []interface{}{
-		sig,
-		map[string]interface{}{
-			"encoding":                       "jsonParsed",
-			"maxSupportedTransactionVersion": 0,
-			"commitment":                     "confirmed",
-		},
-	})
+	data, err := getTransactionJSONParsedFast(sig)
 	if err != nil {
 		return "", "", nil
 	}
@@ -1212,6 +1210,38 @@ func parseCreateTx(sig string) (mint, creator string, createBlockTime *time.Time
 
 	creator = firstSignerFromKeys(r.Transaction.Message.AccountKeys)
 	return mint, creator, createBlockTime
+}
+
+func getTransactionJSONParsedFast(sig string) ([]byte, error) {
+	params := func(commitment string) []interface{} {
+		return []interface{}{
+			sig,
+			map[string]interface{}{
+				"encoding":                       "jsonParsed",
+				"maxSupportedTransactionVersion": 0,
+				"commitment":                     commitment,
+			},
+		}
+	}
+
+	// Быстрый путь для hot-path: сначала processed, чтобы не ждать подтверждение.
+	for attempt := 0; attempt < 3; attempt++ {
+		data, err := rpc("getTransaction", params("processed"))
+		if err == nil {
+			var wrap struct {
+				Result json.RawMessage `json:"result"`
+			}
+			if json.Unmarshal(data, &wrap) == nil && string(wrap.Result) != "null" {
+				return data, nil
+			}
+		}
+		if attempt < 2 {
+			time.Sleep(time.Duration(60*(attempt+1)) * time.Millisecond)
+		}
+	}
+
+	// Fallback для совместимости со старыми/медленными узлами.
+	return rpc("getTransaction", params("confirmed"))
 }
 
 func formatCreateAge(t *time.Time) string {
@@ -2019,7 +2049,7 @@ func listenProgram(programID, prettyLabel string, wantLogs func([]string) bool, 
 			"method": "logsSubscribe",
 			"params": []interface{}{
 				map[string]interface{}{"mentions": []string{programID}},
-				map[string]string{"commitment": "confirmed"},
+				map[string]string{"commitment": "processed"},
 			},
 		})
 
@@ -3222,14 +3252,7 @@ func launchLabInitFromLogs(logs []string) bool {
 }
 
 func parseLaunchLabCreateTx(sig string) (mint, creator string, createBlockTime *time.Time) {
-	data, err := rpc("getTransaction", []interface{}{
-		sig,
-		map[string]interface{}{
-			"encoding":                       "jsonParsed",
-			"maxSupportedTransactionVersion": 0,
-			"commitment":                     "confirmed",
-		},
-	})
+	data, err := getTransactionJSONParsedFast(sig)
 	if err != nil {
 		return "", "", nil
 	}
@@ -3265,3 +3288,4 @@ func parseLaunchLabCreateTx(sig string) (mint, creator string, createBlockTime *
 	creator = firstSignerFromKeys(r.Transaction.Message.AccountKeys)
 	return mint, creator, createBlockTime
 }
+

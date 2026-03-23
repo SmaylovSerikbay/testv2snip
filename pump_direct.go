@@ -157,6 +157,10 @@ func getRecentBlockhashCached() (solana.Hash, bool) {
 	return recentBlockhashCache.blockhash, true
 }
 
+func getCachedBlockhash() (solana.Hash, bool) {
+	return getRecentBlockhashCached()
+}
+
 func prewarmJitoConnection() {
 	url := strings.TrimSpace(os.Getenv("JITO_BLOCK_ENGINE_URL"))
 	if url == "" {
@@ -949,7 +953,7 @@ func swapPumpFun(ctx context.Context, rpcClient *solanarpc.Client, wallet solana
 	}
 
 	bhStart := time.Now()
-	cachedBH, ok := getRecentBlockhashCached()
+	cachedBH, ok := getCachedBlockhash()
 	blockhashMs := time.Since(bhStart).Milliseconds()
 	if !ok {
 		return solana.Signature{}, 0, 0, time.Time{}, fmt.Errorf("blockhash cache cold")
@@ -1155,7 +1159,7 @@ func swapPumpFunSellAmount(ctx context.Context, rpcClient *solanarpc.Client, wal
 		return solana.Signature{}, 0, err
 	}
 
-	cachedBH, ok := getRecentBlockhashCached()
+	cachedBH, ok := getCachedBlockhash()
 	if !ok {
 		return solana.Signature{}, 0, fmt.Errorf("blockhash cache cold")
 	}

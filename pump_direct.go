@@ -288,6 +288,19 @@ func refreshDynamicPriorityFeeFromRPC() {
 
 func sendPumpTransaction(ctx context.Context, rpcClient *solanarpc.Client, tx *solana.Transaction) (solana.Signature, time.Time, error) {
 	if j := strings.TrimSpace(os.Getenv("JITO_BLOCK_ENGINE_URL")); j != "" {
+		fireAndForget := strings.TrimSpace(strings.ToLower(os.Getenv("JITO_FIRE_AND_FORGET"))) != "0"
+		if fireAndForget {
+			txSig := solana.Signature{}
+			if len(tx.Signatures) > 0 {
+				txSig = tx.Signatures[0]
+			}
+			go func(url string, txCopy *solana.Transaction) {
+				bgCtx, cancel := context.WithTimeout(context.Background(), 250*time.Millisecond)
+				defer cancel()
+				_, _, _ = sendJitoBundle(bgCtx, url, txCopy)
+			}(j, tx)
+			return txSig, time.Now(), nil
+		}
 		jitoCtx, cancel := context.WithTimeout(ctx, 200*time.Millisecond)
 		sig, sentAt, err := sendJitoBundle(jitoCtx, j, tx)
 		cancel()

@@ -69,6 +69,8 @@ const (
 	SNIPER_CURVE_MIN = 0.002 // 0.2%
 	SNIPER_CURVE_MAX = 0.15  // 15%
 	MIN_REAL_SOL     = 1.00  // минимум 1.0 SOL в кривой (ранние импульсы)
+	FAST_HEAVY_CHECK_CURVE_MAX = 0.05 // тяжёлые RPC-фильтры только до 5% кривой
+	CREATOR_BALANCE_CACHE_TTL  = 5 * time.Minute
 
 	// Анти-скам
 	CREATOR_SOL_MIN     = 0.04 // не слишком режем поток, но отсеиваем совсем пустых
@@ -746,6 +748,16 @@ func rpc(method string, params []interface{}) ([]byte, error) {
 		return raw, nil
 	}
 	return nil, fmt.Errorf("rpc failed after retries")
+}
+
+func isRateLimitErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	s := strings.ToLower(err.Error())
+	return strings.Contains(s, "429") ||
+		strings.Contains(s, "-32429") ||
+		strings.Contains(s, "rate limit")
 }
 
 // ════════════════════════════════════════════════════
@@ -1577,7 +1589,7 @@ func antiScamCheck(mint, mintAuthorityRef, liquidityVault, creator string, creat
 	if creator == "" {
 		return false, "нет pubkey создателя"
 	}
-	sol, err := rpcGetBalanceSOL(creator)
+	sol, err := rpcGetBalanceSOLCached(creator, CREATOR_BALANCE_CACHE_TTL)
 	if err != nil {
 		return false, "balance RPC"
 	}
@@ -1871,6 +1883,10 @@ func (w *Wallet) openLive(tok NewToken, sym string, spot float64, capitalUSD flo
 	var sentAt time.Time
 	fmt.Println(gray("⏳ Pump.fun: прямая покупка на кривой…"))
 	tokenRaw, sig, solIn, sentAt, err = PumpDirectBuy(tok.Mint, lamports)
+	if err != nil && isRateLimitErr(err) {
+		time.Sleep(1 * time.Second)
+		tokenRaw, sig, solIn, sentAt, err = PumpDirectBuy(tok.Mint, lamports)
+	}
 	if err != nil {
 		consoleMu.Lock()
 		fmt.Printf("%s %v\n", red("❌ Pump buy:"), err)
@@ -2403,6 +2419,11 @@ func main() {
 	if liveTradingEnabled() {
 		fmt.Printf("%s LIVE кошелёк %s | %s\n", green("✓"), cyan(short(livePub.String())),
 			yellow("Только mint …pump на кривой; LaunchLab в live не торгуется."))
+		if strings.TrimSpace(os.Getenv("JITO_BLOCK_ENGINE_URL")) != "" {
+			fmt.Println(green("✓ Jito bundles: ВКЛ (sendBundle)"))
+		} else {
+			fmt.Println(yellow("⚠ Jito bundles: ВЫКЛ (идет обычный RPC sendTransaction)"))
+		}
 	}
 	if envSkipVelocity() {
 		fmt.Println(yellow("⚠ SKIP_VELOCITY=1 — нет 2.6с паузы и второго замера; больше входов, больше шума."))
@@ -2569,6 +2590,11 @@ func main() {
 				}
 
 				atomic.AddInt64(&funnelPassVel, 1)
+				if src == "pump" && snap1.Progress > FAST_HEAVY_CHECK_CURVE_MAX {
+					logRejectLine("late", sym, mint, fmt.Sprintf("fast-gate: curve %.1f%% > %.1f%% до тяжёлых RPC-проверок",
+						snap1.Progress*100, FAST_HEAVY_CHECK_CURVE_MAX*100))
+					return
+				}
 				liqVault := bc
 				if src == "launchlab" {
 					vault, err := launchLabBaseVault(bc, mint)

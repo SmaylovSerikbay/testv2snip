@@ -63,17 +63,19 @@ const (
 	// Recovery Mode ($3.9): узкое окно + ликвидность, чтобы не брать «пустые» мёртвые пулы.
 	SNIPER_CURVE_MIN = 0.002 // 0.2%
 	SNIPER_CURVE_MAX = 0.15  // 15%
-	MIN_REAL_SOL     = 3.0   // минимум 3 SOL в кривой
+	MIN_REAL_SOL     = 1.20  // минимум 1.2 SOL в кривой (чуть больше входов)
 
 	// Анти-скам
 	CREATOR_SOL_MIN     = 0.04 // не слишком режем поток, но отсеиваем совсем пустых
 	CREATOR_SOL_SUSPECT = 80.0
 	MAX_NONCURVE_PCT    = 0.12
 
-	// Выходы Recovery: SL -20%; трейлинг с +50%; на +200% — полный выход.
-	STOP_LOSS        = 0.80
+	// Выходы Recovery: hard SL -25%; подтверждение краша ниже -20% два тика подряд.
+	STOP_LOSS_HARD   = 0.75 // -25%
+	STOP_CONFIRM_LVL = 0.80 // -20% (уровень подтверждения)
+	STOP_CONFIRM_N   = 2
 	TAKE_PROFIT      = 3.0 // +200%
-	TRAIL_ACTIVATE   = 1.50
+	TRAIL_ACTIVATE   = 1.40 // трейлинг стартует после +40%
 	TRAILING         = 0.16
 	TRAIL_MIN_AGE    = 10 * time.Second
 	TRAIL_MIN_PROFIT = 1.10
@@ -86,9 +88,10 @@ const (
 	// Если create-транзакция старше — не считаем «только что залистились» (защита от кривых сигналов)
 	MAX_CREATE_TX_AGE = 30 * time.Minute
 
-	VELOCITY_PAUSE         = 800 * time.Millisecond // микро-velocity
+	VELOCITY_PAUSE         = 500 * time.Millisecond // микро-velocity: быстрее вход
 	VELOCITY_MIN_DPROGRESS = 0.0
 	VELOCITY_MIN_DREALSOL  = 0.0
+	VELOCITY_MIN_DELTA_DP  = -0.0001 // -0.01% (разрешаем микро-откат на замере)
 	LIVE_FIXED_BUY_SOL     = 0.022 // fixed buy for recovery mode
 
 	// Логи: false = не печатать каждый отсев (только сводка раз в минуту + успешный ВХОД)
@@ -743,9 +746,9 @@ func curveVelocityOK(bc string, snap0 *curveSnap, source string, createAt *time.
 	}
 	dP := s1.Progress - snap0.Progress
 	dSol := s1.RealSolSOL - snap0.RealSolSOL
-	// Recovery logic: за 800ms динамика должна быть строго вверх.
-	if dP <= 0 {
-		return s1, false, fmt.Sprintf("micro-velocity вниз/флэт (Δ%.3f%% за %v)", dP*100, pause), "vel_low"
+	// Recovery logic: допускаем небольшой отрицательный шум до -0.01%.
+	if dP < VELOCITY_MIN_DELTA_DP {
+		return s1, false, fmt.Sprintf("micro-velocity ниже порога (Δ%.3f%% < %.3f%% за %v)", dP*100, VELOCITY_MIN_DELTA_DP*100, pause), "vel_low"
 	}
 	if dP < minDP && dSol < minDSol {
 		return s1, false, fmt.Sprintf("мало притока (Δ%.2f%% / +%.3f SOL за %v; проф=%s, need≈Δ%.2f%% или +%.3f SOL)",
@@ -1914,6 +1917,7 @@ func monitor(w *Wallet, mint, bcAddr, sym, source string) {
 	fmt.Printf("  %s %s\n", gray("DEX"), cyan(dexScreenerURL(mint)))
 
 	consecutiveFails := 0
+	confirmedStopTicks := 0
 	var lastMult float64
 	var lastPrint time.Time
 	const monitorPrintMinMove = 0.0025 // ~0.25% к цене входа — новая строка
@@ -2037,8 +2041,19 @@ func monitor(w *Wallet, mint, bcAddr, sym, source string) {
 				w.closePos(mint, "НЕТ ИМПУЛЬСА", price)
 				return
 			}
-			if price <= entry*STOP_LOSS {
-				w.closePos(mint, "СТОП -12%", price)
+			if price <= entry*STOP_CONFIRM_LVL {
+				confirmedStopTicks++
+			} else {
+				confirmedStopTicks = 0
+			}
+			// "Fake stop-out" защита: требуется 2 подряд тика ниже -20%,
+			// либо мгновенный hard-stop при -25%.
+			if price <= entry*STOP_LOSS_HARD || confirmedStopTicks >= STOP_CONFIRM_N {
+				if price <= entry*STOP_LOSS_HARD {
+					w.closePos(mint, "СТОП -25% (hard)", price)
+				} else {
+					w.closePos(mint, "СТОП подтверждён (-20% x2)", price)
+				}
 				return
 			}
 		}

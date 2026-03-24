@@ -266,6 +266,15 @@ func useJitoEnabled() bool {
 	return strings.TrimSpace(os.Getenv("JITO_BLOCK_ENGINE_URL")) != ""
 }
 
+func pumpBuySignDelay() time.Duration {
+	if s := strings.TrimSpace(os.Getenv("PUMP_BUY_SIGN_DELAY_MS")); s != "" {
+		if v, err := strconv.Atoi(s); err == nil && v >= 0 && v <= 500 {
+			return time.Duration(v) * time.Millisecond
+		}
+	}
+	return 0
+}
+
 func applySlippagePump(amount uint64, slippageBps uint64) uint64 {
 	if amount == 0 || slippageBps >= 10_000 {
 		return 0
@@ -1099,6 +1108,9 @@ func swapPumpFun(ctx context.Context, rpcClient *solanarpc.Client, wallet solana
 	tx, err := solana.NewTransaction(all, cachedBH, solana.TransactionPayer(owner))
 	if err != nil {
 		return solana.Signature{}, 0, 0, time.Time{}, err
+	}
+	if d := pumpBuySignDelay(); d > 0 {
+		time.Sleep(d)
 	}
 	signStart := time.Now()
 	err = signTransactionAsync(tx, owner, wallet)

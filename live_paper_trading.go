@@ -111,8 +111,8 @@ const (
 	SOLANA_TX_LAMPORTS = 12_000.0
 
 	PRICE_TICK         = 1500 * time.Millisecond // 1.5s — чаще ловим памп
-	MAX_HOLD           = 30 * time.Second        // 30 сек — не ждём 3 мин, если монета мёртвая
-	FAST_EXIT_AFTER    = 120 * time.Second       // если за 120с нет роста — выходим
+	MAX_HOLD           = 300 * time.Second       // 5 минут — даём токену «подышать»
+	FAST_EXIT_AFTER    = 300 * time.Second       // если за 300с нет роста — выходим
 	FAST_EXIT_MIN_MULT = 1.00                    // 0% (без плюса)
 	// Сервисные интервалы/лимиты RPC для защиты от -32429.
 	BALANCE_CHECK_INTERVAL = 30 * time.Second
@@ -135,16 +135,16 @@ const (
 	DEV_MAX_TXS_HOUR      = 7    // dev >7 tx/час — serial rugger (создаёт 4+ токенов)
 
 	// Выходы Final Recovery: hard SL -30%; TP только от +150%.
-	STOP_LOSS_HARD      = 0.90 // -10%
-	STOP_CONFIRM_LVL    = 0.90 // -10%
+	STOP_LOSS_HARD      = 0.70 // -30%
+	STOP_CONFIRM_LVL    = 0.70 // -30%
 	STOP_CONFIRM_N      = 1
 	SELL_SLIPPAGE_GUARD = 0.10            // >10% ожидаемого slip на выходе — подождать следующий тик
-	TAKE_PROFIT         = 1.50            // +50% — фиксируем весь объём
-	TRAIL_ACTIVATE      = 1.15            // трейлинг после +15% (было +40%)
+	TAKE_PROFIT         = 1.75            // +75% — фиксируем весь объём
+	TRAIL_ACTIVATE      = 1.30            // трейлинг после +30%
 	TRAILING            = 0.12            // откат 12% от пика (было 16%)
 	TRAIL_MIN_AGE       = 5 * time.Second // был 10s — трейл раньше
 	TRAIL_MIN_PROFIT    = 1.05            // пол +5% (было +10%)
-	BREAKEVEN_ARM       = 1.10
+	BREAKEVEN_ARM       = 1.30            // после +30% ставим стоп в ноль
 	SCRATCH_AFTER       = 2 * time.Minute // не зависаем в флэте слишком долго
 	SCRATCH_IF_BELOW    = 0.97            // скретч только если совсем плоско
 	NO_IMPULSE_AFTER    = 4 * time.Minute // «нет импульса» — после умеренной консолидации
@@ -1013,6 +1013,23 @@ func noPriceProfitLockMinMult() float64 {
 		return 1.004 // +0.4% достаточно, чтобы не отдавать уже пойманный микро-плюс
 	}
 	return 1.01
+}
+
+func ultraDevFilterEnabled() bool {
+	s := strings.TrimSpace(strings.ToLower(os.Getenv("ULTRA_DEV_FILTER")))
+	if s == "0" || s == "false" || s == "no" {
+		return false
+	}
+	return ultraFastEntryMode()
+}
+
+func ultraDevMinSOL() float64 {
+	if s := strings.TrimSpace(os.Getenv("ULTRA_DEV_MIN_SOL")); s != "" {
+		if v, err := strconv.ParseFloat(s, 64); err == nil && v >= 0 {
+			return v
+		}
+	}
+	return 0.000001
 }
 
 func monitorTickInterval() time.Duration {
@@ -3046,6 +3063,17 @@ func monitor(w *Wallet, mint, bcAddr, sym, source string) {
 			}
 
 			age := time.Since(opened)
+			// Dynamic exit: после +15% фиксируем минимум +5%; также выходим при просадке 15% от пика.
+			if peak >= entry*1.15 {
+				if price <= entry*1.05 {
+					w.closePos(mint, "PROFIT LOCK (после +15% не отдаём ниже +5%)", price)
+					return
+				}
+				if price <= peak*0.85 {
+					w.closePos(mint, fmt.Sprintf("DRAWDOWN EXIT (-15%% от пика x%.2f)", peak/entry), price)
+					return
+				}
+			}
 			if quickWindow > 0 && livePos && age <= quickWindow {
 				if mult >= quickTP {
 					w.closePos(mint, fmt.Sprintf("QUICK PUMP ТЕЙК ~+%.0f%% (%.1fs)", (quickTP-1)*100, quickWindow.Seconds()), price)
@@ -3361,6 +3389,26 @@ func main() {
 					consoleMu.Unlock()
 				}
 				if src == "pump" && ultraFastEntryMode() {
+					if ultraDevFilterEnabled() {
+						if creator == "" {
+							logRejectLine("scam", sym, mint, "ultra-dev-filter: creator missing")
+							if !tok.DetectedAt.IsZero() {
+								total := time.Since(tok.DetectedAt).Milliseconds()
+								printHotPathTrace(sym, src, "reject:ultra_dev", "creator missing", parseDone.Sub(traceStart).Milliseconds(), 0, 0, total)
+							}
+							return
+						}
+						if sol, err := rpcGetBalanceSOLCached(creator, CREATOR_BALANCE_CACHE_TTL); err == nil {
+							if sol <= ultraDevMinSOL() {
+								logRejectLine("scam", sym, mint, fmt.Sprintf("ultra-dev-filter: creator SOL %.6f <= %.6f", sol, ultraDevMinSOL()))
+								if !tok.DetectedAt.IsZero() {
+									total := time.Since(tok.DetectedAt).Milliseconds()
+									printHotPathTrace(sym, src, "reject:ultra_dev", "creator balance too low", parseDone.Sub(traceStart).Milliseconds(), 0, 0, total)
+								}
+								return
+							}
+						}
+					}
 					atomic.AddInt64(&funnelInWindow, 1)
 					atomic.AddInt64(&funnelPassVel, 1)
 					atomic.AddInt64(&funnelPassScam, 1)

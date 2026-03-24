@@ -1540,7 +1540,7 @@ func swapPumpFunSellAll(ctx context.Context, rpcClient *solanarpc.Client, wallet
 		return solana.Signature{}, 0, err
 	}
 	if raw == 0 {
-		return solana.Signature{}, 0, fmt.Errorf("zero token balance")
+		return solana.Signature{}, 0, nil
 	}
 	return swapPumpFunSellWithFallback(ctx, rpcClient, wallet, mint, raw, slipBps)
 }
@@ -1553,6 +1553,21 @@ func isPumpOverflow6024(err error) bool {
 	return strings.Contains(s, "custom program error: 0x1788") ||
 		strings.Contains(s, "Error Number: 6024") ||
 		strings.Contains(s, "Overflow")
+}
+
+func isPumpTooLittleSol6003(err error) bool {
+	if err == nil {
+		return false
+	}
+	s := err.Error()
+	return strings.Contains(s, "custom program error: 0x1773") ||
+		strings.Contains(s, "Error Number: 6003") ||
+		strings.Contains(strings.ToLower(s), "toolittlesolreceived") ||
+		strings.Contains(strings.ToLower(s), "too little sol received")
+}
+
+func isPumpRetriableSellErr(err error) bool {
+	return isPumpOverflow6024(err) || isPumpTooLittleSol6003(err)
 }
 
 func isIncorrectProgramIDErr(err error) bool {
@@ -1646,7 +1661,7 @@ func swapPumpFunSellWithFallback(
 			return sig, gross, nil
 		}
 		lastErr = err
-		if !isPumpOverflow6024(err) {
+		if !isPumpRetriableSellErr(err) {
 			return solana.Signature{}, 0, err
 		}
 	}
@@ -1671,7 +1686,7 @@ func swapPumpFunSellWithFallback(
 			return sig, gross, nil
 		}
 		lastErr = err
-		if !isPumpOverflow6024(err) {
+		if !isPumpRetriableSellErr(err) {
 			return solana.Signature{}, 0, err
 		}
 	}
@@ -1770,7 +1785,7 @@ func PumpDirectSellFraction(mintStr string, fraction float64) (sig string, soldR
 		return "", 0, 0, err
 	}
 	if raw == 0 {
-		return "", 0, 0, fmt.Errorf("zero token balance")
+		return "", 0, 0, nil
 	}
 	if fraction <= 0 || fraction > 1 {
 		return "", 0, 0, fmt.Errorf("fraction out of range")

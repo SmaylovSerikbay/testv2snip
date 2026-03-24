@@ -1,4 +1,4 @@
-// Прямые сделки Pump.fun (buy_exact_sol_in / sell) без Jupiter — как в apexsnip/pump_live.go.
+// РџСЂСЏРјС‹Рµ СЃРґРµР»РєРё Pump.fun (buy_exact_sol_in / sell) Р±РµР· Jupiter вЂ” РєР°Рє РІ apexsnip/pump_live.go.
 package main
 
 import (
@@ -24,10 +24,10 @@ import (
 	"github.com/mr-tron/base58"
 )
 
-// Jito tip account (один из восьми — можно выбрать любой)
+// Jito tip account (РѕРґРёРЅ РёР· РІРѕСЃСЊРјРё вЂ” РјРѕР¶РЅРѕ РІС‹Р±СЂР°С‚СЊ Р»СЋР±РѕР№)
 const jitoTipAccount = "96gYZGLnJYVFmbjzopPSU6QiEV5fGqZNyN9nmNhvrZU5"
 
-// Программа комиссий Pump (IDL).
+// РџСЂРѕРіСЂР°РјРјР° РєРѕРјРёСЃСЃРёР№ Pump (IDL).
 var pumpFeeProgramPK = solana.MustPublicKeyFromBase58("pfeeUxB6jkeY1Hxd7CsFCAjcbHA9rWtchMGdZ6VojVZ")
 
 var pumpFeeConfigSeed32 = []byte{
@@ -57,10 +57,11 @@ const (
 var (
 	pumpBuySlippageBps       uint64 = 2000    // buy 20%
 	pumpSellSlippageBps      uint64 = 2000    // sell 20%
-	pumpPriorityFeeLamports  uint64 = 200_000 // 0.0002 SOL (выживание малого банка)
-	jitoMinTipLamports       uint64 = 500_000 // 0.0005 SOL — "входной билет" для включения бандла в блок
-	pumpPriorityMaxFeeBps    uint64 = 100     // максимум приоритета как доля от размера сделки (1.0%)
-	pumpSellRetryPriorityFee uint64 = 8_000_000
+	pumpPriorityFeeLamports  uint64 = 200_000 // 0.0002 SOL
+	pumpPriorityFeeHardCap   uint64 = 800_000 // 0.0008 SOL: hard cap for small bankroll
+	jitoMinTipLamports       uint64 = 500_000 // 0.0005 SOL вЂ” "РІС…РѕРґРЅРѕР№ Р±РёР»РµС‚" РґР»СЏ РІРєР»СЋС‡РµРЅРёСЏ Р±Р°РЅРґР»Р° РІ Р±Р»РѕРє
+	pumpPriorityMaxFeeBps    uint64 = 100     // РјР°РєСЃРёРјСѓРј РїСЂРёРѕСЂРёС‚РµС‚Р° РєР°Рє РґРѕР»СЏ РѕС‚ СЂР°Р·РјРµСЂР° СЃРґРµР»РєРё (1.0%)
+	pumpSellRetryPriorityFee uint64 = 800_000
 	pumpDirectRPC            *solanarpc.Client
 	pumpDirectRPCOnce        sync.Once
 	priorityFeeCache         struct {
@@ -126,9 +127,19 @@ func initPumpDirectFromEnv() {
 			pumpPriorityFeeLamports = v
 		}
 	}
+	if s := strings.TrimSpace(os.Getenv("PUMP_PRIORITY_FEE_HARD_CAP_LAMPORTS")); s != "" {
+		if v, err := strconv.ParseUint(s, 10, 64); err == nil && v >= 100_000 {
+			pumpPriorityFeeHardCap = v
+		}
+	}
 	if s := strings.TrimSpace(os.Getenv("PUMP_PRIORITY_MAX_FEE_BPS")); s != "" {
 		if v, err := strconv.ParseUint(s, 10, 64); err == nil && v <= 2_000 {
 			pumpPriorityMaxFeeBps = v
+		}
+	}
+	if s := strings.TrimSpace(os.Getenv("PUMP_SELL_RETRY_PRIORITY_LAMPORTS")); s != "" {
+		if v, err := strconv.ParseUint(s, 10, 64); err == nil && v >= 100_000 {
+			pumpSellRetryPriorityFee = v
 		}
 	}
 	if s := strings.TrimSpace(os.Getenv("JITO_MIN_TIP_LAMPORTS")); s != "" {
@@ -219,7 +230,7 @@ func getLastBuyLatency() buyLatencyBreakdown {
 	return lastBuyLatency.v
 }
 
-// fastHotBuyMode: в горячем входе не делаем лишние pre-check RPC перед отправкой.
+// fastHotBuyMode: РІ РіРѕСЂСЏС‡РµРј РІС…РѕРґРµ РЅРµ РґРµР»Р°РµРј Р»РёС€РЅРёРµ pre-check RPC РїРµСЂРµРґ РѕС‚РїСЂР°РІРєРѕР№.
 func fastHotBuyMode() bool {
 	s := strings.TrimSpace(strings.ToLower(os.Getenv("HOT_PATH_FAST_BUY")))
 	if s == "0" || s == "false" || s == "no" {
@@ -247,7 +258,7 @@ func disableMintInfoFastPath(reason string) {
 	mintInfoFastPathState.mu.Lock()
 	mintInfoFastPathState.disabledTill = now.Add(mintInfoFastPathCooldown)
 	mintInfoFastPathState.mu.Unlock()
-	fmt.Printf("⚠ fast buy path cooldown %s: %s\n", mintInfoFastPathCooldown.String(), reason)
+	fmt.Printf("вљ  fast buy path cooldown %s: %s\n", mintInfoFastPathCooldown.String(), reason)
 }
 
 func preferJitoBundleFirst() bool {
@@ -313,6 +324,9 @@ func choosePriorityFeeLamports(baseTradeLamports uint64) uint64 {
 	if useJitoEnabled() && fee < jitoMinTipLamports {
 		fee = jitoMinTipLamports
 	}
+	if pumpPriorityFeeHardCap > 0 && fee > pumpPriorityFeeHardCap {
+		fee = pumpPriorityFeeHardCap
+	}
 	return fee
 }
 
@@ -328,8 +342,8 @@ func cachedDynamicPriorityFeeLamports() (uint64, bool) {
 	return priorityFeeCache.lamports, true
 }
 
-// refreshDynamicPriorityFeeFromRPC обновляет кэш фи в фоне.
-// В buy-пути эта функция не вызывается, чтобы не добавлять latency от retry/backoff.
+// refreshDynamicPriorityFeeFromRPC РѕР±РЅРѕРІР»СЏРµС‚ РєСЌС€ С„Рё РІ С„РѕРЅРµ.
+// Р’ buy-РїСѓС‚Рё СЌС‚Р° С„СѓРЅРєС†РёСЏ РЅРµ РІС‹Р·С‹РІР°РµС‚СЃСЏ, С‡С‚РѕР±С‹ РЅРµ РґРѕР±Р°РІР»СЏС‚СЊ latency РѕС‚ retry/backoff.
 func refreshDynamicPriorityFeeFromRPC() {
 	raw, err := rpc("getRecentPrioritizationFees", []interface{}{[]string{}})
 	if err != nil {
@@ -353,7 +367,7 @@ func refreshDynamicPriorityFeeFromRPC() {
 		return
 	}
 	sort.Slice(fees, func(i, j int) bool { return fees[i] < fees[j] })
-	// Берём верхний квартиль microLamports/CU как рабочий компромисс скорости/комиссии.
+	// Р‘РµСЂС‘Рј РІРµСЂС…РЅРёР№ РєРІР°СЂС‚РёР»СЊ microLamports/CU РєР°Рє СЂР°Р±РѕС‡РёР№ РєРѕРјРїСЂРѕРјРёСЃСЃ СЃРєРѕСЂРѕСЃС‚Рё/РєРѕРјРёСЃСЃРёРё.
 	microPerCU := fees[(len(fees)*3)/4]
 	lamports := microPerCU * uint64(pumpComputeUnitLimit) / 1_000_000
 	if lamports == 0 {
@@ -365,7 +379,7 @@ func refreshDynamicPriorityFeeFromRPC() {
 	priorityFeeCache.mu.Unlock()
 }
 
-const jitoMinInterval = 2 * time.Second // не чаще 1 раз в 2 сек — иначе 429 Too Many Requests
+const jitoMinInterval = 2 * time.Second // РЅРµ С‡Р°С‰Рµ 1 СЂР°Р· РІ 2 СЃРµРє вЂ” РёРЅР°С‡Рµ 429 Too Many Requests
 
 func jitoRateLimitedNow() bool {
 	jitoRateLimitState.mu.Lock()
@@ -382,7 +396,7 @@ func markJitoRateLimited(reason string) {
 	jitoRateLimitState.lastReason = reason
 	jitoRateLimitState.mu.Unlock()
 	if shouldLog {
-		fmt.Printf("⚠ Jito cooldown %ds: %s; fallback на RPC\n", int(jitoRateLimitCooldown.Seconds()), reason)
+		fmt.Printf("вљ  Jito cooldown %ds: %s; fallback РЅР° RPC\n", int(jitoRateLimitCooldown.Seconds()), reason)
 	}
 }
 
@@ -435,7 +449,7 @@ func sendPumpTransaction(ctx context.Context, rpcClient *solanarpc.Client, tx *s
 	}
 
 	if useJitoInRace {
-		// Race: Jito и RPC одновременно — первый успех побеждает (~50ms вместо 300ms+)
+		// Race: Jito Рё RPC РѕРґРЅРѕРІСЂРµРјРµРЅРЅРѕ вЂ” РїРµСЂРІС‹Р№ СѓСЃРїРµС… РїРѕР±РµР¶РґР°РµС‚ (~50ms РІРјРµСЃС‚Рѕ 300ms+)
 		type result struct {
 			ok  bool
 			err error
@@ -480,10 +494,10 @@ func sendPumpTransaction(ctx context.Context, rpcClient *solanarpc.Client, tx *s
 			}
 			if jitoDone && rpcDone {
 				if jitoRes.err != nil && !strings.Contains(jitoRes.err.Error(), "429") {
-					fmt.Printf("⚠ Jito: %v\n", jitoRes.err)
+					fmt.Printf("вљ  Jito: %v\n", jitoRes.err)
 				}
 				if rpcRes.err != nil && jitoRes.err != nil {
-					// Последняя попытка: отправка без preflight, чтобы не терять вход из-за перегруза.
+					// РџРѕСЃР»РµРґРЅСЏСЏ РїРѕРїС‹С‚РєР°: РѕС‚РїСЂР°РІРєР° Р±РµР· preflight, С‡С‚РѕР±С‹ РЅРµ С‚РµСЂСЏС‚СЊ РІС…РѕРґ РёР·-Р·Р° РїРµСЂРµРіСЂСѓР·Р°.
 					rpcCtx, cancel := context.WithTimeout(ctx, 6*time.Second)
 					defer cancel()
 					if sig, err := rpcClient.SendTransactionWithOpts(rpcCtx, tx, solanarpc.TransactionOpts{
@@ -500,7 +514,7 @@ func sendPumpTransaction(ctx context.Context, rpcClient *solanarpc.Client, tx *s
 		}
 	}
 
-	// Только RPC (Jito выкл или rate limited)
+	// РўРѕР»СЊРєРѕ RPC (Jito РІС‹РєР» РёР»Рё rate limited)
 	sig, err := rpcClient.SendTransactionWithOpts(ctx, tx, solanarpc.TransactionOpts{
 		SkipPreflight: false, PreflightCommitment: solanarpc.CommitmentProcessed,
 	})
@@ -515,7 +529,7 @@ func sendJitoBundle(ctx context.Context, blockEngineURL string, tx *solana.Trans
 	if err != nil {
 		return solana.Signature{}, time.Time{}, fmt.Errorf("marshal tx: %w", err)
 	}
-	// Jito block-engine ожидает base58; base64 даёт "transaction #0 could not be decoded"
+	// Jito block-engine РѕР¶РёРґР°РµС‚ base58; base64 РґР°С‘С‚ "transaction #0 could not be decoded"
 	encodedTx := base58.Encode(rawTx)
 	payload := map[string]interface{}{
 		"jsonrpc": "2.0",
@@ -547,9 +561,9 @@ func sendJitoBundle(ctx context.Context, blockEngineURL string, tx *solana.Trans
 			markJitoRateLimited("429/rate limited")
 		}
 		if bodyStr != "" {
-			fmt.Printf("❌ Jito API error | status=%s | body=%s\n", resp.Status, bodyStr)
+			fmt.Printf("вќЊ Jito API error | status=%s | body=%s\n", resp.Status, bodyStr)
 		} else {
-			fmt.Printf("❌ Jito API error | status=%s\n", resp.Status)
+			fmt.Printf("вќЊ Jito API error | status=%s\n", resp.Status)
 		}
 		return solana.Signature{}, time.Time{}, fmt.Errorf("jito status: %s", resp.Status)
 	}
@@ -582,7 +596,7 @@ func nativeBalanceLamports(ctx context.Context, rpcClient *solanarpc.Client, own
 	return b.Value, nil
 }
 
-// waitNativeBalanceDelta — пытается поймать изменение SOL после отправки tx.
+// waitNativeBalanceDelta вЂ” РїС‹С‚Р°РµС‚СЃСЏ РїРѕР№РјР°С‚СЊ РёР·РјРµРЅРµРЅРёРµ SOL РїРѕСЃР»Рµ РѕС‚РїСЂР°РІРєРё tx.
 func waitNativeBalanceDelta(ctx context.Context, rpcClient *solanarpc.Client, owner solana.PublicKey, before uint64, expectIncrease bool) (delta uint64, ok bool) {
 	for i := 0; i < 8; i++ {
 		select {
@@ -765,8 +779,8 @@ func pumpEnvForceMinOutOne() bool {
 	return true
 }
 
-// pumpEnvForceSellMinSolOne — по умолчанию true: min_sol_out=1 при продаже, чтобы не ловить 6024 Overflow
-// (клиентская CPMM ≠ GetFees on-chain). Отключить: PUMP_SELL_MIN_SOL_ONE=false
+// pumpEnvForceSellMinSolOne вЂ” РїРѕ СѓРјРѕР»С‡Р°РЅРёСЋ true: min_sol_out=1 РїСЂРё РїСЂРѕРґР°Р¶Рµ, С‡С‚РѕР±С‹ РЅРµ Р»РѕРІРёС‚СЊ 6024 Overflow
+// (РєР»РёРµРЅС‚СЃРєР°СЏ CPMM в‰  GetFees on-chain). РћС‚РєР»СЋС‡РёС‚СЊ: PUMP_SELL_MIN_SOL_ONE=false
 func pumpEnvForceSellMinSolOne() bool {
 	s := strings.TrimSpace(strings.ToLower(os.Getenv("PUMP_SELL_MIN_SOL_ONE")))
 	if s == "false" || s == "0" || s == "no" {
@@ -844,7 +858,7 @@ func ensurePumpUserATA(preIxs *[]solana.Instruction, owner, mint, tokenProgram s
 	if err != nil {
 		return solana.PublicKey{}, err
 	}
-	// Idempotent ATA create: безопасно добавлять всегда, без RPC pre-check.
+	// Idempotent ATA create: Р±РµР·РѕРїР°СЃРЅРѕ РґРѕР±Р°РІР»СЏС‚СЊ РІСЃРµРіРґР°, Р±РµР· RPC pre-check.
 	ix := solana.NewInstruction(
 		solana.SPLAssociatedTokenAccountProgramID,
 		[]*solana.AccountMeta{
@@ -941,7 +955,7 @@ func swapPumpFun(ctx context.Context, rpcClient *solanarpc.Client, wallet solana
 		errMu.Unlock()
 	}
 	if skipMintInfo {
-		// Максимально быстрый путь: не дёргаем mint account (getAccountInfo) до покупки.
+		// РњР°РєСЃРёРјР°Р»СЊРЅРѕ Р±С‹СЃС‚СЂС‹Р№ РїСѓС‚СЊ: РЅРµ РґС‘СЂРіР°РµРј mint account (getAccountInfo) РґРѕ РїРѕРєСѓРїРєРё.
 		tokenProgram = solana.TokenProgramID
 		mintDecimals = 6
 	} else {
@@ -1136,7 +1150,7 @@ func swapPumpFun(ctx context.Context, rpcClient *solanarpc.Client, wallet solana
 	})
 	actualSpent := spendableBudget
 	if !fastMode {
-		// Фактические лампорты, списанные с кошелька, важнее оценок (учёт комиссий/priority/реального исполнения).
+		// Р¤Р°РєС‚РёС‡РµСЃРєРёРµ Р»Р°РјРїРѕСЂС‚С‹, СЃРїРёСЃР°РЅРЅС‹Рµ СЃ РєРѕС€РµР»СЊРєР°, РІР°Р¶РЅРµРµ РѕС†РµРЅРѕРє (СѓС‡С‘С‚ РєРѕРјРёСЃСЃРёР№/priority/СЂРµР°Р»СЊРЅРѕРіРѕ РёСЃРїРѕР»РЅРµРЅРёСЏ).
 		if measured, ok := waitNativeBalanceDelta(ctx, rpcClient, owner, balBefore, false); ok && measured > 0 {
 			actualSpent = measured
 		}
@@ -1201,7 +1215,7 @@ func swapPumpFunSellAmount(ctx context.Context, rpcClient *solanarpc.Client, wal
 		return solana.Signature{}, 0, err
 	}
 	if complete {
-		return solana.Signature{}, 0, fmt.Errorf("curve complete — используй DEX, не pump sell")
+		return solana.Signature{}, 0, fmt.Errorf("curve complete вЂ” РёСЃРїРѕР»СЊР·СѓР№ DEX, РЅРµ pump sell")
 	}
 
 	grossSol := pumpGrossSolForSell(tokenAmount, vSol, vTok)
@@ -1210,7 +1224,7 @@ func swapPumpFunSellAmount(ctx context.Context, rpcClient *solanarpc.Client, wal
 		minSol = 1
 	}
 	if pumpEnvForceSellMinSolOne() {
-		// Как PUMP_MIN_OUT_ONE на покупке: min_sol_out=1 — иначе часто 6024 Overflow (клиент ≠ GetFees).
+		// РљР°Рє PUMP_MIN_OUT_ONE РЅР° РїРѕРєСѓРїРєРµ: min_sol_out=1 вЂ” РёРЅР°С‡Рµ С‡Р°СЃС‚Рѕ 6024 Overflow (РєР»РёРµРЅС‚ в‰  GetFees).
 		minSol = 1
 	} else {
 		minSol = pumpExtraHaircutMinOut(minSol, pumpMinOutExtraHaircutBps)
@@ -1322,7 +1336,7 @@ func swapPumpFunSellAmount(ctx context.Context, rpcClient *solanarpc.Client, wal
 	if err != nil {
 		return solana.Signature{}, 0, err
 	}
-	// Для PnL берём факт прихода SOL, не теоретический gross.
+	// Р”Р»СЏ PnL Р±РµСЂС‘Рј С„Р°РєС‚ РїСЂРёС…РѕРґР° SOL, РЅРµ С‚РµРѕСЂРµС‚РёС‡РµСЃРєРёР№ gross.
 	actualOut, ok := waitNativeBalanceDelta(ctx, rpcClient, owner, balBefore, true)
 	if ok && actualOut > 0 {
 		return sig, actualOut, nil
@@ -1373,7 +1387,7 @@ func isIncorrectProgramIDErr(err error) bool {
 		strings.Contains(s, "incorrect program id for instruction")
 }
 
-// swapPumpFunSellWithFallback — при 6024 пробует меньший объём, чтобы не застревать в позиции.
+// swapPumpFunSellWithFallback вЂ” РїСЂРё 6024 РїСЂРѕР±СѓРµС‚ РјРµРЅСЊС€РёР№ РѕР±СЉС‘Рј, С‡С‚РѕР±С‹ РЅРµ Р·Р°СЃС‚СЂРµРІР°С‚СЊ РІ РїРѕР·РёС†РёРё.
 func swapPumpFunSellWithFallback(
 	ctx context.Context,
 	rpcClient *solanarpc.Client,
@@ -1408,13 +1422,13 @@ func swapPumpFunSellWithFallback(
 			return solana.Signature{}, 0, err
 		}
 	}
-	// Аварийный повтор: 50% slippage + повышенный priority fee (как requested anti-6024 path).
+	// Аварийный повтор: 50% slippage + умеренный priority fee (без убийства банка комиссиями).
 	prevPriority := pumpPriorityFeeLamports
 	prevCap := pumpPriorityMaxFeeBps
 	if pumpPriorityFeeLamports < pumpSellRetryPriorityFee {
 		pumpPriorityFeeLamports = pumpSellRetryPriorityFee
 	}
-	pumpPriorityMaxFeeBps = 0 // на аварийном проходе не режем fee cap
+	pumpPriorityMaxFeeBps = 300
 	defer func() {
 		pumpPriorityFeeLamports = prevPriority
 		pumpPriorityMaxFeeBps = prevCap
@@ -1439,7 +1453,7 @@ func swapPumpFunSellWithFallback(
 	return solana.Signature{}, 0, fmt.Errorf("sell failed after fallback attempts: %w", lastErr)
 }
 
-// liveUsePumpDirect — в live только чистый Pump.fun (…pump); LaunchLab не через этот путь.
+// liveUsePumpDirect вЂ” РІ live С‚РѕР»СЊРєРѕ С‡РёСЃС‚С‹Р№ Pump.fun (вЂ¦pump); LaunchLab РЅРµ С‡РµСЂРµР· СЌС‚РѕС‚ РїСѓС‚СЊ.
 func liveUsePumpDirect(tok NewToken) bool {
 	if strings.TrimSpace(tok.Source) == "launchlab" {
 		return false
@@ -1460,7 +1474,7 @@ func liveUsePumpDirectClose(pos *Position) bool {
 	return strings.HasSuffix(strings.TrimSpace(pos.Mint), "pump")
 }
 
-// PumpDirectBuy — покупка на bonding curve; tokenRaw — ожидаемые атомы по котировке; solIn — lamports в инструкции.
+// PumpDirectBuy вЂ” РїРѕРєСѓРїРєР° РЅР° bonding curve; tokenRaw вЂ” РѕР¶РёРґР°РµРјС‹Рµ Р°С‚РѕРјС‹ РїРѕ РєРѕС‚РёСЂРѕРІРєРµ; solIn вЂ” lamports РІ РёРЅСЃС‚СЂСѓРєС†РёРё.
 func PumpDirectBuy(mintStr string, spendLamports uint64) (tokenRaw uint64, sig string, solIn uint64, sentAt time.Time, err error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
 	defer cancel()
@@ -1470,10 +1484,10 @@ func PumpDirectBuy(mintStr string, spendLamports uint64) (tokenRaw uint64, sig s
 	}
 	s, expectedOut, spendBudget, sentAt, err := swapPumpFun(ctx, rpcPumpDirect(), livePrivKey, mint, spendLamports, false)
 	if err != nil && isIncorrectProgramIDErr(err) && skipMintInfoInFastBuy() {
-		// Fast-path мог промахнуться с token program (Tokenkeg vs Token-2022).
-		// Повторяем с обязательным чтением mint account.
+		// Fast-path РјРѕРі РїСЂРѕРјР°С…РЅСѓС‚СЊСЃСЏ СЃ token program (Tokenkeg vs Token-2022).
+		// РџРѕРІС‚РѕСЂСЏРµРј СЃ РѕР±СЏР·Р°С‚РµР»СЊРЅС‹Рј С‡С‚РµРЅРёРµРј mint account.
 		disableMintInfoFastPath("incorrect program id on ATA/mint path")
-		fmt.Printf("⚠ buy fallback %s: retry with mint info (token program)\n", mintStr[:8]+"..")
+		fmt.Printf("вљ  buy fallback %s: retry with mint info (token program)\n", mintStr[:8]+"..")
 		s, expectedOut, spendBudget, sentAt, err = swapPumpFun(ctx, rpcPumpDirect(), livePrivKey, mint, spendLamports, true)
 	}
 	if err != nil {
@@ -1482,7 +1496,7 @@ func PumpDirectBuy(mintStr string, spendLamports uint64) (tokenRaw uint64, sig s
 	return expectedOut, s.String(), spendBudget, sentAt, nil
 }
 
-// PumpDirectSellAll — продажа всего баланса токена; solOutLamports — грубая оценка выхода SOL (до slippage в min_out).
+// PumpDirectSellAll вЂ” РїСЂРѕРґР°Р¶Р° РІСЃРµРіРѕ Р±Р°Р»Р°РЅСЃР° С‚РѕРєРµРЅР°; solOutLamports вЂ” РіСЂСѓР±Р°СЏ РѕС†РµРЅРєР° РІС‹С…РѕРґР° SOL (РґРѕ slippage РІ min_out).
 func PumpDirectSellAll(mintStr string) (sig string, solOutLamports uint64, err error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
 	defer cancel()
@@ -1538,7 +1552,7 @@ func PumpDirectSellFraction(mintStr string, fraction float64) (sig string, soldR
 	return s.String(), soldRaw, out, nil
 }
 
-// PumpDirectTokenRawBalance — текущий raw-баланс токена в ATA live-кошелька.
+// PumpDirectTokenRawBalance вЂ” С‚РµРєСѓС‰РёР№ raw-Р±Р°Р»Р°РЅСЃ С‚РѕРєРµРЅР° РІ ATA live-РєРѕС€РµР»СЊРєР°.
 func PumpDirectTokenRawBalance(mintStr string) (uint64, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 6*time.Second)
 	defer cancel()
@@ -1560,7 +1574,7 @@ func PumpDirectTokenRawBalance(mintStr string) (uint64, error) {
 	}
 	bal, err := rpcPumpDirect().GetTokenAccountBalance(ctx, ata, solanarpc.CommitmentProcessed)
 	if err != nil || bal == nil || bal.Value == nil {
-		// Нет ATA/баланса — считаем что позиции нет.
+		// РќРµС‚ ATA/Р±Р°Р»Р°РЅСЃР° вЂ” СЃС‡РёС‚Р°РµРј С‡С‚Рѕ РїРѕР·РёС†РёРё РЅРµС‚.
 		return 0, nil
 	}
 	raw, err := strconv.ParseUint(bal.Value.Amount, 10, 64)
@@ -1570,8 +1584,8 @@ func PumpDirectTokenRawBalance(mintStr string) (uint64, error) {
 	return raw, nil
 }
 
-// PumpDirectEstimateSellSlippage — оценка проскальзывания продажи относительно spot цены.
-// Возвращает долю (0.15 = 15% хуже spot).
+// PumpDirectEstimateSellSlippage вЂ” РѕС†РµРЅРєР° РїСЂРѕСЃРєР°Р»СЊР·С‹РІР°РЅРёСЏ РїСЂРѕРґР°Р¶Рё РѕС‚РЅРѕСЃРёС‚РµР»СЊРЅРѕ spot С†РµРЅС‹.
+// Р’РѕР·РІСЂР°С‰Р°РµС‚ РґРѕР»СЋ (0.15 = 15% С…СѓР¶Рµ spot).
 func PumpDirectEstimateSellSlippage(mintStr string, tokenRaw uint64, spotUSD float64) (float64, error) {
 	if tokenRaw == 0 || spotUSD <= 0 {
 		return 0, fmt.Errorf("bad inputs")

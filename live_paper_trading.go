@@ -1015,6 +1015,80 @@ func noPriceProfitLockMinMult() float64 {
 	return 1.01
 }
 
+func noPricePanicSellPeakMult() float64 {
+	if s := strings.TrimSpace(os.Getenv("NO_PRICE_PANIC_SELL_PEAK_PCT")); s != "" {
+		if v, err := strconv.ParseFloat(s, 64); err == nil && v >= 1 && v <= 300 {
+			return 1 + v/100.0
+		}
+	}
+	if ultraFastEntryMode() {
+		return 1.10 // если уже было +10% и цена пропала — выходим мгновенно
+	}
+	return 1.20
+}
+
+func ultraQualityFilterEnabled() bool {
+	s := strings.TrimSpace(strings.ToLower(os.Getenv("ULTRA_QUALITY_FILTER")))
+	if s == "0" || s == "false" || s == "no" {
+		return false
+	}
+	return ultraFastEntryMode()
+}
+
+func ultraMinRealSOL() float64 {
+	if s := strings.TrimSpace(os.Getenv("ULTRA_MIN_REAL_SOL")); s != "" {
+		if v, err := strconv.ParseFloat(s, 64); err == nil && v >= 0.01 && v <= 20 {
+			return v
+		}
+	}
+	return 0.8
+}
+
+func ultraMinProgress() float64 {
+	if s := strings.TrimSpace(os.Getenv("ULTRA_MIN_PROGRESS_PCT")); s != "" {
+		if v, err := strconv.ParseFloat(s, 64); err == nil && v >= 0 && v <= 100 {
+			return v / 100.0
+		}
+	}
+	return 0.02
+}
+
+func ultraMaxProgress() float64 {
+	if s := strings.TrimSpace(os.Getenv("ULTRA_MAX_PROGRESS_PCT")); s != "" {
+		if v, err := strconv.ParseFloat(s, 64); err == nil && v >= 1 && v <= 100 {
+			return v / 100.0
+		}
+	}
+	return 0.70
+}
+
+func ultraMomentumPause() time.Duration {
+	if s := strings.TrimSpace(os.Getenv("ULTRA_MOMENTUM_PAUSE_MS")); s != "" {
+		if v, err := strconv.Atoi(s); err == nil && v >= 20 && v <= 500 {
+			return time.Duration(v) * time.Millisecond
+		}
+	}
+	return 90 * time.Millisecond
+}
+
+func ultraMinDeltaProgress() float64 {
+	if s := strings.TrimSpace(os.Getenv("ULTRA_MIN_DP_PCT")); s != "" {
+		if v, err := strconv.ParseFloat(s, 64); err == nil && v >= 0 && v <= 20 {
+			return v / 100.0
+		}
+	}
+	return 0.005 // 0.5%
+}
+
+func ultraMinDeltaSOL() float64 {
+	if s := strings.TrimSpace(os.Getenv("ULTRA_MIN_DSOL")); s != "" {
+		if v, err := strconv.ParseFloat(s, 64); err == nil && v >= 0 && v <= 5 {
+			return v
+		}
+	}
+	return 0.03
+}
+
 func ultraDevFilterEnabled() bool {
 	s := strings.TrimSpace(strings.ToLower(os.Getenv("ULTRA_DEV_FILTER")))
 	if s == "0" || s == "false" || s == "no" {
@@ -1118,6 +1192,15 @@ func activateFeeGuard(d time.Duration, reason string) {
 	consoleMu.Lock()
 	fmt.Printf("%s fee-guard %ds: %s\n", yellow("⚠"), int(d.Seconds()), reason)
 	consoleMu.Unlock()
+}
+
+func maxDrawdownPct() float64 {
+	if s := strings.TrimSpace(os.Getenv("MAX_DRAWDOWN_PCT")); s != "" {
+		if v, err := strconv.ParseFloat(s, 64); err == nil && v >= 1 && v <= 90 {
+			return v
+		}
+	}
+	return 20
 }
 
 func printHotPathTrace(sym, src, status, detail string, parseMs, curveMs, checksMs int64, totalMs int64) {
@@ -2469,6 +2552,16 @@ func listenPumpWSS(ch chan<- NewToken) {
 func (w *Wallet) open(tok NewToken, sym string, spot float64) bool {
 	if liveTradingEnabled() {
 		w.mu.Lock()
+		ddPct := maxDrawdownPct()
+		stopBal := w.Start * (1 - ddPct/100.0)
+		if w.Balance <= stopBal {
+			w.mu.Unlock()
+			consoleMu.Lock()
+			fmt.Printf("%s open reject %s | drawdown_stop (bal=%.2f <= %.2f, max_dd=%.0f%%)\n",
+				yellow("⚠"), sym, w.Balance, stopBal, ddPct)
+			consoleMu.Unlock()
+			return false
+		}
 		if len(w.Pos) >= MAX_POSITIONS {
 			w.mu.Unlock()
 			consoleMu.Lock()
@@ -2948,6 +3041,7 @@ func monitor(w *Wallet, mint, bcAddr, sym, source string) {
 	failLogEvery := monitorFailLogEvery()
 	lockFails := noPriceProfitLockFails()
 	lockMinMult := noPriceProfitLockMinMult()
+	panicNoPricePeakMult := noPricePanicSellPeakMult()
 	quickWindow := quickPumpWindow()
 	quickTP := quickPumpTakeProfitMult()
 	var lastMult float64
@@ -3001,6 +3095,10 @@ func monitor(w *Wallet, mint, bcAddr, sym, source string) {
 						w.closePos(mint, fmt.Sprintf("LOCK PROFIT (нет цены x%d, stale=%v)", consecutiveFails, stale), 0)
 						return
 					}
+				}
+				if livePos && entry > 0 && peak >= entry*panicNoPricePeakMult {
+					w.closePos(mint, fmt.Sprintf("PANIC SELL (нет цены после пика +%.0f%%)", (panicNoPricePeakMult-1)*100), 0)
+					return
 				}
 				// В live/turbo первые секунды часто дают RPC-пустоту; не закрываем слишком рано.
 				if consecutiveFails > maxPriceFails && !(livePos && openedFor < 20*time.Second) {
@@ -3389,6 +3487,78 @@ func main() {
 					consoleMu.Unlock()
 				}
 				if src == "pump" && ultraFastEntryMode() {
+					var snapFast *curveSnap
+					if ultraQualityFilterEnabled() {
+						snap0, err := getCurveSnapshotWithRetry(bc, src)
+						curveDone = time.Now()
+						if err != nil || snap0 == nil || snap0.PriceUSD <= 0 {
+							logRejectLine("no_price", sym, mint, "ultra-quality: нет цены")
+							if !tok.DetectedAt.IsZero() {
+								total := time.Since(tok.DetectedAt).Milliseconds()
+								printHotPathTrace(sym, src, "reject:ultra_no_price", "curve snapshot unavailable", parseDone.Sub(traceStart).Milliseconds(), curveDone.Sub(parseDone).Milliseconds(), 0, total)
+							}
+							return
+						}
+						if snap0.Complete {
+							logRejectLine("complete", sym, mint, "ultra-quality: curve complete")
+							if !tok.DetectedAt.IsZero() {
+								total := time.Since(tok.DetectedAt).Milliseconds()
+								printHotPathTrace(sym, src, "reject:ultra_complete", "bonding curve complete", parseDone.Sub(traceStart).Milliseconds(), curveDone.Sub(parseDone).Milliseconds(), 0, total)
+							}
+							return
+						}
+						if snap0.RealSolSOL < ultraMinRealSOL() {
+							logRejectLine("low_sol", sym, mint, fmt.Sprintf("ultra-quality: SOL %.2f < %.2f", snap0.RealSolSOL, ultraMinRealSOL()))
+							if !tok.DetectedAt.IsZero() {
+								total := time.Since(tok.DetectedAt).Milliseconds()
+								printHotPathTrace(sym, src, "reject:ultra_low_sol", "real SOL below threshold", parseDone.Sub(traceStart).Milliseconds(), curveDone.Sub(parseDone).Milliseconds(), 0, total)
+							}
+							return
+						}
+						if snap0.Progress < ultraMinProgress() {
+							logRejectLine("empty", sym, mint, fmt.Sprintf("ultra-quality: curve %.1f%% < %.1f%%", snap0.Progress*100, ultraMinProgress()*100))
+							if !tok.DetectedAt.IsZero() {
+								total := time.Since(tok.DetectedAt).Milliseconds()
+								printHotPathTrace(sym, src, "reject:ultra_empty", "too early / empty curve", parseDone.Sub(traceStart).Milliseconds(), curveDone.Sub(parseDone).Milliseconds(), 0, total)
+							}
+							return
+						}
+						if snap0.Progress > ultraMaxProgress() {
+							logRejectLine("late", sym, mint, fmt.Sprintf("ultra-quality: curve %.1f%% > %.1f%%", snap0.Progress*100, ultraMaxProgress()*100))
+							if !tok.DetectedAt.IsZero() {
+								total := time.Since(tok.DetectedAt).Milliseconds()
+								printHotPathTrace(sym, src, "reject:ultra_late", "curve too late", parseDone.Sub(traceStart).Milliseconds(), curveDone.Sub(parseDone).Milliseconds(), 0, total)
+							}
+							return
+						}
+						pause := ultraMomentumPause()
+						if pause > 0 {
+							time.Sleep(pause)
+							snap1, err := getCurveSnapshotWithRetry(bc, src)
+							if err != nil || snap1 == nil || snap1.PriceUSD <= 0 {
+								logRejectLine("vel_rpc", sym, mint, "ultra-quality: второй замер недоступен")
+								if !tok.DetectedAt.IsZero() {
+									total := time.Since(tok.DetectedAt).Milliseconds()
+									printHotPathTrace(sym, src, "reject:ultra_vel_rpc", "second snapshot unavailable", parseDone.Sub(traceStart).Milliseconds(), time.Since(parseDone).Milliseconds(), 0, total)
+								}
+								return
+							}
+							dP := snap1.Progress - snap0.Progress
+							dSol := snap1.RealSolSOL - snap0.RealSolSOL
+							if dP < ultraMinDeltaProgress() && dSol < ultraMinDeltaSOL() {
+								logRejectLine("vel_low", sym, mint, fmt.Sprintf("ultra-quality: слабый импульс (Δ%.2f%% / +%.3f SOL)", dP*100, dSol))
+								if !tok.DetectedAt.IsZero() {
+									total := time.Since(tok.DetectedAt).Milliseconds()
+									printHotPathTrace(sym, src, "reject:ultra_vel_low", "weak momentum", parseDone.Sub(traceStart).Milliseconds(), time.Since(parseDone).Milliseconds(), 0, total)
+								}
+								return
+							}
+							snapFast = snap1
+							curveDone = time.Now()
+						} else {
+							snapFast = snap0
+						}
+					}
 					if ultraDevFilterEnabled() {
 						if creator == "" {
 							logRejectLine("scam", sym, mint, "ultra-dev-filter: creator missing")
@@ -3415,14 +3585,32 @@ func main() {
 					tok.FiltersPassedAt = time.Now()
 					if !tok.DetectedAt.IsZero() {
 						total := time.Since(tok.DetectedAt).Milliseconds()
-						printHotPathTrace(sym, src, "pass:ultra_fast", "skip curve/velocity/scam", parseDone.Sub(traceStart).Milliseconds(), 0, 0, total)
+						detail := "skip curve/velocity/scam"
+						curveMs := int64(0)
+						if ultraQualityFilterEnabled() {
+							curveMs = curveDone.Sub(parseDone).Milliseconds()
+							if snapFast != nil {
+								detail = fmt.Sprintf("ultra-quality ok | curve %.1f%% | SOL %.2f", snapFast.Progress*100, snapFast.RealSolSOL)
+							} else {
+								detail = "ultra-quality ok"
+							}
+						}
+						printHotPathTrace(sym, src, "pass:ultra_fast", detail, parseDone.Sub(traceStart).Milliseconds(), curveMs, 0, total)
 					}
-					if wallet.open(tok, sym, 0) {
+					price := 0.0
+					if snapFast != nil {
+						price = snapFast.PriceUSD
+					}
+					if wallet.open(tok, sym, price) {
 						atomic.AddInt64(&funnelOpenOK, 1)
 						if !hotPathSilent() {
 							consoleMu.Lock()
+							msg := "skip curve/velocity/scam"
+							if ultraQualityFilterEnabled() && snapFast != nil {
+								msg = fmt.Sprintf("ultra-quality: curve %.1f%% | SOL %.2f", snapFast.Progress*100, snapFast.RealSolSOL)
+							}
 							fmt.Printf("\n%s %-18s | %s | ULTRA_FAST_ENTRY → ВХОД\n",
-								green("✓"), sym, gray("skip curve/velocity/scam"))
+								green("✓"), sym, gray(msg))
 							if createAt != nil {
 								fmt.Printf("   %s %s\n", gray("⏱"), formatCreateAge(createAt))
 							}

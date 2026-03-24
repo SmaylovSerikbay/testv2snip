@@ -1388,6 +1388,15 @@ func maxDrawdownPct() float64 {
 	return 20
 }
 
+func sellSlippageGuardValue() float64 {
+	if s := strings.TrimSpace(os.Getenv("SELL_SLIPPAGE_GUARD_PCT")); s != "" {
+		if v, err := strconv.ParseFloat(s, 64); err == nil && v >= 1 && v <= 90 {
+			return v / 100.0
+		}
+	}
+	return SELL_SLIPPAGE_GUARD
+}
+
 func printHotPathTrace(sym, src, status, detail string, parseMs, curveMs, checksMs int64, totalMs int64) {
 	if !hotPathTraceEnabled() {
 		return
@@ -3011,16 +3020,24 @@ func (w *Wallet) closePosLive(pos *Position, reason string, spot float64) {
 	}
 	// РќРµ РїСЂРѕРґР°С‘Рј РІ СЃР»РёС€РєРѕРј РїР»РѕС…РѕР№ С‚РёРє: РµСЃР»Рё РѕР¶РёРґР°РµРјРѕРµ РїСЂРѕСЃРєР°Р»СЊР·С‹РІР°РЅРёРµ > 10%, Р¶РґС‘Рј СЃР»РµРґСѓСЋС‰РёР№ С†РёРєР».
 	if spot > 0 {
-		if estSlip, err := PumpDirectEstimateSellSlippage(pos.Mint, pos.TokenRaw, spot); err == nil && estSlip > SELL_SLIPPAGE_GUARD {
+		guard := sellSlippageGuardValue()
+		if estSlip, err := PumpDirectEstimateSellSlippage(pos.Mint, pos.TokenRaw, spot); err == nil && estSlip > guard {
+			age := time.Since(pos.OpenedAt)
+			if age < 60*time.Second {
+				consoleMu.Lock()
+				fmt.Printf("%s wait better tick: est sell slippage %.1f%% > %.0f%%\n",
+					yellow("вЏё"), estSlip*100, guard*100)
+				consoleMu.Unlock()
+				w.mu.Lock()
+				w.Pos[pos.Mint] = pos
+				w.saveActivePositionsLocked()
+				w.mu.Unlock()
+				return
+			}
 			consoleMu.Lock()
-			fmt.Printf("%s wait better tick: est sell slippage %.1f%% > %.0f%%\n",
-				yellow("вЏё"), estSlip*100, SELL_SLIPPAGE_GUARD*100)
+			fmt.Printf("%s stale position %.0fs: bypass slippage guard %.1f%% > %.0f%%\n",
+				yellow("вљ "), age.Seconds(), estSlip*100, guard*100)
 			consoleMu.Unlock()
-			w.mu.Lock()
-			w.Pos[pos.Mint] = pos
-			w.saveActivePositionsLocked()
-			w.mu.Unlock()
-			return
 		}
 	}
 	var sig string

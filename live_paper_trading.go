@@ -20,6 +20,7 @@ import (
 	"syscall"
 	"time"
 
+	ag_binary "github.com/gagliardetto/binary"
 	"github.com/gagliardetto/solana-go"
 	"github.com/gorilla/websocket"
 	"github.com/joho/godotenv"
@@ -1888,41 +1889,112 @@ func pickMintFromPostBalances(balances []postTokenBal) string {
 //  CREATE TX: mint + СЃРѕР·РґР°С‚РµР»СЊ (РїРµСЂРІС‹Р№ signer / fee payer)
 // в•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђ
 
-func parseCreateTx(sig string) (mint, creator string, createBlockTime *time.Time) {
-	data, err := getTransactionJSONParsedFast(sig)
-	if err != nil {
-		return "", "", nil
+func parseTxMintCreatorBase64(data []byte, wantLogs func([]string) bool) (mint, creator string, createBlockTime *time.Time, wanted bool, err error) {
+	var wrap struct {
+		Result json.RawMessage `json:"result"`
 	}
-	mint, creator, createBlockTime, isCreate := parseTxMintCreator(data, func(logs []string) bool {
+	if err := json.Unmarshal(data, &wrap); err != nil {
+		return "", "", nil, false, err
+	}
+	if string(wrap.Result) == "null" {
+		return "", "", nil, false, fmt.Errorf("null tx result")
+	}
+	var r struct {
+		BlockTime *int64 `json:"blockTime"`
+		Meta      struct {
+			PostTokenBalances []postTokenBal `json:"postTokenBalances"`
+			LogMessages       []string       `json:"logMessages"`
+		} `json:"meta"`
+		Transaction struct {
+			Transaction []string `json:"transaction"`
+		} `json:"transaction"`
+	}
+	if err := json.Unmarshal(wrap.Result, &r); err != nil {
+		return "", "", nil, false, err
+	}
+	if r.BlockTime != nil && *r.BlockTime > 0 {
+		t := time.Unix(*r.BlockTime, 0)
+		createBlockTime = &t
+	}
+	if len(r.Transaction.Transaction) == 0 || r.Transaction.Transaction[0] == "" {
+		return "", "", createBlockTime, false, fmt.Errorf("empty base64 tx")
+	}
+	rawTx, err := base64.StdEncoding.DecodeString(r.Transaction.Transaction[0])
+	if err != nil {
+		return "", "", createBlockTime, false, err
+	}
+	tx, err := solana.TransactionFromDecoder(ag_binary.NewBinDecoder(rawTx))
+	if err != nil {
+		return "", "", createBlockTime, false, err
+	}
+	if len(tx.Message.AccountKeys) > 0 {
+		creator = tx.Message.AccountKeys[0].String()
+	}
+	mint = pickMintFromPostBalances(r.Meta.PostTokenBalances)
+	if mint == "" {
+		mint = pickMintFromPublicKeys(tx.Message.AccountKeys)
+	}
+	if !wantLogs(r.Meta.LogMessages) {
+		return mint, creator, createBlockTime, false, nil
+	}
+	return mint, creator, createBlockTime, true, nil
+}
+
+func getTransactionBase64Fast(sig string, wantLogs func([]string) bool) (mint, creator string, createBlockTime *time.Time, wanted bool, err error) {
+	params := func(commitment string) []interface{} {
+		return []interface{}{
+			sig,
+			map[string]interface{}{
+				"encoding":                       "base64",
+				"maxSupportedTransactionVersion": 0,
+				"commitment":                     commitment,
+			},
+		}
+	}
+	tries := 3
+	if turboModeEnabled() {
+		tries = 1
+	}
+	for attempt := 0; attempt < tries; attempt++ {
+		data, err := rpc("getTransaction", params("processed"))
+		if err == nil {
+			mint, creator, createBlockTime, wanted, parseErr := parseTxMintCreatorBase64(data, wantLogs)
+			if parseErr == nil {
+				return mint, creator, createBlockTime, wanted, nil
+			}
+		}
+		if attempt < tries-1 {
+			time.Sleep(time.Duration(60*(attempt+1)) * time.Millisecond)
+		}
+	}
+	data, err := rpc("getTransaction", params("confirmed"))
+	if err != nil {
+		return "", "", nil, false, err
+	}
+	return parseTxMintCreatorBase64(data, wantLogs)
+}
+
+func parseCreateTx(sig string) (mint, creator string, createBlockTime *time.Time) {
+	wantCreate := func(logs []string) bool {
 		for _, l := range logs {
 			if contains(l, "Instruction: Create") {
 				return true
 			}
 		}
 		return false
-	})
+	}
+	mint, creator, createBlockTime, isCreate, err := getTransactionBase64Fast(sig, wantCreate)
+	if err != nil {
+		return "", "", nil
+	}
 	if !isCreate {
 		if mint == "" {
-			mint, creator, createBlockTime = refillMintFromConfirmed(sig, creator, createBlockTime, func(logs []string) bool {
-				for _, l := range logs {
-					if contains(l, "Instruction: Create") {
-						return true
-					}
-				}
-				return false
-			})
+			mint, creator, createBlockTime = refillMintFromConfirmed(sig, creator, createBlockTime, wantCreate)
 		}
 		return mint, creator, createBlockTime
 	}
 	if mint == "" {
-		mint, creator, createBlockTime = refillMintFromConfirmed(sig, creator, createBlockTime, func(logs []string) bool {
-			for _, l := range logs {
-				if contains(l, "Instruction: Create") {
-					return true
-				}
-			}
-			return false
-		})
+		mint, creator, createBlockTime = refillMintFromConfirmed(sig, creator, createBlockTime, wantCreate)
 	}
 	return mint, creator, createBlockTime
 }
@@ -2008,13 +2080,16 @@ func refillMintFromConfirmed(sig, creator string, createBlockTime *time.Time, wa
 		data, err := rpc("getTransaction", []interface{}{
 			sig,
 			map[string]interface{}{
-				"encoding":                       "json",
+				"encoding":                       "base64",
 				"maxSupportedTransactionVersion": 0,
 				"commitment":                     "confirmed",
 			},
 		})
 		if err == nil {
-			mint, parsedCreator, bt, ok := parseTxMintCreator(data, wantLogs)
+			mint, parsedCreator, bt, ok, parseErr := parseTxMintCreatorBase64(data, wantLogs)
+			if parseErr != nil {
+				goto sleepAndRetry
+			}
 			if creatorOut == "" && parsedCreator != "" {
 				creatorOut = parsedCreator
 			}
@@ -2026,6 +2101,7 @@ func refillMintFromConfirmed(sig, creator string, createBlockTime *time.Time, wa
 			}
 			_ = ok
 		}
+	sleepAndRetry:
 		if attempt < 2 {
 			time.Sleep(time.Duration(80*(attempt+1)) * time.Millisecond)
 		}
@@ -2063,6 +2139,23 @@ func pickMintFromAccountKeys(keys []json.RawMessage) string {
 			if fallback == "" {
 				fallback = s
 			}
+		}
+	}
+	return fallback
+}
+
+func pickMintFromPublicKeys(keys []solana.PublicKey) string {
+	var fallback string
+	for _, key := range keys {
+		k := key.String()
+		if k == "" || ignoredTokenMints[k] {
+			continue
+		}
+		if strings.HasSuffix(k, "pump") {
+			return k
+		}
+		if fallback == "" {
+			fallback = k
 		}
 	}
 	return fallback
@@ -4569,11 +4662,10 @@ func launchLabInitFromLogs(logs []string) bool {
 }
 
 func parseLaunchLabCreateTx(sig string) (mint, creator string, createBlockTime *time.Time) {
-	data, err := getTransactionJSONParsedFast(sig)
+	mint, creator, createBlockTime, isInit, err := getTransactionBase64Fast(sig, launchLabInitFromLogs)
 	if err != nil {
 		return "", "", nil
 	}
-	mint, creator, createBlockTime, isInit := parseTxMintCreator(data, launchLabInitFromLogs)
 	if !isInit {
 		return "", "", createBlockTime
 	}

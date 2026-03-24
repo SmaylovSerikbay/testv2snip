@@ -48,15 +48,19 @@ var (
 )
 
 func init() {
-	h := sha256.Sum256([]byte("global:buy"))
-	copy(buyDisc[:], h[:8])
-	h = sha256.Sum256([]byte("global:sell"))
+	// buy_exact_sol_in discriminator (replaces old "global:buy")
+	copy(buyDisc[:], []byte{56, 252, 116, 8, 158, 223, 205, 95})
+	h := sha256.Sum256([]byte("global:sell"))
 	copy(sellDisc[:], h[:8])
 	h = sha256.Sum256([]byte("event:TradeEvent"))
 	copy(tradeDisc[:], h[:8])
 	ea, _, _ := solana.FindProgramAddress([][]byte{[]byte("__event_authority")}, PumpProgram)
 	PumpEventAuth = ea
-	fc, _, _ := solana.FindProgramAddress([][]byte{[]byte("fee_config"), PumpProgram.Bytes()}, FeeProgram)
+	feeKey := []byte{
+		1, 86, 224, 246, 147, 102, 90, 207, 68, 219, 21, 104, 191, 23, 91, 170,
+		81, 137, 203, 151, 245, 210, 255, 59, 101, 93, 43, 182, 253, 109, 24, 176,
+	}
+	fc, _, _ := solana.FindProgramAddress([][]byte{[]byte("fee_config"), feeKey}, FeeProgram)
 	FeeConfig = fc
 }
 
@@ -101,6 +105,7 @@ type BondingCurve struct {
 	VTK, VSR, RTK, RSR, Supply uint64
 	Done                       bool
 	Creator                    solana.PublicKey
+	Cashback                   bool
 }
 
 type TradeEvent struct {
@@ -146,6 +151,11 @@ var (
 	buyingMu sync.Mutex
 	buying   = map[string]bool{}
 
+	// Cooldown: skip mints recently attempted (success or fail)
+	cdMu       sync.Mutex
+	cdMap      = map[string]time.Time{} // mint → last attempt
+	cdDuration = 3 * time.Minute
+
 	// Per-target consecutive loss tracking
 	tgtLossMu sync.Mutex
 	tgtLosses = map[string]int{}
@@ -154,8 +164,12 @@ var (
 	bhHash  solana.Hash
 	bhStale int64 // unix seconds when fetched
 
-	statBuys  atomic.Int64
-	statSells atomic.Int64
+	statBuys   atomic.Int64
+	statSells  atomic.Int64
+	statWins   atomic.Int64
+	statLosses atomic.Int64
+	statPnlMu  sync.Mutex
+	statPnlSum float64
 )
 
 func rpcWait() { <-rpcBucket }
@@ -237,11 +251,12 @@ func main() {
 	launch(runWSListener)
 	launch(runExecutor)
 	launch(runMonitor)
+	launch(runStats)
 
-	sig := make(chan os.Signal, 1)
-	signal.Notify(sig, os.Interrupt)
-	<-sig
-	log.Printf("[EXIT] Buys=%d Sells=%d", statBuys.Load(), statSells.Load())
+	osSig := make(chan os.Signal, 1)
+	signal.Notify(osSig, os.Interrupt)
+	<-osSig
+	printStats()
 	cancel()
 	wg.Wait()
 }
@@ -739,8 +754,28 @@ func runExecutor(ctx context.Context) {
 	}
 }
 
+func mintOnCooldown(mint string) bool {
+	cdMu.Lock()
+	defer cdMu.Unlock()
+	if t, ok := cdMap[mint]; ok && time.Since(t) < cdDuration {
+		return true
+	}
+	return false
+}
+
+func setMintCooldown(mint string) {
+	cdMu.Lock()
+	cdMap[mint] = time.Now()
+	cdMu.Unlock()
+}
+
 func doBuy(ctx context.Context, sig Signal) {
 	mint := sig.Mint.String()
+
+	// ── Cooldown: не заходить в одну монету повторно ──
+	if mintOnCooldown(mint) {
+		return
+	}
 
 	// ── DEDUP: atomic claim на минт (блокирует повторные горутины) ──
 	buyingMu.Lock()
@@ -761,7 +796,6 @@ func doBuy(ctx context.Context, sig Signal) {
 		return
 	}
 	if cnt >= cfg.MaxPositions {
-		log.Printf("[BUY] Слотов нет (%d/%d) — пропуск %s", cnt, cfg.MaxPositions, short(mint))
 		return
 	}
 	if len(cfg.Key) != 64 {
@@ -777,12 +811,12 @@ func doBuy(ctx context.Context, sig Signal) {
 
 	state, bc, err := readBC(ctx, sig.Mint)
 	if err != nil || state.Done {
-		log.Printf("[BUY] BC недоступна или завершена: %s", short(mint))
+		setMintCooldown(mint)
 		return
 	}
 
-	if state.VSR < 1_500_000_000 {
-		log.Printf("[BUY] Мало ликвидности: %.2f SOL — пропуск %s", float64(state.VSR)/1e9, short(mint))
+	if state.VSR < 3_000_000_000 {
+		setMintCooldown(mint)
 		return
 	}
 
@@ -791,7 +825,7 @@ func doBuy(ctx context.Context, sig Signal) {
 	if tokOut == 0 {
 		return
 	}
-	maxSol := cfg.BuyLamp * (10000 + cfg.Slip) / 10000
+	minTokOut := tokOut * (10000 - cfg.Slip) / 10000
 
 	user := cfg.Key.PublicKey()
 	assocBC := findATA(bc, sig.Mint, tokProg)
@@ -803,12 +837,14 @@ func doBuy(ctx context.Context, sig Signal) {
 		[][]byte{[]byte("global_volume_accumulator")}, PumpProgram)
 	userVolAcc, _, _ := solana.FindProgramAddress(
 		[][]byte{[]byte("user_volume_accumulator"), user.Bytes()}, PumpProgram)
+	bcV2, _, _ := solana.FindProgramAddress(
+		[][]byte{[]byte("bonding-curve-v2"), sig.Mint.Bytes()}, PumpProgram)
 
-	data := make([]byte, 25)
+	// buy_exact_sol_in: (sol_amount u64, min_tokens_out u64)
+	data := make([]byte, 24)
 	copy(data[:8], buyDisc[:])
-	binary.LittleEndian.PutUint64(data[8:], tokOut)
-	binary.LittleEndian.PutUint64(data[16:], maxSol)
-	data[24] = 0 // track_volume = None
+	binary.LittleEndian.PutUint64(data[8:], cfg.BuyLamp)
+	binary.LittleEndian.PutUint64(data[16:], minTokOut)
 
 	cuLimit := uint32(250_000)
 	ixs := []solana.Instruction{
@@ -816,22 +852,23 @@ func doBuy(ctx context.Context, sig Signal) {
 		cuPriceIx(cfg.PrioLamp * 1_000_000 / uint64(cuLimit)),
 		ataIx(user, user, sig.Mint, tokProg),
 		&genericIx{pid: PumpProgram, dat: data, accs: []*solana.AccountMeta{
-			{PublicKey: PumpGlobal},
-			{PublicKey: PumpFee, IsWritable: true},
-			{PublicKey: sig.Mint},
-			{PublicKey: bc, IsWritable: true},
-			{PublicKey: assocBC, IsWritable: true},
-			{PublicKey: assocUser, IsWritable: true},
-			{PublicKey: user, IsSigner: true, IsWritable: true},
-			{PublicKey: solana.SystemProgramID},
-			{PublicKey: tokProg},
-			{PublicKey: creatorVault, IsWritable: true},
-			{PublicKey: PumpEventAuth},
-			{PublicKey: PumpProgram},
-			{PublicKey: globalVolAcc},
-			{PublicKey: userVolAcc, IsWritable: true},
-			{PublicKey: FeeConfig},
-			{PublicKey: FeeProgram},
+			{PublicKey: PumpGlobal},                             // 0
+			{PublicKey: PumpFee, IsWritable: true},              // 1
+			{PublicKey: sig.Mint},                               // 2
+			{PublicKey: bc, IsWritable: true},                   // 3
+			{PublicKey: assocBC, IsWritable: true},              // 4
+			{PublicKey: assocUser, IsWritable: true},            // 5
+			{PublicKey: user, IsSigner: true, IsWritable: true}, // 6
+			{PublicKey: solana.SystemProgramID},                 // 7
+			{PublicKey: tokProg},                                // 8
+			{PublicKey: creatorVault, IsWritable: true},         // 9
+			{PublicKey: PumpEventAuth},                          // 10
+			{PublicKey: PumpProgram},                            // 11
+			{PublicKey: globalVolAcc},                           // 12
+			{PublicKey: userVolAcc, IsWritable: true},           // 13
+			{PublicKey: FeeConfig},                              // 14
+			{PublicKey: FeeProgram},                             // 15
+			{PublicKey: bcV2},                                   // 16 bonding_curve_v2
 		}},
 	}
 
@@ -859,6 +896,8 @@ func doBuy(ctx context.Context, sig Signal) {
 		statBuys.Add(1)
 		return
 	}
+
+	setMintCooldown(mint)
 
 	rpcWait()
 	txSig, err := rpcCl.SendTransactionWithOpts(ctx, tx, rpc.TransactionOpts{SkipPreflight: false})
@@ -971,11 +1010,14 @@ func checkAll(ctx context.Context) {
 			reason = fmt.Sprintf("TP +%.0f%%", pnl*100)
 		case pnl <= -cfg.SL:
 			reason = fmt.Sprintf("SL %.0f%%", pnl*100)
-		// Trailing: был выше +15%, упал на 10% от пика → фиксируем
-		case p.HiPnl >= 0.15 && pnl < p.HiPnl-0.10:
+		// Trailing: был выше +8%, упал на 5% от пика → фиксируем прибыль
+		case p.HiPnl >= 0.08 && pnl < p.HiPnl-0.05:
 			reason = fmt.Sprintf("TRAIL peak+%.0f%% now%+.0f%%", p.HiPnl*100, pnl*100)
 		case age >= time.Duration(cfg.TimeKillSec)*time.Second && pnl < cfg.TimeKillMin:
 			reason = fmt.Sprintf("TIMEKILL %ds pnl=%+.1f%%", int(age.Seconds()), pnl*100)
+		// Hard kill: 90 секунд без значительного роста
+		case age >= 90*time.Second && pnl < 0.10:
+			reason = fmt.Sprintf("HARDKILL %ds pnl=%+.1f%%", int(age.Seconds()), pnl*100)
 		}
 		if reason == "" {
 			continue
@@ -1019,11 +1061,6 @@ func doSell(ctx context.Context, p *Position, reason string) bool {
 		return false
 	}
 
-	solOut := calcSolOut(state.VTK, state.VSR, p.Tokens)
-	solNet := solOut - solOut/100
-	minSol := solNet * (10000 - cfg.Slip) / 10000
-	pnl := float64(solNet)/float64(p.Spent)*100 - 100
-
 	user := cfg.Key.PublicKey()
 	tokProg := p.TokProg
 	if tokProg.IsZero() {
@@ -1032,40 +1069,66 @@ func doSell(ctx context.Context, p *Position, reason string) bool {
 	assocBC := findATA(bc, p.Mint, tokProg)
 	assocUser := findATA(user, p.Mint, tokProg)
 
+	realBal := getTokenBalance(ctx, assocUser)
+	sellAmt := realBal
+	if sellAmt == 0 {
+		sellAmt = p.Tokens
+	}
+	if sellAmt == 0 {
+		log.Printf("[SELL] Нет токенов: %s", short(mintStr))
+		return false
+	}
+
+	solOut := calcSolOut(state.VTK, state.VSR, sellAmt)
+	solNet := solOut - solOut/100
+	minSol := solNet * (10000 - cfg.Slip) / 10000
+	pnl := float64(solNet)/float64(p.Spent)*100 - 100
+
 	creatorVault, _, _ := solana.FindProgramAddress(
 		[][]byte{[]byte("creator-vault"), state.Creator.Bytes()}, PumpProgram)
+	bcV2, _, _ := solana.FindProgramAddress(
+		[][]byte{[]byte("bonding-curve-v2"), p.Mint.Bytes()}, PumpProgram)
 
 	data := make([]byte, 24)
 	copy(data[:8], sellDisc[:])
-	binary.LittleEndian.PutUint64(data[8:], p.Tokens)
+	binary.LittleEndian.PutUint64(data[8:], sellAmt)
 	binary.LittleEndian.PutUint64(data[16:], minSol)
+
+	sellAccs := []*solana.AccountMeta{
+		{PublicKey: PumpGlobal},                             // 0
+		{PublicKey: PumpFee, IsWritable: true},              // 1
+		{PublicKey: p.Mint},                                 // 2
+		{PublicKey: bc, IsWritable: true},                   // 3
+		{PublicKey: assocBC, IsWritable: true},              // 4
+		{PublicKey: assocUser, IsWritable: true},            // 5
+		{PublicKey: user, IsSigner: true, IsWritable: true}, // 6
+		{PublicKey: solana.SystemProgramID},                 // 7
+		{PublicKey: creatorVault, IsWritable: true},         // 8
+		{PublicKey: tokProg},                                // 9
+		{PublicKey: PumpEventAuth},                          // 10
+		{PublicKey: PumpProgram},                            // 11
+		{PublicKey: FeeConfig},                              // 12
+		{PublicKey: FeeProgram},                             // 13
+	}
+	if state.Cashback {
+		userVolAcc, _, _ := solana.FindProgramAddress(
+			[][]byte{[]byte("user_volume_accumulator"), user.Bytes()}, PumpProgram)
+		sellAccs = append(sellAccs, &solana.AccountMeta{PublicKey: userVolAcc, IsWritable: true}) // 14
+	}
+	sellAccs = append(sellAccs, &solana.AccountMeta{PublicKey: bcV2}) // last: bonding_curve_v2
 
 	cuLimit := uint32(250_000)
 	ixs := []solana.Instruction{
 		cuLimitIx(cuLimit),
 		cuPriceIx(cfg.PrioLamp * 1_000_000 / uint64(cuLimit)),
-		&genericIx{pid: PumpProgram, dat: data, accs: []*solana.AccountMeta{
-			{PublicKey: PumpGlobal},
-			{PublicKey: PumpFee, IsWritable: true},
-			{PublicKey: p.Mint},
-			{PublicKey: bc, IsWritable: true},
-			{PublicKey: assocBC, IsWritable: true},
-			{PublicKey: assocUser, IsWritable: true},
-			{PublicKey: user, IsSigner: true, IsWritable: true},
-			{PublicKey: solana.SystemProgramID},
-			{PublicKey: creatorVault, IsWritable: true},
-			{PublicKey: tokProg},
-			{PublicKey: PumpEventAuth},
-			{PublicKey: PumpProgram},
-			{PublicKey: FeeConfig},
-			{PublicKey: FeeProgram},
-		}},
+		&genericIx{pid: PumpProgram, dat: data, accs: sellAccs},
 	}
 
 	if !cfg.Live {
 		log.Printf("[SELL][PAPER] %s | %s | PnL %+.1f%% | %.6f SOL",
 			reason, short(mintStr), pnl, float64(solNet)/1e9)
 		statSells.Add(1)
+		recordPnl(pnl)
 		return true
 	}
 
@@ -1095,6 +1158,7 @@ func doSell(ctx context.Context, p *Position, reason string) bool {
 	}
 	log.Printf("[SELL] %s | TX %s | %s | PnL %+.1f%%", reason, txSig.String()[:12], short(mintStr), pnl)
 	statSells.Add(1)
+	recordPnl(pnl)
 
 	savedPos := *p
 	go confirmTx(ctx, txSig, "SELL", mintStr, func() {
@@ -1133,6 +1197,9 @@ func readBC(ctx context.Context, mint solana.PublicKey) (*BondingCurve, solana.P
 	if len(d) >= 81 {
 		copy(s.Creator[:], d[49:81])
 	}
+	if len(d) > 82 {
+		s.Cashback = d[82] != 0
+	}
 	return s, bc, nil
 }
 
@@ -1164,11 +1231,16 @@ func parseTE(d []byte) *TradeEvent {
 	}
 	o := 8
 	var e TradeEvent
-	copy(e.Mint[:], d[o:o+32]); o += 32
-	e.Sol = binary.LittleEndian.Uint64(d[o:]); o += 8
-	e.Tokens = binary.LittleEndian.Uint64(d[o:]); o += 8
-	e.IsBuy = d[o] != 0; o++
-	copy(e.User[:], d[o:o+32]); o += 32
+	copy(e.Mint[:], d[o:o+32])
+	o += 32
+	e.Sol = binary.LittleEndian.Uint64(d[o:])
+	o += 8
+	e.Tokens = binary.LittleEndian.Uint64(d[o:])
+	o += 8
+	e.IsBuy = d[o] != 0
+	o++
+	copy(e.User[:], d[o:o+32])
+	o += 32
 	e.Timestamp = int64(binary.LittleEndian.Uint64(d[o:]))
 	return &e
 }
@@ -1192,6 +1264,22 @@ func calcSolOut(vtk, vsr, tok uint64) uint64 {
 // ═══════════════════════════════════════════════════════════════════════════════
 //  INSTRUCTION BUILDERS
 // ═══════════════════════════════════════════════════════════════════════════════
+
+func getTokenBalance(ctx context.Context, ata solana.PublicKey) uint64 {
+	rpcWait()
+	info, err := rpcCl.GetAccountInfoWithOpts(ctx, ata, &rpc.GetAccountInfoOpts{
+		Encoding:   solana.EncodingBase64,
+		Commitment: rpc.CommitmentConfirmed,
+	})
+	if err != nil || info == nil || info.Value == nil {
+		return 0
+	}
+	d := info.Value.Data.GetBinary()
+	if len(d) < 72 {
+		return 0
+	}
+	return binary.LittleEndian.Uint64(d[64:72])
+}
 
 func getMintTokenProgram(ctx context.Context, mint solana.PublicKey) solana.PublicKey {
 	rpcWait()
@@ -1273,4 +1361,46 @@ func short(s string) string {
 		return s
 	}
 	return s[:4] + ".." + s[len(s)-4:]
+}
+
+func recordPnl(pnlPct float64) {
+	if pnlPct > 0 {
+		statWins.Add(1)
+	} else {
+		statLosses.Add(1)
+	}
+	statPnlMu.Lock()
+	statPnlSum += pnlPct
+	statPnlMu.Unlock()
+}
+
+func printStats() {
+	w := statWins.Load()
+	l := statLosses.Load()
+	total := w + l
+	statPnlMu.Lock()
+	pnl := statPnlSum
+	statPnlMu.Unlock()
+	wr := float64(0)
+	if total > 0 {
+		wr = float64(w) / float64(total) * 100
+	}
+	posMu.RLock()
+	open := len(pos)
+	posMu.RUnlock()
+	log.Printf("[STAT] Wins=%d Losses=%d WR=%.0f%% | PnL=%+.1f%% | Open=%d | Buys=%d Sells=%d",
+		w, l, wr, pnl, open, statBuys.Load(), statSells.Load())
+}
+
+func runStats(ctx context.Context) {
+	t := time.NewTicker(30 * time.Second)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+			printStats()
+		}
+	}
 }

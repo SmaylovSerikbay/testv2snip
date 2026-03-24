@@ -1315,13 +1315,21 @@ func doSell(ctx context.Context, p *Position, reason string, cachedState *Bondin
 	}
 	log.Printf("[SELL] %s | TX %s | %s | PnL %+.1f%%", reason, txSig.String()[:12], short(mintStr), pnl)
 	statSells.Add(1)
-	recordPnl(pnl)
 
 	savedPos := *p
+	savedPnl := pnl
 	go confirmTx(ctx, txSig, "SELL", mintStr, func() {
 		addPos(savedPos.Mint, savedPos.Tokens, savedPos.Spent, savedPos.Wallet, savedPos.TokProg)
 		log.Printf("[SELL] Позиция восстановлена (TX fail): %s", short(mintStr))
 	})
+	go func() {
+		time.Sleep(5 * time.Second)
+		rpcWait()
+		st, err := rpcCl.GetSignatureStatuses(ctx, false, txSig)
+		if err == nil && len(st.Value) > 0 && st.Value[0] != nil && st.Value[0].Err == nil {
+			recordPnl(savedPnl)
+		}
+	}()
 	return true
 }
 
@@ -1545,8 +1553,16 @@ func printStats() {
 	posMu.RLock()
 	open := len(pos)
 	posMu.RUnlock()
-	log.Printf("[STAT] Wins=%d Losses=%d WR=%.0f%% | PnL=%+.1f%% | Open=%d | Buys=%d Sells=%d",
-		w, l, wr, pnl, open, statBuys.Load(), statSells.Load())
+	balStr := ""
+	if len(cfg.Key) == 64 {
+		rpcWait()
+		b, err := rpcCl.GetBalance(context.Background(), cfg.Key.PublicKey(), rpc.CommitmentConfirmed)
+		if err == nil {
+			balStr = fmt.Sprintf(" | Bal=%.4f SOL", float64(b.Value)/1e9)
+		}
+	}
+	log.Printf("[STAT] Wins=%d Losses=%d WR=%.0f%% | PnL=%+.1f%% | Open=%d | Buys=%d Sells=%d%s",
+		w, l, wr, pnl, open, statBuys.Load(), statSells.Load(), balStr)
 }
 
 func runStats(ctx context.Context) {

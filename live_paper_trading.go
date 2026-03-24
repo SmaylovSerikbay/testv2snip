@@ -1448,7 +1448,10 @@ type curveSnap struct {
 func getCurveSnapshot(bcAddr string) (*curveSnap, error) {
 	data, err := rpc("getAccountInfo", []interface{}{
 		bcAddr,
-		map[string]string{"encoding": "base64"},
+		map[string]string{
+			"encoding":   "base64",
+			"commitment": "processed",
+		},
 	})
 	if err != nil {
 		return nil, err
@@ -4160,7 +4163,10 @@ func parseLaunchLabPoolData(raw []byte) (virtualA, virtualB, realA, realB, total
 func getLaunchLabSnapshot(poolAddr string) (*curveSnap, error) {
 	data, err := rpc("getAccountInfo", []interface{}{
 		poolAddr,
-		map[string]string{"encoding": "base64"},
+		map[string]string{
+			"encoding":   "base64",
+			"commitment": "processed",
+		},
 	})
 	if err != nil {
 		return nil, err

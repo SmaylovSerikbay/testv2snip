@@ -256,6 +256,39 @@ func main() {
 	osSig := make(chan os.Signal, 1)
 	signal.Notify(osSig, os.Interrupt)
 	<-osSig
+	log.Println("[EXIT] Останавливаем... ждём закрытия позиций")
+
+	// Перестаём принимать новые сигналы
+	close(signalCh)
+
+	// Даём монитору 30 секунд чтобы закрыть открытые позиции
+	posMu.RLock()
+	open := len(pos)
+	posMu.RUnlock()
+	if open > 0 {
+		log.Printf("[EXIT] Открыто %d позиций, ждём закрытия (до 30с)...", open)
+		deadline := time.After(30 * time.Second)
+		tick := time.NewTicker(2 * time.Second)
+	waitLoop:
+		for {
+			select {
+			case <-deadline:
+				log.Println("[EXIT] Таймаут — завершаем принудительно")
+				break waitLoop
+			case <-tick.C:
+				posMu.RLock()
+				n := len(pos)
+				posMu.RUnlock()
+				if n == 0 {
+					log.Println("[EXIT] Все позиции закрыты")
+					break waitLoop
+				}
+				checkAll(ctx)
+			}
+		}
+		tick.Stop()
+	}
+
 	printStats()
 	cancel()
 	wg.Wait()
@@ -432,7 +465,7 @@ func scrape(ctx context.Context) {
 	tgtMu.Lock()
 	added := 0
 	for w, cnt := range freq {
-		if cnt < 2 {
+		if cnt < 3 {
 			continue
 		}
 		if _, ok := targets[w]; !ok && len(targets) < cfg.MaxTargets {
@@ -748,7 +781,10 @@ func runExecutor(ctx context.Context) {
 		select {
 		case <-ctx.Done():
 			return
-		case sig := <-signalCh:
+		case sig, ok := <-signalCh:
+			if !ok {
+				return
+			}
 			go doBuy(ctx, sig)
 		}
 	}
@@ -1056,9 +1092,9 @@ func checkAll(ctx context.Context) {
 			reason = fmt.Sprintf("TRAIL peak+%.0f%% now+%.0f%%", p.HiPnl*100, pnl*100)
 		case p.HiPnl >= 0.05 && pnl < p.HiPnl-0.03 && pnl <= -cfg.SL:
 			reason = fmt.Sprintf("SL(trail) %.0f%%", pnl*100)
-		case age >= time.Duration(cfg.TimeKillSec)*time.Second && pnl < cfg.TimeKillMin:
+		case age >= time.Duration(cfg.TimeKillSec)*time.Second && pnl < cfg.TimeKillMin && pnl > -cfg.SL:
 			reason = fmt.Sprintf("TIMEKILL %ds pnl=%+.1f%%", int(age.Seconds()), pnl*100)
-		case age >= 45*time.Second && pnl < 0.05:
+		case age >= 120*time.Second && pnl < 0.05:
 			reason = fmt.Sprintf("HARDKILL %ds pnl=%+.1f%%", int(age.Seconds()), pnl*100)
 		}
 		if reason == "" {
@@ -1157,11 +1193,23 @@ func doSell(ctx context.Context, p *Position, reason string) bool {
 	}
 	sellAccs = append(sellAccs, &solana.AccountMeta{PublicKey: bcV2}) // last: bonding_curve_v2
 
-	cuLimit := uint32(250_000)
+	// CloseAccount — возвращает rent (~0.002 SOL) после продажи
+	closeIx := &genericIx{
+		pid: tokProg,
+		dat: []byte{9}, // CloseAccount instruction index
+		accs: []*solana.AccountMeta{
+			{PublicKey: assocUser, IsWritable: true},
+			{PublicKey: user, IsWritable: true},
+			{PublicKey: user, IsSigner: true},
+		},
+	}
+
+	cuLimit := uint32(300_000)
 	ixs := []solana.Instruction{
 		cuLimitIx(cuLimit),
 		cuPriceIx(cfg.PrioLamp * 1_000_000 / uint64(cuLimit)),
 		&genericIx{pid: PumpProgram, dat: data, accs: sellAccs},
+		closeIx,
 	}
 
 	if !cfg.Live {

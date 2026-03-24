@@ -723,6 +723,43 @@ func parsePumpFeeConfigRecipients(data []byte) []solana.PublicKey {
 	return out
 }
 
+func parseAnchorPubkeys(data []byte) []solana.PublicKey {
+	// Generic Anchor account scan: after 8-byte discriminator, many fields are 32-byte pubkeys.
+	if len(data) <= 8 {
+		return nil
+	}
+	out := make([]solana.PublicKey, 0, (len(data)-8)/32)
+	seen := make(map[string]struct{}, (len(data)-8)/32)
+	for off := 8; off+32 <= len(data); off += 32 {
+		var pk solana.PublicKey
+		copy(pk[:], data[off:off+32])
+		zero := true
+		for _, b := range pk {
+			if b != 0 {
+				zero = false
+				break
+			}
+		}
+		if zero {
+			continue
+		}
+		if pk.Equals(solana.SystemProgramID) ||
+			pk.Equals(solana.TokenProgramID) ||
+			pk.Equals(solana.Token2022ProgramID) ||
+			pk.Equals(pumpProgramPK) ||
+			pk.Equals(pumpFeeProgramPK) {
+			continue
+		}
+		s := pk.String()
+		if _, ok := seen[s]; ok {
+			continue
+		}
+		seen[s] = struct{}{}
+		out = append(out, pk)
+	}
+	return out
+}
+
 func buildFeeRecipientCandidates(primary solana.PublicKey, alt []solana.PublicKey) []solana.PublicKey {
 	out := make([]solana.PublicKey, 0, 1+len(alt))
 	seen := make(map[string]struct{}, 1+len(alt))
@@ -742,6 +779,14 @@ func buildFeeRecipientCandidates(primary solana.PublicKey, alt []solana.PublicKe
 		add(pk)
 	}
 	return out
+}
+
+func shortPK(pk solana.PublicKey) string {
+	s := pk.String()
+	if len(s) <= 12 {
+		return s
+	}
+	return s[:6] + ".." + s[len(s)-4:]
 }
 
 func isPumpNotAuthorizedErr(err error) bool {
@@ -1005,6 +1050,7 @@ func swapPumpFun(ctx context.Context, rpcClient *solanarpc.Client, wallet solana
 		complete      bool
 		creator       solana.PublicKey
 		feeAlt        []solana.PublicKey
+		globalRaw     []byte
 		firstErr      error
 	)
 	var wg sync.WaitGroup
@@ -1044,7 +1090,9 @@ func swapPumpFun(ctx context.Context, rpcClient *solanarpc.Client, wallet solana
 			setErr(fmt.Errorf("global account missing"))
 			return
 		}
-		fr, fbps, cfbps, e := parsePumpGlobalFees(gInfo.Value.Data.GetBinary())
+		raw := gInfo.Value.Data.GetBinary()
+		globalRaw = raw
+		fr, fbps, cfbps, e := parsePumpGlobalFees(raw)
 		if e != nil {
 			setErr(e)
 			return
@@ -1072,7 +1120,9 @@ func swapPumpFun(ctx context.Context, rpcClient *solanarpc.Client, wallet solana
 		if e != nil || fInfo == nil || fInfo.Value == nil || fInfo.Value.Data == nil {
 			return
 		}
-		feeAlt = parsePumpFeeConfigRecipients(fInfo.Value.Data.GetBinary())
+		raw := fInfo.Value.Data.GetBinary()
+		feeAlt = append(feeAlt, parsePumpFeeConfigRecipients(raw)...)
+		feeAlt = append(feeAlt, parseAnchorPubkeys(raw)...)
 	}()
 	wg.Wait()
 	if firstErr != nil {
@@ -1135,6 +1185,7 @@ func swapPumpFun(ctx context.Context, rpcClient *solanarpc.Client, wallet solana
 	}
 
 	data := encodePumpBuyExactSolInData(spendableBudget, minOut)
+	feeAlt = append(feeAlt, parseAnchorPubkeys(globalRaw)...)
 	feeRecipients := buildFeeRecipientCandidates(feeRecipient, feeAlt)
 	if len(feeRecipients) == 0 {
 		feeRecipients = []solana.PublicKey{feeRecipient}
@@ -1163,6 +1214,27 @@ func swapPumpFun(ctx context.Context, rpcClient *solanarpc.Client, wallet solana
 		return solana.Signature{}, 0, 0, time.Time{}, fmt.Errorf("blockhash cache cold")
 	}
 
+	refreshCandidates := func() []solana.PublicKey {
+		gInfo, e1 := rpcClient.GetAccountInfoWithOpts(ctx, globalPK, &solanarpc.GetAccountInfoOpts{Encoding: solana.EncodingBase64, Commitment: solanarpc.CommitmentProcessed})
+		fInfo, e2 := rpcClient.GetAccountInfoWithOpts(ctx, feeCfg, &solanarpc.GetAccountInfoOpts{Encoding: solana.EncodingBase64, Commitment: solanarpc.CommitmentProcessed})
+		if e1 != nil || gInfo == nil || gInfo.Value == nil || gInfo.Value.Data == nil {
+			return nil
+		}
+		rawG := gInfo.Value.Data.GetBinary()
+		fr, _, _, e3 := parsePumpGlobalFees(rawG)
+		if e3 != nil {
+			return nil
+		}
+		var alt []solana.PublicKey
+		alt = append(alt, parseAnchorPubkeys(rawG)...)
+		if e2 == nil && fInfo != nil && fInfo.Value != nil && fInfo.Value.Data != nil {
+			rawF := fInfo.Value.Data.GetBinary()
+			alt = append(alt, parsePumpFeeConfigRecipients(rawF)...)
+			alt = append(alt, parseAnchorPubkeys(rawF)...)
+		}
+		return buildFeeRecipientCandidates(fr, alt)
+	}
+
 	var (
 		sig      solana.Signature
 		sentAt   time.Time
@@ -1171,7 +1243,8 @@ func swapPumpFun(ctx context.Context, rpcClient *solanarpc.Client, wallet solana
 		signedAt  time.Time
 		lastErr   error
 	)
-	for i, fr := range feeRecipients {
+	for i := 0; i < len(feeRecipients); i++ {
+		fr := feeRecipients[i]
 		metas := []*solana.AccountMeta{
 			{PublicKey: globalPK, IsSigner: false, IsWritable: false},
 			{PublicKey: fr, IsSigner: false, IsWritable: true},
@@ -1222,8 +1295,16 @@ func swapPumpFun(ctx context.Context, rpcClient *solanarpc.Client, wallet solana
 		}
 		lastErr = e
 		if isPumpNotAuthorizedErr(e) && i+1 < len(feeRecipients) {
-			fmt.Printf("⚠ pump fee recipient rejected, retry %d/%d\n", i+2, len(feeRecipients))
+			fmt.Printf("⚠ pump fee recipient rejected %s, retry %d/%d\n", shortPK(fr), i+2, len(feeRecipients))
 			continue
+		}
+		if isPumpNotAuthorizedErr(e) && i+1 >= len(feeRecipients) {
+			refreshed := refreshCandidates()
+			if len(refreshed) > len(feeRecipients) {
+				feeRecipients = refreshed
+				fmt.Printf("⚠ pump fee recipient list refreshed, retrying (%d candidates)\n", len(feeRecipients))
+				continue
+			}
 		}
 		break
 	}

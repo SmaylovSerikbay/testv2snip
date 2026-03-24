@@ -852,6 +852,13 @@ func doBuy(ctx context.Context, sig Signal) {
 		return
 	}
 
+	rpcWait()
+	bal, bErr := rpcCl.GetBalance(ctx, cfg.Key.PublicKey(), rpc.CommitmentConfirmed)
+	if bErr == nil && bal.Value < cfg.BuyLamp+3_000_000 {
+		log.Printf("[BUY] Баланс слишком мал: %.4f SOL — пропуск", float64(bal.Value)/1e9)
+		return
+	}
+
 	log.Printf("[BUY] Сигнал: %s от %s", short(mint), short(sig.Wallet))
 
 	tokProg := getMintTokenProgram(ctx, sig.Mint)
@@ -1203,7 +1210,7 @@ func doSell(ctx context.Context, p *Position, reason string, cachedState *Bondin
 
 	solOut := calcSolOut(state.VTK, state.VSR, sellAmt)
 	solNet := solOut - solOut/100
-	sellSlip := uint64(5000)
+	sellSlip := uint64(3000)
 	minSol := solNet * (10000 - sellSlip) / 10000
 	pnl := float64(solNet)/float64(p.Spent)*100 - 100
 
@@ -1284,7 +1291,7 @@ func doSell(ctx context.Context, p *Position, reason string, cachedState *Bondin
 	rpcWait()
 	noRetry := uint(0)
 	txSig, err := rpcCl.SendTransactionWithOpts(ctx, tx, rpc.TransactionOpts{
-		SkipPreflight: true,
+		SkipPreflight: false,
 		MaxRetries:    &noRetry,
 	})
 	if err != nil {

@@ -3903,6 +3903,14 @@ func main() {
 			}
 			go func() {
 				defer func() { <-sem }()
+				if liveTradingEnabled() {
+					wallet.mu.Lock()
+					busy := wallet.LiveSlotBusy
+					wallet.mu.Unlock()
+					if busy {
+						return
+					}
+				}
 				traceStart := time.Now()
 				parseDone := traceStart
 				curveDone := traceStart

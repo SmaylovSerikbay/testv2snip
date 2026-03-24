@@ -2821,6 +2821,28 @@ func antiScamCheck(mint, mintAuthorityRef, liquidityVault, creator string, creat
 		}
 	}
 	// РћР±СЏР·Р°С‚РµР»СЊРЅС‹Р№ anti-scam: Сѓ С‚РѕРєРµРЅР° РґРѕР»Р¶РЅР° Р±С‹С‚СЊ С…РѕС‚СЏ Р±С‹ РѕРґРЅР° social-СЃСЃС‹Р»РєР°.
+	if fastAntiScamMode() {
+		badMint, badFreeze, mintErr := rpcMintAuthorities(mint, mintAuthorityRef, extraMintAuth...)
+		if mintErr != nil {
+			if !allowTransientAntiScamMiss(mintErr, "mint") {
+				return false, "mint RPC"
+			}
+		}
+		if badMint {
+			return false, "mintAuthority Р Р…Р Вµ Р С”РЎР‚Р С‘Р Р†Р В°РЎРЏ (РЎвЂЎРЎС“Р В¶Р В°РЎРЏ РЎвЂЎР ВµР С”Р В°Р Р…Р С”Р В°)"
+		}
+		if badFreeze {
+			return false, "freezeAuthority (Р В·Р В°Р СР С•РЎР‚Р С•Р В·Р С”Р В° РЎРѓРЎвЂЎР ВµРЎвЂљР С•Р Р†)"
+		}
+		mintInfo := "mint ok"
+		if mintErr != nil {
+			mintInfo = "mint unknown (RPC miss allowed)"
+		}
+		if solUnknown {
+			return true, fmt.Sprintf("fast anti-scam | %s | dev SOL n/a", mintInfo)
+		}
+		return true, fmt.Sprintf("fast anti-scam | %s | dev %.2f SOL", mintInfo, sol)
+	}
 	okSocial, socialDetail := hasSocialLinksInMetadata(mint)
 	if !okSocial {
 		if !allowTransientAntiScamMiss(fmt.Errorf("%s", socialDetail), "metadata") {

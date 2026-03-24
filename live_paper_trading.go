@@ -102,6 +102,42 @@ func envSignalProfile() string {
 	}
 }
 
+func antiScamAllowRpcMiss() bool {
+	s := strings.TrimSpace(strings.ToLower(os.Getenv("ANTI_SCAM_ALLOW_RPC_MISS")))
+	switch s {
+	case "1", "true", "yes":
+		return true
+	case "0", "false", "no":
+		return false
+	}
+	return envSignalProfile() != "strict"
+}
+
+func antiScamCreatorMinSOL() float64 {
+	if s := strings.TrimSpace(os.Getenv("ANTI_SCAM_CREATOR_MIN_SOL")); s != "" {
+		if v, err := strconv.ParseFloat(s, 64); err == nil && v >= 0.05 && v <= 20 {
+			return v
+		}
+	}
+	switch envSignalProfile() {
+	case "strict":
+		return 1.20
+	case "aggressive":
+		return 0.50
+	default:
+		return 0.80
+	}
+}
+
+func antiScamCreatorMaxSOL() float64 {
+	if s := strings.TrimSpace(os.Getenv("ANTI_SCAM_CREATOR_MAX_SOL")); s != "" {
+		if v, err := strconv.ParseFloat(s, 64); err == nil && v >= 10 && v <= 5000 {
+			return v
+		}
+	}
+	return CREATOR_SOL_SUSPECT
+}
+
 // в•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђ
 //  РљРћРќР¤РР“
 // в•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђ
@@ -2425,18 +2461,18 @@ func rpcTop10HoldersClusterOK(mint, bondingCurve string) (ok bool, detail string
 
 // РўРѕРї-С…РѕР»РґРµСЂС‹: РєСЂРёРІР°СЏ РґРѕР»Р¶РЅР° РґРµСЂР¶Р°С‚СЊ Р»СЊРІРёРЅСѓСЋ РґРѕР»СЋ; РёРЅР°С‡Рµ вЂ” СЂР°Р·РґР°С‡Р°/СЃРєР°Рј-РїР°С‚С‚РµСЂРЅ
 func antiScamThresholds() (creatorMinSOL, creatorMaxSOL, minCurveShare, maxNonCurveShare float64) {
-	creatorMinSOL = CREATOR_SOL_MIN
-	creatorMaxSOL = CREATOR_SOL_SUSPECT
+	creatorMinSOL = antiScamCreatorMinSOL()
+	creatorMaxSOL = antiScamCreatorMaxSOL()
 	minCurveShare = 0.55
 	maxNonCurveShare = MAX_NONCURVE_PCT
 
 	switch envSignalProfile() {
 	case "strict":
-		creatorMinSOL = math.Max(creatorMinSOL, 0.06)
+		creatorMinSOL = math.Max(creatorMinSOL, 1.20)
 		minCurveShare = 0.62
 		maxNonCurveShare = math.Min(maxNonCurveShare, 0.10)
 	case "aggressive":
-		creatorMinSOL = math.Min(creatorMinSOL, 2.0) // РЅРµ РЅРёР¶Рµ 2 SOL
+		creatorMinSOL = math.Max(creatorMinSOL, 0.30)
 		minCurveShare = 0.45
 		maxNonCurveShare = math.Max(maxNonCurveShare, 0.18)
 	}
@@ -2510,21 +2546,33 @@ func antiScamCheck(mint, mintAuthorityRef, liquidityVault, creator string, creat
 	if creator == "" {
 		return false, "РЅРµС‚ pubkey СЃРѕР·РґР°С‚РµР»СЏ"
 	}
-	sol, err := rpcGetBalanceSOLCached(creator, CREATOR_BALANCE_CACHE_TTL)
-	if err != nil {
-		return false, "balance RPC"
-	}
 	creatorMinSOL, creatorMaxSOL, minCurveShare, maxNonCurveShare := antiScamThresholds()
-	if sol < creatorMinSOL {
-		return false, fmt.Sprintf("SOL СЃРѕР·РґР°С‚РµР»СЏ %.3f < %.2f", sol, creatorMinSOL)
+	sol, err := rpcGetBalanceSOLCached(creator, CREATOR_BALANCE_CACHE_TTL)
+	solUnknown := false
+	if err != nil {
+		if !antiScamAllowRpcMiss() {
+			return false, "balance RPC"
+		}
+		solUnknown = true
 	}
-	if sol > creatorMaxSOL {
-		return false, fmt.Sprintf("SOL СЃРѕР·РґР°С‚РµР»СЏ %.1f > %.0f (РїРѕРґРѕР·СЂ.)", sol, creatorMaxSOL)
+	if !solUnknown {
+		if sol < creatorMinSOL {
+			return false, fmt.Sprintf("SOL СЃРѕР·РґР°С‚РµР»СЏ %.3f < %.2f", sol, creatorMinSOL)
+		}
+		if sol > creatorMaxSOL {
+			return false, fmt.Sprintf("SOL СЃРѕР·РґР°С‚РµР»СЏ %.1f > %.0f (РїРѕРґРѕР·СЂ.)", sol, creatorMaxSOL)
+		}
 	}
 	// РћР±СЏР·Р°С‚РµР»СЊРЅС‹Р№ anti-scam: Сѓ С‚РѕРєРµРЅР° РґРѕР»Р¶РЅР° Р±С‹С‚СЊ С…РѕС‚СЏ Р±С‹ РѕРґРЅР° social-СЃСЃС‹Р»РєР°.
 	okSocial, socialDetail := hasSocialLinksInMetadata(mint)
 	if !okSocial {
-		return false, socialDetail
+		d := strings.ToLower(socialDetail)
+		transientMeta := strings.Contains(d, "metadata uri") || strings.Contains(d, "metadata json") || strings.Contains(d, "read error")
+		if !antiScamAllowRpcMiss() || !transientMeta {
+			return false, socialDetail
+		}
+		okSocial = true
+		socialDetail = "social unknown (metadata unavailable)"
 	}
 	if fastAntiScamMode() {
 		badMint, badFreeze, err := rpcMintAuthorities(mint, mintAuthorityRef, extraMintAuth...)
@@ -2542,6 +2590,9 @@ func antiScamCheck(mint, mintAuthorityRef, liquidityVault, creator string, creat
 		}
 		if devCreatedTooMany(creator) {
 			return false, "dev serial rugger (>7 tx/С‡Р°СЃ)"
+		}
+		if solUnknown {
+			return true, fmt.Sprintf("fast anti-scam | %s | dev SOL n/a", socialDetail)
 		}
 		return true, fmt.Sprintf("fast anti-scam | %s | dev %.2f SOL", socialDetail, sol)
 	}
@@ -2626,6 +2677,9 @@ func antiScamCheck(mint, mintAuthorityRef, liquidityVault, creator string, creat
 		case "bundle":
 			bundleDetail = r.detail
 		}
+	}
+	if solUnknown {
+		return true, hd + fmt.Sprintf(" | %s | %s | dev SOL n/a", socialInfo, bundleDetail)
 	}
 	return true, hd + fmt.Sprintf(" | %s | %s | dev %.2f SOL", socialInfo, bundleDetail, sol)
 }

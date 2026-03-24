@@ -3022,6 +3022,18 @@ func (w *Wallet) closePosLive(pos *Position, reason string, spot float64) {
 	if spot > 0 {
 		guard := sellSlippageGuardValue()
 		if estSlip, err := PumpDirectEstimateSellSlippage(pos.Mint, pos.TokenRaw, spot); err == nil && estSlip > guard {
+			riskExit := strings.Contains(reason, "СТОП") ||
+				strings.Contains(reason, "EARLY STOP") ||
+				strings.Contains(reason, "IMPULSE LOST") ||
+				strings.Contains(reason, "ТЕЙК") ||
+				strings.Contains(reason, "LOCK PROFIT") ||
+				strings.Contains(reason, "PROFIT LOCK")
+			if riskExit {
+				consoleMu.Lock()
+				fmt.Printf("%s risk-exit bypass slippage guard %.1f%% > %.0f%% (%s)\n",
+					yellow("⚠"), estSlip*100, guard*100, reason)
+				consoleMu.Unlock()
+			} else {
 			age := time.Since(pos.OpenedAt)
 			if age < 60*time.Second {
 				consoleMu.Lock()
@@ -3038,6 +3050,7 @@ func (w *Wallet) closePosLive(pos *Position, reason string, spot float64) {
 			fmt.Printf("%s stale position %.0fs: bypass slippage guard %.1f%% > %.0f%%\n",
 				yellow("вљ "), age.Seconds(), estSlip*100, guard*100)
 			consoleMu.Unlock()
+			}
 		}
 	}
 	var sig string

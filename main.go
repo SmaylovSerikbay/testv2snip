@@ -1096,9 +1096,8 @@ func checkAll(ctx context.Context) bool {
 			}
 		}
 
-		// Если 10 неудачных продаж подряд — удаляем позицию (монета мёртвая)
-		if p.SellFails >= 10 {
-			log.Printf("[MON] %s удалена (10 неудачных sell)", short(mint))
+		if p.SellFails >= 7 {
+			log.Printf("[MON] %s удалена (7 неудачных sell)", short(mint))
 			delete(pos, mint)
 			continue
 		}

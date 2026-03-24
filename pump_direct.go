@@ -694,6 +694,66 @@ func parsePumpGlobalFees(data []byte) (feeRecipient solana.PublicKey, feeBps, cr
 	return feeRecipient, feeBps, creatorFeeBps, nil
 }
 
+func parsePumpFeeConfigRecipients(data []byte) []solana.PublicKey {
+	// Layout can vary across fee program upgrades, so probe several common offsets.
+	offsets := []int{8, 40, 9, 41, 72, 73}
+	out := make([]solana.PublicKey, 0, len(offsets))
+	seen := make(map[string]struct{}, len(offsets))
+	for _, off := range offsets {
+		if len(data) < off+32 {
+			continue
+		}
+		var pk solana.PublicKey
+		copy(pk[:], data[off:off+32])
+		// Skip obvious non-recipient program IDs.
+		if pk.Equals(solana.SystemProgramID) ||
+			pk.Equals(solana.TokenProgramID) ||
+			pk.Equals(solana.Token2022ProgramID) ||
+			pk.Equals(pumpProgramPK) ||
+			pk.Equals(pumpFeeProgramPK) {
+			continue
+		}
+		s := pk.String()
+		if _, ok := seen[s]; ok {
+			continue
+		}
+		seen[s] = struct{}{}
+		out = append(out, pk)
+	}
+	return out
+}
+
+func buildFeeRecipientCandidates(primary solana.PublicKey, alt []solana.PublicKey) []solana.PublicKey {
+	out := make([]solana.PublicKey, 0, 1+len(alt))
+	seen := make(map[string]struct{}, 1+len(alt))
+	add := func(pk solana.PublicKey) {
+		s := pk.String()
+		if s == "" {
+			return
+		}
+		if _, ok := seen[s]; ok {
+			return
+		}
+		seen[s] = struct{}{}
+		out = append(out, pk)
+	}
+	add(primary)
+	for _, pk := range alt {
+		add(pk)
+	}
+	return out
+}
+
+func isPumpNotAuthorizedErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	s := strings.ToLower(err.Error())
+	return strings.Contains(s, "notauthorized") ||
+		strings.Contains(s, "error number: 6000") ||
+		strings.Contains(s, "custom program error: 0x1770")
+}
+
 func pumpQuoteExpectedTokensBuyExactSolIn(spendableSolIn, vSol, vToken, protocolFeeBps, creatorFeeBps uint64) uint64 {
 	totalFeeBps := protocolFeeBps + creatorFeeBps
 	if totalFeeBps > 10000 {
@@ -928,6 +988,10 @@ func swapPumpFun(ctx context.Context, rpcClient *solanarpc.Client, wallet solana
 	if err != nil {
 		return solana.Signature{}, 0, 0, time.Time{}, err
 	}
+	feeCfg, _, err := derivePumpFeeConfig()
+	if err != nil {
+		return solana.Signature{}, 0, 0, time.Time{}, err
+	}
 
 	var (
 		tokenProgram  solana.PublicKey
@@ -940,6 +1004,7 @@ func swapPumpFun(ctx context.Context, rpcClient *solanarpc.Client, wallet solana
 		realToken     uint64
 		complete      bool
 		creator       solana.PublicKey
+		feeAlt        []solana.PublicKey
 		firstErr      error
 	)
 	var wg sync.WaitGroup
@@ -971,7 +1036,7 @@ func swapPumpFun(ctx context.Context, rpcClient *solanarpc.Client, wallet solana
 			mintDecimals = md
 		}()
 	}
-	wg.Add(2)
+	wg.Add(3)
 	go func() {
 		defer wg.Done()
 		gInfo, e := rpcClient.GetAccountInfoWithOpts(ctx, globalPK, &solanarpc.GetAccountInfoOpts{Encoding: solana.EncodingBase64, Commitment: solanarpc.CommitmentProcessed})
@@ -999,6 +1064,15 @@ func swapPumpFun(ctx context.Context, rpcClient *solanarpc.Client, wallet solana
 			return
 		}
 		vTok, vSol, realToken, complete, creator = vt, vs, rt, c, cr
+	}()
+	go func() {
+		defer wg.Done()
+		// Best-effort fallback source for fee recipient candidates.
+		fInfo, e := rpcClient.GetAccountInfoWithOpts(ctx, feeCfg, &solanarpc.GetAccountInfoOpts{Encoding: solana.EncodingBase64, Commitment: solanarpc.CommitmentProcessed})
+		if e != nil || fInfo == nil || fInfo.Value == nil || fInfo.Value.Data == nil {
+			return
+		}
+		feeAlt = parsePumpFeeConfigRecipients(fInfo.Value.Data.GetBinary())
 	}()
 	wg.Wait()
 	if firstErr != nil {
@@ -1055,38 +1129,16 @@ func swapPumpFun(ctx context.Context, rpcClient *solanarpc.Client, wallet solana
 	if err != nil {
 		return solana.Signature{}, 0, 0, time.Time{}, err
 	}
-	feeCfg, _, err := derivePumpFeeConfig()
-	if err != nil {
-		return solana.Signature{}, 0, 0, time.Time{}, err
-	}
 	bondingCurveV2, _, err := derivePumpBondingCurveV2(mint)
 	if err != nil {
 		return solana.Signature{}, 0, 0, time.Time{}, err
 	}
 
 	data := encodePumpBuyExactSolInData(spendableBudget, minOut)
-
-	metas := []*solana.AccountMeta{
-		{PublicKey: globalPK, IsSigner: false, IsWritable: false},
-		{PublicKey: feeRecipient, IsSigner: false, IsWritable: true},
-		{PublicKey: mint, IsSigner: false, IsWritable: false},
-		{PublicKey: bondingCurve, IsSigner: false, IsWritable: true},
-		{PublicKey: assocBonding, IsSigner: false, IsWritable: true},
-		{PublicKey: assocUser, IsSigner: false, IsWritable: true},
-		{PublicKey: owner, IsSigner: true, IsWritable: true},
-		{PublicKey: solana.SystemProgramID, IsSigner: false, IsWritable: false},
-		{PublicKey: tokenProgram, IsSigner: false, IsWritable: false},
-		{PublicKey: creatorVault, IsSigner: false, IsWritable: true},
-		{PublicKey: eventAuth, IsSigner: false, IsWritable: false},
-		{PublicKey: pumpProgramPK, IsSigner: false, IsWritable: false},
-		{PublicKey: gVol, IsSigner: false, IsWritable: false},
-		{PublicKey: uVol, IsSigner: false, IsWritable: true},
-		{PublicKey: feeCfg, IsSigner: false, IsWritable: false},
-		{PublicKey: pumpFeeProgramPK, IsSigner: false, IsWritable: false},
-		{PublicKey: bondingCurveV2, IsSigner: false, IsWritable: false},
+	feeRecipients := buildFeeRecipientCandidates(feeRecipient, feeAlt)
+	if len(feeRecipients) == 0 {
+		feeRecipients = []solana.PublicKey{feeRecipient}
 	}
-
-	buyIx := solana.NewInstruction(pumpProgramPK, metas, data)
 
 	var preIxs []solana.Instruction
 	if _, err := ensurePumpUserATA(&preIxs, owner, mint, tokenProgram); err != nil {
@@ -1111,34 +1163,72 @@ func swapPumpFun(ctx context.Context, rpcClient *solanarpc.Client, wallet solana
 		return solana.Signature{}, 0, 0, time.Time{}, fmt.Errorf("blockhash cache cold")
 	}
 
-	all := append([]solana.Instruction{}, cuLimitIx, cuPriceIx)
-	all = append(all, preIxs...)
-	all = append(all, buyIx)
-	if shouldUseJitoPath() && jitoMinTipLamports > 0 {
-		tipIx := system.NewTransferInstruction(jitoMinTipLamports, owner, solana.MustPublicKeyFromBase58(jitoTipAccount)).Build()
-		all = append(all, tipIx)
+	var (
+		sig      solana.Signature
+		sentAt   time.Time
+		signingMs int64
+		sendingMs int64
+		signedAt  time.Time
+		lastErr   error
+	)
+	for i, fr := range feeRecipients {
+		metas := []*solana.AccountMeta{
+			{PublicKey: globalPK, IsSigner: false, IsWritable: false},
+			{PublicKey: fr, IsSigner: false, IsWritable: true},
+			{PublicKey: mint, IsSigner: false, IsWritable: false},
+			{PublicKey: bondingCurve, IsSigner: false, IsWritable: true},
+			{PublicKey: assocBonding, IsSigner: false, IsWritable: true},
+			{PublicKey: assocUser, IsSigner: false, IsWritable: true},
+			{PublicKey: owner, IsSigner: true, IsWritable: true},
+			{PublicKey: solana.SystemProgramID, IsSigner: false, IsWritable: false},
+			{PublicKey: tokenProgram, IsSigner: false, IsWritable: false},
+			{PublicKey: creatorVault, IsSigner: false, IsWritable: true},
+			{PublicKey: eventAuth, IsSigner: false, IsWritable: false},
+			{PublicKey: pumpProgramPK, IsSigner: false, IsWritable: false},
+			{PublicKey: gVol, IsSigner: false, IsWritable: false},
+			{PublicKey: uVol, IsSigner: false, IsWritable: true},
+			{PublicKey: feeCfg, IsSigner: false, IsWritable: false},
+			{PublicKey: pumpFeeProgramPK, IsSigner: false, IsWritable: false},
+			{PublicKey: bondingCurveV2, IsSigner: false, IsWritable: false},
+		}
+		buyIx := solana.NewInstruction(pumpProgramPK, metas, data)
+		all := append([]solana.Instruction{}, cuLimitIx, cuPriceIx)
+		all = append(all, preIxs...)
+		all = append(all, buyIx)
+		if shouldUseJitoPath() && jitoMinTipLamports > 0 {
+			tipIx := system.NewTransferInstruction(jitoMinTipLamports, owner, solana.MustPublicKeyFromBase58(jitoTipAccount)).Build()
+			all = append(all, tipIx)
+		}
+		tx, e := solana.NewTransaction(all, cachedBH, solana.TransactionPayer(owner))
+		if e != nil {
+			return solana.Signature{}, 0, 0, time.Time{}, e
+		}
+		if d := pumpBuySignDelay(); d > 0 {
+			time.Sleep(d)
+		}
+		signStart := time.Now()
+		e = signTransactionAsync(tx, owner, wallet)
+		signedAt = time.Now()
+		signingMs = time.Since(signStart).Milliseconds()
+		if e != nil {
+			return solana.Signature{}, 0, 0, time.Time{}, e
+		}
+		sendStart := time.Now()
+		sig, sentAt, e = sendPumpTransaction(ctx, rpcClient, tx)
+		sendingMs = time.Since(sendStart).Milliseconds()
+		if e == nil {
+			lastErr = nil
+			break
+		}
+		lastErr = e
+		if isPumpNotAuthorizedErr(e) && i+1 < len(feeRecipients) {
+			fmt.Printf("⚠ pump fee recipient rejected, retry %d/%d\n", i+2, len(feeRecipients))
+			continue
+		}
+		break
 	}
-
-	tx, err := solana.NewTransaction(all, cachedBH, solana.TransactionPayer(owner))
-	if err != nil {
-		return solana.Signature{}, 0, 0, time.Time{}, err
-	}
-	if d := pumpBuySignDelay(); d > 0 {
-		time.Sleep(d)
-	}
-	signStart := time.Now()
-	err = signTransactionAsync(tx, owner, wallet)
-	signedAt := time.Now()
-	signingMs := time.Since(signStart).Milliseconds()
-	if err != nil {
-		return solana.Signature{}, 0, 0, time.Time{}, err
-	}
-
-	sendStart := time.Now()
-	sig, sentAt, err := sendPumpTransaction(ctx, rpcClient, tx)
-	sendingMs := time.Since(sendStart).Milliseconds()
-	if err != nil {
-		return solana.Signature{}, 0, 0, time.Time{}, err
+	if lastErr != nil {
+		return solana.Signature{}, 0, 0, time.Time{}, lastErr
 	}
 	setLastBuyLatency(buyLatencyBreakdown{
 		FiltersMs:       filtersMs,

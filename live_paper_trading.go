@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/base64"
 	"encoding/binary"
 	"encoding/json"
@@ -9,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"math"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -458,7 +460,9 @@ type NewToken struct {
 	Mint            string
 	BondingCurve    string // pump: bonding curve PDA | launchlab: pool state PDA
 	Sig             string
+	Creator         string
 	Source          string // "pump" | "launchlab" (РїСѓСЃС‚Рѕ = pump)
+	CreateAt        time.Time
 	DetectedAt      time.Time
 	FiltersPassedAt time.Time
 }
@@ -833,7 +837,19 @@ func stakeFromBalance(balance float64) float64 {
 //  RPC РљР›РР•РќРў
 // в•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђ
 
-var httpClient = &http.Client{Timeout: 8 * time.Second}
+var sharedHTTPTransport = &http.Transport{
+	Proxy:                 http.ProxyFromEnvironment,
+	DialContext:           (&net.Dialer{Timeout: 1200 * time.Millisecond, KeepAlive: 30 * time.Second}).DialContext,
+	ForceAttemptHTTP2:     true,
+	MaxIdleConns:          128,
+	MaxIdleConnsPerHost:   32,
+	IdleConnTimeout:       90 * time.Second,
+	TLSHandshakeTimeout:   1200 * time.Millisecond,
+	ExpectContinueTimeout: 200 * time.Millisecond,
+	ResponseHeaderTimeout: 3500 * time.Millisecond,
+}
+var httpClient = &http.Client{Timeout: 8 * time.Second, Transport: sharedHTTPTransport}
+var hotRPCClient = &http.Client{Timeout: 1800 * time.Millisecond, Transport: sharedHTTPTransport}
 var rpcLimiter = make(chan struct{}, RPC_MAX_CONCURRENT)
 var rpcEndpointCursor uint64
 
@@ -999,6 +1015,91 @@ func rpc(method string, params []interface{}) ([]byte, error) {
 		return raw, nil
 	}
 	return nil, fmt.Errorf("rpc failed after retries")
+}
+
+func rpcFast(method string, params []interface{}, timeout time.Duration) ([]byte, error) {
+	body, _ := json.Marshal(map[string]interface{}{
+		"jsonrpc": "2.0", "id": 1,
+		"method": method, "params": params,
+	})
+	urls := heliusRPCURLs()
+	if len(urls) == 0 {
+		return rpc(method, params)
+	}
+	rpcLimiter <- struct{}{}
+	defer func() { <-rpcLimiter }()
+
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+
+	type rpcResult struct {
+		raw []byte
+		err error
+	}
+	results := make(chan rpcResult, len(urls))
+	var wg sync.WaitGroup
+	for _, u := range urls {
+		u := u
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			req, err := http.NewRequestWithContext(ctx, http.MethodPost, u, bytes.NewReader(body))
+			if err != nil {
+				results <- rpcResult{err: err}
+				return
+			}
+			req.Header.Set("Content-Type", "application/json")
+			resp, err := hotRPCClient.Do(req)
+			if err != nil {
+				results <- rpcResult{err: err}
+				return
+			}
+			raw, readErr := io.ReadAll(resp.Body)
+			resp.Body.Close()
+			if readErr != nil {
+				results <- rpcResult{err: readErr}
+				return
+			}
+			if resp.StatusCode == 429 || bytes.Contains(raw, []byte(`"code":-32429`)) {
+				results <- rpcResult{err: fmt.Errorf("rpc rate-limited (-32429)")}
+				return
+			}
+			results <- rpcResult{raw: raw}
+		}()
+	}
+
+	var lastErr error
+	for i := 0; i < len(urls); i++ {
+		select {
+		case r := <-results:
+			if r.err == nil && len(r.raw) > 0 {
+				cancel()
+				go func() {
+					wg.Wait()
+					close(results)
+				}()
+				return r.raw, nil
+			}
+			lastErr = r.err
+		case <-ctx.Done():
+			if lastErr == nil {
+				lastErr = ctx.Err()
+			}
+			go func() {
+				wg.Wait()
+				close(results)
+			}()
+			return nil, lastErr
+		}
+	}
+	go func() {
+		wg.Wait()
+		close(results)
+	}()
+	if lastErr == nil {
+		lastErr = fmt.Errorf("fast rpc failed")
+	}
+	return nil, lastErr
 }
 
 func isRateLimitErr(err error) bool {
@@ -1659,13 +1760,13 @@ type curveSnap struct {
 }
 
 func getCurveSnapshot(bcAddr string) (*curveSnap, error) {
-	data, err := rpc("getAccountInfo", []interface{}{
+	data, err := rpcFast("getAccountInfo", []interface{}{
 		bcAddr,
 		map[string]string{
 			"encoding":   "base64",
 			"commitment": "processed",
 		},
-	})
+	}, 1400*time.Millisecond)
 	if err != nil {
 		return nil, err
 	}
@@ -1964,7 +2065,7 @@ func getTransactionBase64Fast(sig string, wantLogs func([]string) bool) (mint, c
 		tries = 1
 	}
 	for attempt := 0; attempt < tries; attempt++ {
-		data, err := rpc("getTransaction", params("processed"))
+		data, err := rpcFast("getTransaction", params("processed"), 1600*time.Millisecond)
 		if err == nil {
 			mint, creator, createBlockTime, wanted, parseErr := parseTxMintCreatorBase64(data, wantLogs)
 			if parseErr == nil {
@@ -1975,7 +2076,7 @@ func getTransactionBase64Fast(sig string, wantLogs func([]string) bool) (mint, c
 			time.Sleep(time.Duration(60*(attempt+1)) * time.Millisecond)
 		}
 	}
-	data, err := rpc("getTransaction", params("confirmed"))
+	data, err := rpcFast("getTransaction", params("confirmed"), 2*time.Second)
 	if err != nil {
 		return "", "", nil, false, err
 	}
@@ -2085,14 +2186,14 @@ func refillMintFromConfirmed(sig, creator string, createBlockTime *time.Time, wa
 	creatorOut = creator
 	blockTimeOut = createBlockTime
 	for attempt := 0; attempt < 3; attempt++ {
-		data, err := rpc("getTransaction", []interface{}{
+		data, err := rpcFast("getTransaction", []interface{}{
 			sig,
 			map[string]interface{}{
 				"encoding":                       "base64",
 				"maxSupportedTransactionVersion": 0,
 				"commitment":                     "confirmed",
 			},
-		})
+		}, 2*time.Second)
 		if err == nil {
 			mint, parsedCreator, bt, ok, parseErr := parseTxMintCreatorBase64(data, wantLogs)
 			if parseErr != nil {
@@ -2984,6 +3085,186 @@ func pumpCreateFromLogs(logs []string) bool {
 	return false
 }
 
+func parseWSBase64Envelope(raw json.RawMessage) ([]string, error) {
+	var direct []string
+	if err := json.Unmarshal(raw, &direct); err == nil && len(direct) > 0 && direct[0] != "" {
+		return direct, nil
+	}
+	var nested struct {
+		Transaction []string `json:"transaction"`
+	}
+	if err := json.Unmarshal(raw, &nested); err == nil && len(nested.Transaction) > 0 && nested.Transaction[0] != "" {
+		return nested.Transaction, nil
+	}
+	return nil, fmt.Errorf("empty ws base64 tx")
+}
+
+func parseWSBlockToken(raw json.RawMessage, wantLogs func([]string) bool, tokenSrc string, fallbackBlockTime *time.Time) (NewToken, bool, error) {
+	var row struct {
+		Meta struct {
+			PostTokenBalances []postTokenBal `json:"postTokenBalances"`
+			LogMessages       []string       `json:"logMessages"`
+		} `json:"meta"`
+		Transaction json.RawMessage `json:"transaction"`
+		BlockTime   *int64          `json:"blockTime"`
+	}
+	if err := json.Unmarshal(raw, &row); err != nil {
+		return NewToken{}, false, err
+	}
+	if !wantLogs(row.Meta.LogMessages) {
+		return NewToken{}, false, nil
+	}
+	env, err := parseWSBase64Envelope(row.Transaction)
+	if err != nil {
+		return NewToken{}, false, err
+	}
+	rawTx, err := base64.StdEncoding.DecodeString(env[0])
+	if err != nil {
+		return NewToken{}, false, err
+	}
+	tx, err := solana.TransactionFromDecoder(ag_binary.NewBinDecoder(rawTx))
+	if err != nil {
+		return NewToken{}, false, err
+	}
+	mint := pickMintFromPostBalances(row.Meta.PostTokenBalances)
+	if mint == "" {
+		mint = pickMintFromPublicKeys(tx.Message.AccountKeys)
+	}
+	if mint == "" {
+		return NewToken{}, false, nil
+	}
+	creator := ""
+	if len(tx.Message.AccountKeys) > 0 {
+		creator = tx.Message.AccountKeys[0].String()
+	}
+	createAt := time.Time{}
+	if row.BlockTime != nil && *row.BlockTime > 0 {
+		createAt = time.Unix(*row.BlockTime, 0)
+	} else if fallbackBlockTime != nil {
+		createAt = *fallbackBlockTime
+	}
+	sig := ""
+	if len(tx.Signatures) > 0 {
+		sig = tx.Signatures[0].String()
+	}
+	tok := NewToken{
+		Mint:       mint,
+		Creator:    creator,
+		Sig:        sig,
+		Source:     tokenSrc,
+		CreateAt:   createAt,
+		DetectedAt: time.Now(),
+	}
+	if tokenSrc == "pump" {
+		if bc, err := pumpBondingCurvePDA(mint); err == nil {
+			tok.BondingCurve = bc
+		}
+	}
+	return tok, true, nil
+}
+
+func listenProgramBlocks(programID, prettyLabel string, wantLogs func([]string) bool, ch chan<- NewToken, tokenSrc string) {
+	endpoints := []string{
+		"wss://mainnet.helius-rpc.com/?api-key=" + HELIUS_API_KEY,
+		"wss://atlas-mainnet.helius-rpc.com/?api-key=" + HELIUS_API_KEY,
+	}
+	headers := http.Header{}
+	headers.Set("User-Agent", "Mozilla/5.0")
+	headers.Set("Origin", "https://solana.com")
+	dialer := websocket.Dialer{HandshakeTimeout: 15 * time.Second}
+	backoff := 3 * time.Second
+	ei := 0
+
+	for {
+		url := endpoints[ei%len(endpoints)]
+		ei++
+		fmt.Printf("%s WS-BLOCK [%s] в†’ %s\n", cyan("🔌"), prettyLabel, url[:52]+"...")
+		conn, resp, err := dialer.Dial(url, headers)
+		if err != nil {
+			code := 0
+			if resp != nil {
+				code = resp.StatusCode
+			}
+			if code == 403 {
+				fmt.Println(red("✘ HTTP 403 — пробую другой endpoint..."))
+			} else {
+				fmt.Printf("%s [%s] %v\n", red("✘"), prettyLabel, err)
+			}
+			time.Sleep(backoff)
+			backoff = time.Duration(math.Min(float64(backoff*2), float64(30*time.Second)))
+			continue
+		}
+		backoff = 3 * time.Second
+		fmt.Printf("%s WebSocket-BLOCK — %s\n", green("✓"), prettyLabel)
+
+		conn.WriteJSON(map[string]interface{}{
+			"jsonrpc": "2.0", "id": 1,
+			"method": "blockSubscribe",
+			"params": []interface{}{
+				map[string]interface{}{"mentionsAccountOrProgram": programID},
+				map[string]interface{}{
+					"commitment":                     "processed",
+					"encoding":                       "base64",
+					"transactionDetails":             "full",
+					"showRewards":                    false,
+					"maxSupportedTransactionVersion": 0,
+				},
+			},
+		})
+
+		stop := make(chan struct{})
+		go func() {
+			t := time.NewTicker(20 * time.Second)
+			defer t.Stop()
+			for {
+				select {
+				case <-stop:
+					return
+				case <-t.C:
+					conn.WriteMessage(websocket.PingMessage, nil)
+				}
+			}
+		}()
+
+		for {
+			_, msg, err := conn.ReadMessage()
+			if err != nil {
+				fmt.Printf("%s WS-BLOCK [%s] разорван: %s\n", yellow("⚠"), prettyLabel, err.Error())
+				close(stop)
+				conn.Close()
+				break
+			}
+			var m struct {
+				Params struct {
+					Result struct {
+						Value struct {
+							Block struct {
+								BlockTime    *int64           `json:"blockTime"`
+								Transactions []json.RawMessage `json:"transactions"`
+							} `json:"block"`
+						} `json:"value"`
+					} `json:"result"`
+				} `json:"params"`
+			}
+			if json.Unmarshal(msg, &m) != nil {
+				continue
+			}
+			var bt *time.Time
+			if m.Params.Result.Value.Block.BlockTime != nil && *m.Params.Result.Value.Block.BlockTime > 0 {
+				tm := time.Unix(*m.Params.Result.Value.Block.BlockTime, 0)
+				bt = &tm
+			}
+			for _, rawTx := range m.Params.Result.Value.Block.Transactions {
+				tok, ok, err := parseWSBlockToken(rawTx, wantLogs, tokenSrc, bt)
+				if err != nil || !ok {
+					continue
+				}
+				ch <- tok
+			}
+		}
+	}
+}
+
 // listenProgram вЂ” РїРѕРґРїРёСЃРєР° РЅР° Р»РѕРіРё РѕРґРЅРѕР№ РїСЂРѕРіСЂР°РјРјС‹ (Pump.fun РёР»Рё Raydium LaunchLab).
 func listenProgram(programID, prettyLabel string, wantLogs func([]string) bool, ch chan<- NewToken, tokenSrc string) {
 	endpoints := []string{
@@ -3077,6 +3358,10 @@ func listenProgram(programID, prettyLabel string, wantLogs func([]string) bool, 
 
 // listenPumpWSS вЂ” РѕС‚РґРµР»СЊРЅС‹Р№ WSS-СЃР»СѓС€Р°С‚РµР»СЊ Р»РѕРіРѕРІ Pump.fun РґР»СЏ РјРёРЅРёРјР°Р»СЊРЅРѕР№ Р·Р°РґРµСЂР¶РєРё РЅР° РґРµС‚РµРєС‚Рµ.
 func listenPumpWSS(ch chan<- NewToken) {
+	if liveTradingEnabled() {
+		listenProgramBlocks(PUMP_PROGRAM, "Pump.fun", pumpCreateFromLogs, ch, "pump")
+		return
+	}
 	listenProgram(PUMP_PROGRAM, "Pump.fun", pumpCreateFromLogs, ch, "pump")
 }
 
@@ -4085,9 +4370,18 @@ func main() {
 						return
 					}
 				} else {
-					mint, creator, createAt = parseCreateTx(tok.Sig)
-					if abortIfTooLate(tok, "parse_pump_create_tx") {
-						return
+					if tok.Mint != "" {
+						mint = tok.Mint
+						creator = tok.Creator
+						if !tok.CreateAt.IsZero() {
+							tm := tok.CreateAt
+							createAt = &tm
+						}
+					} else {
+						mint, creator, createAt = parseCreateTx(tok.Sig)
+						if abortIfTooLate(tok, "parse_pump_create_tx") {
+							return
+						}
 					}
 					if mint == "" {
 						logRejectLine("no_mint", "?", "", "РЅРµС‚ mint РІ create tx")
@@ -4098,7 +4392,10 @@ func main() {
 						logRejectLine("not_pump", sym, mint, "mint РЅРµ вЂ¦pump вЂ” РЅРµ pump.fun С‚РѕРєРµРЅ")
 						return
 					}
-					bc, err = pumpBondingCurvePDA(mint)
+					bc = tok.BondingCurve
+					if bc == "" {
+						bc, err = pumpBondingCurvePDA(mint)
+					}
 					if err != nil {
 						logRejectLine("pda_err", "$"+short(mint), mint, err.Error())
 						if !tok.DetectedAt.IsZero() {
@@ -4611,13 +4908,13 @@ func parseLaunchLabPoolData(raw []byte) (virtualA, virtualB, realA, realB, total
 }
 
 func getLaunchLabSnapshot(poolAddr string) (*curveSnap, error) {
-	data, err := rpc("getAccountInfo", []interface{}{
+	data, err := rpcFast("getAccountInfo", []interface{}{
 		poolAddr,
 		map[string]string{
 			"encoding":   "base64",
 			"commitment": "processed",
 		},
-	})
+	}, 1400*time.Millisecond)
 	if err != nil {
 		return nil, err
 	}

@@ -3042,6 +3042,39 @@ func (w *Wallet) closePosLive(pos *Position, reason string, spot float64) {
 		w.mu.Unlock()
 		return
 	}
+
+	// Важно: fallback-продажа может исполниться частично (не весь raw объём).
+	// Перед тем как помечать сделку закрытой, сверяем остаток токена on-chain.
+	remRaw, remErr := PumpDirectTokenRawBalance(pos.Mint)
+	if remErr != nil {
+		consoleMu.Lock()
+		fmt.Printf("%s sell verify failed (%s): keep position open\n", yellow("⚠"), remErr)
+		consoleMu.Unlock()
+		w.mu.Lock()
+		w.Pos[pos.Mint] = pos
+		w.saveActivePositionsLocked()
+		w.mu.Unlock()
+		return
+	}
+	if remRaw > 10 {
+		updated := *pos
+		beforeRaw := pos.TokenRaw
+		if beforeRaw > 0 && remRaw < beforeRaw {
+			k := float64(remRaw) / float64(beforeRaw)
+			updated.Tokens = pos.Tokens * k
+			updated.CapitalUSD = pos.CapitalUSD * k
+		}
+		updated.TokenRaw = remRaw
+		consoleMu.Lock()
+		fmt.Printf("%s partial sell on %s: remaining raw=%d, keep position open\n", yellow("⚠"), pos.Symbol, remRaw)
+		consoleMu.Unlock()
+		w.mu.Lock()
+		w.Pos[pos.Mint] = &updated
+		w.saveActivePositionsLocked()
+		w.mu.Unlock()
+		return
+	}
+
 	syncWalletBalanceUSDFresh(w)
 
 	net := float64(solOut) / 1e9 * solUSD

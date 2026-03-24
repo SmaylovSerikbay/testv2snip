@@ -545,6 +545,14 @@ type Wallet struct {
 	ExitLoss map[string]int
 }
 
+type openEquityEstimate struct {
+	GrossUSD      float64
+	NetUSD        float64
+	UnrealizedPnL float64
+	CountPriced   int
+	CountUnpriced int
+}
+
 type persistedPosition struct {
 	Mint           string    `json:"mint"`
 	BondingCurve   string    `json:"bonding_curve"`
@@ -660,6 +668,61 @@ func (w *Wallet) activePositionSnapshots() []*Position {
 		out = append(out, snapshotPosition(p))
 	}
 	return out
+}
+
+func estimatePositionExitNetUSD(pos *Position) (grossUSD, netUSD float64, ok bool) {
+	if pos == nil || pos.BondingCurve == "" {
+		return 0, 0, false
+	}
+	snap, err := getCurveSnapshotWithRetry(pos.BondingCurve, pos.Source)
+	if err != nil || snap == nil || snap.PriceUSD <= 0 {
+		return 0, 0, false
+	}
+	grossUSD = pos.Tokens * snap.PriceUSD
+	if grossUSD <= 0 {
+		return 0, 0, false
+	}
+	netUSD = grossUSD
+	if pos.Live && pos.TokenRaw > 0 {
+		if estSlip, err := PumpDirectEstimateSellSlippage(pos.Mint, pos.TokenRaw, snap.PriceUSD); err == nil && estSlip > 0 && estSlip < 1 {
+			netUSD = grossUSD * (1 - estSlip)
+		}
+	}
+	netUSD = netUSD*(1-pumpFeePct()) - solanaTxFeeUSD()
+	if netUSD < 0 {
+		netUSD = 0
+	}
+	return grossUSD, netUSD, true
+}
+
+func estimateOpenEquity(pos []*Position) openEquityEstimate {
+	var out openEquityEstimate
+	for _, p := range pos {
+		gross, net, ok := estimatePositionExitNetUSD(p)
+		if !ok {
+			out.CountUnpriced++
+			continue
+		}
+		out.GrossUSD += gross
+		out.NetUSD += net
+		out.UnrealizedPnL += net - p.CapitalUSD
+		out.CountPriced++
+	}
+	return out
+}
+
+func (w *Wallet) resumeLivePosition(pos *Position, why string) {
+	if pos == nil {
+		return
+	}
+	w.mu.Lock()
+	w.Pos[pos.Mint] = pos
+	w.saveActivePositionsLocked()
+	w.mu.Unlock()
+	consoleMu.Lock()
+	fmt.Printf("%s LIVE position resumed | %s | %s\n", yellow("⚠"), pos.Symbol, why)
+	consoleMu.Unlock()
+	go monitor(w, pos.Mint, pos.BondingCurve, pos.Symbol, pos.Source)
 }
 
 func newWallet() *Wallet {
@@ -1413,6 +1476,24 @@ func liveFixedBuySOLValue() float64 {
 		return 0.005
 	}
 	return LIVE_FIXED_BUY_SOL
+}
+
+func liveMinTradeUSD() float64 {
+	if s := strings.TrimSpace(os.Getenv("MIN_LIVE_TRADE_USD")); s != "" {
+		if v, err := strconv.ParseFloat(s, 64); err == nil && v >= 0.5 && v <= 50 {
+			return v
+		}
+	}
+	return 1.0
+}
+
+func minPartialRemainderUSD() float64 {
+	if s := strings.TrimSpace(os.Getenv("MIN_PARTIAL_REMAINDER_USD")); s != "" {
+		if v, err := strconv.ParseFloat(s, 64); err == nil && v >= 0.5 && v <= 50 {
+			return v
+		}
+	}
+	return 1.0
 }
 
 func minFeeReserveSOLValue() float64 {
@@ -2959,6 +3040,14 @@ func (w *Wallet) openLive(tok NewToken, sym string, spot float64, capitalUSD flo
 		consoleMu.Unlock()
 		return false
 	}
+	notionalUSD := solForSwap * solPrice
+	if notionalUSD < liveMinTradeUSD() {
+		consoleMu.Lock()
+		fmt.Printf("%s open reject %s | live_trade_too_small ($%.2f < $%.2f)\n",
+			yellow("вљ "), sym, notionalUSD, liveMinTradeUSD())
+		consoleMu.Unlock()
+		return false
+	}
 	if !atomic.CompareAndSwapInt32(&liveBuyInFlight, 0, 1) {
 		consoleMu.Lock()
 		fmt.Printf("%s open reject %s | buy_in_flight\n", yellow("вљ "), sym)
@@ -3110,10 +3199,7 @@ func (w *Wallet) closePosLive(pos *Position, reason string, spot float64) {
 		fmt.Println(yellow("вљ  LIVE РІС‹С…РѕРґ: С‚РѕР»СЊРєРѕ Pump.fun РЅР° РєСЂРёРІРѕР№ вЂ” СЌС‚Р° РїРѕР·РёС†РёСЏ РЅРµ pump; Р·Р°РєСЂРѕР№ РІСЂСѓС‡РЅСѓСЋ РЅР° DEX."))
 		consoleMu.Unlock()
 		syncWalletBalanceUSDFresh(w)
-		w.mu.Lock()
-		w.Pos[pos.Mint] = pos
-		w.saveActivePositionsLocked()
-		w.mu.Unlock()
+		w.resumeLivePosition(pos, "close skipped: unsupported source")
 		return
 	}
 	// РќРµ РїСЂРѕРґР°С‘Рј РІ СЃР»РёС€РєРѕРј РїР»РѕС…РѕР№ С‚РёРє: РµСЃР»Рё РѕР¶РёРґР°РµРјРѕРµ РїСЂРѕСЃРєР°Р»СЊР·С‹РІР°РЅРёРµ > 10%, Р¶РґС‘Рј СЃР»РµРґСѓСЋС‰РёР№ С†РёРєР».
@@ -3138,10 +3224,7 @@ func (w *Wallet) closePosLive(pos *Position, reason string, spot float64) {
 					fmt.Printf("%s wait better tick: est sell slippage %.1f%% > %.0f%%\n",
 						yellow("вЏё"), estSlip*100, guard*100)
 					consoleMu.Unlock()
-					w.mu.Lock()
-					w.Pos[pos.Mint] = pos
-					w.saveActivePositionsLocked()
-					w.mu.Unlock()
+					w.resumeLivePosition(pos, fmt.Sprintf("sell deferred by slippage guard %.1f%% > %.0f%%", estSlip*100, guard*100))
 					return
 				}
 				consoleMu.Lock()
@@ -3164,10 +3247,7 @@ func (w *Wallet) closePosLive(pos *Position, reason string, spot float64) {
 			activateFeeGuard(60*time.Second, "insufficient funds for fee on sell (need SOL for exit tx)")
 		}
 		syncWalletBalanceUSD(w)
-		w.mu.Lock()
-		w.Pos[pos.Mint] = pos
-		w.saveActivePositionsLocked()
-		w.mu.Unlock()
+		w.resumeLivePosition(pos, "sell failed; monitor re-armed")
 		return
 	}
 
@@ -3178,10 +3258,7 @@ func (w *Wallet) closePosLive(pos *Position, reason string, spot float64) {
 		consoleMu.Lock()
 		fmt.Printf("%s sell verify failed (%s): keep position open\n", yellow("⚠"), remErr)
 		consoleMu.Unlock()
-		w.mu.Lock()
-		w.Pos[pos.Mint] = pos
-		w.saveActivePositionsLocked()
-		w.mu.Unlock()
+		w.resumeLivePosition(pos, "sell verify failed; monitor re-armed")
 		return
 	}
 	if remRaw > 10 {
@@ -3196,10 +3273,7 @@ func (w *Wallet) closePosLive(pos *Position, reason string, spot float64) {
 		consoleMu.Lock()
 		fmt.Printf("%s partial sell on %s: remaining raw=%d, keep position open\n", yellow("⚠"), pos.Symbol, remRaw)
 		consoleMu.Unlock()
-		w.mu.Lock()
-		w.Pos[pos.Mint] = &updated
-		w.saveActivePositionsLocked()
-		w.mu.Unlock()
+		w.resumeLivePosition(&updated, fmt.Sprintf("partial sell; remaining raw=%d", remRaw))
 		return
 	}
 
@@ -3249,6 +3323,7 @@ func (w *Wallet) stats() {
 	if liveTradingEnabled() {
 		syncWalletBalanceUSD(w)
 	}
+	openEst := estimateOpenEquity(w.activePositionSnapshots())
 	w.mu.Lock()
 	wins, total := 0, 0.0
 	for _, t := range w.Closed {
@@ -3266,6 +3341,9 @@ func (w *Wallet) stats() {
 	nOpen := len(w.Pos)
 	bal := w.Balance
 	start := w.Start
+	equity := bal + openEst.NetUSD
+	equityPnL := equity - start
+	equityPct := equityPnL / start * 100
 	lossBk := make(map[string]int)
 	winBk := make(map[string]int)
 	for k, v := range w.ExitLoss {
@@ -3276,11 +3354,25 @@ func (w *Wallet) stats() {
 	}
 	bs := green(fmt.Sprintf("$%.2f", bal))
 	if bal < start {
-		bs = red(fmt.Sprintf("$%.2f", bal))
+		bs = yellow(fmt.Sprintf("$%.2f", bal))
 	}
 	ps := green(fmt.Sprintf("+$%.2f (+%.1f%%)", total, pct))
 	if total < 0 {
 		ps = red(fmt.Sprintf("$%.2f (%.1f%%)", total, pct))
+	}
+	es := green(fmt.Sprintf("+$%.2f (+%.1f%%)", equityPnL, equityPct))
+	if equityPnL < 0 {
+		es = red(fmt.Sprintf("$%.2f (%.1f%%)", equityPnL, equityPct))
+	}
+	openLine := gray("$0.00")
+	if nOpen > 0 || openEst.CountUnpriced > 0 {
+		openLine = green(fmt.Sprintf("+$%.2f", openEst.UnrealizedPnL))
+		if openEst.UnrealizedPnL < 0 {
+			openLine = red(fmt.Sprintf("$%.2f", openEst.UnrealizedPnL))
+		}
+		if openEst.CountUnpriced > 0 {
+			openLine = yellow(fmt.Sprintf("%s (%d unpriced)", openLine, openEst.CountUnpriced))
+		}
 	}
 	w.mu.Unlock()
 
@@ -3293,8 +3385,10 @@ func (w *Wallet) stats() {
 	fmt.Println("\n" + bold("в”Њв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”ђ"))
 	fmt.Println(bold("в”‚  " + title + "                    в”‚"))
 	fmt.Println(bold("в”њв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”¤"))
-	fmt.Printf("в”‚  Р‘Р°Р»Р°РЅСЃ:   %-33sв”‚\n", bs)
-	fmt.Printf("в”‚  PnL:      %-33sв”‚\n", ps)
+	fmt.Printf("в”‚  Free USD: %-33sв”‚\n", bs)
+	fmt.Printf("в”‚  Closed:   %-33sв”‚\n", ps)
+	fmt.Printf("в”‚  Open PnL: %-33sв”‚\n", openLine)
+	fmt.Printf("в”‚  Equity:   %-33sв”‚\n", es)
 	fmt.Printf("в”‚  РЎРґРµР»РѕРє:   %-33sв”‚\n", fmt.Sprintf("%d Р·Р°РєСЂС‹С‚Рѕ | %d РѕС‚РєСЂС‹С‚Рѕ", n, nOpen))
 	fmt.Printf("в”‚  Win/Loss: %-33sв”‚\n",
 		fmt.Sprintf("%s/%s  WR: %.0f%%",
@@ -3548,7 +3642,7 @@ func monitor(w *Wallet, mint, bcAddr, sym, source string) {
 				return
 			}
 			// Recovery: РЅР° +100% С„РёРєСЃРёСЂСѓРµРј РїРѕР»РѕРІРёРЅСѓ, РѕСЃС‚Р°С‚РѕРє РІРµРґС‘Рј С‚СЂРµР№Р»РёРЅРіРѕРј.
-			if livePos && !halfTaken && mult >= 2.0 && tokenRaw > 10 {
+			if livePos && !halfTaken && mult >= 2.0 && tokenRaw > 10 && pos.CapitalUSD*0.5 >= minPartialRemainderUSD() {
 				if sig, soldRaw, solOut, err := PumpDirectSellFraction(mint, 0.5); err == nil && soldRaw > 0 {
 					w.mu.Lock()
 					if p2, ok := w.Pos[mint]; ok {
@@ -3566,6 +3660,9 @@ func monitor(w *Wallet, mint, bcAddr, sym, source string) {
 					fmt.Printf("  %s %-18s | partial +100%%: sold 50%% | out %.4f SOL | %s\n",
 						green("в†—"), sym, float64(solOut)/1e9, gray(sig))
 				}
+			} else if livePos && !halfTaken && mult >= 2.0 && tokenRaw > 10 {
+				fmt.Printf("  %s %-18s | skip partial: remainder would be <$%.2f\n",
+					yellow("вљ "), sym, minPartialRemainderUSD())
 			}
 
 			// РўСЂРµР№Р»РёРЅРі: С‚РѕР»СЊРєРѕ РїРѕСЃР»Рµ TRAIL_MIN_AGE; СЃС‚РѕРї = max(РѕС‚РєР°С‚ РѕС‚ РїРёРєР°, РјРёРЅ. +4% Рє РІС…РѕРґСѓ)

@@ -1148,7 +1148,9 @@ func curveSnapshotRetryTries() int {
 
 func flatExitAfter() time.Duration {
 	if s := strings.TrimSpace(os.Getenv("FLAT_EXIT_AFTER_SEC")); s != "" {
-		if v, err := strconv.Atoi(s); err == nil && v >= 5 && v <= 300 {
+		if v, err := strconv.Atoi(s); err == nil && v == 0 {
+			return 0
+		} else if err == nil && v >= 5 && v <= 300 {
 			return time.Duration(v) * time.Second
 		}
 	}
@@ -1178,7 +1180,9 @@ func flatExitMaxMult() float64 {
 
 func earlyStopWindow() time.Duration {
 	if s := strings.TrimSpace(os.Getenv("EARLY_STOP_WINDOW_SEC")); s != "" {
-		if v, err := strconv.Atoi(s); err == nil && v >= 5 && v <= 180 {
+		if v, err := strconv.Atoi(s); err == nil && v == 0 {
+			return 0
+		} else if err == nil && v >= 5 && v <= 180 {
 			return time.Duration(v) * time.Second
 		}
 	}
@@ -1196,7 +1200,9 @@ func earlyStopLossMult() float64 {
 
 func impulseProtectPeakMult() float64 {
 	if s := strings.TrimSpace(os.Getenv("IMPULSE_PROTECT_PEAK_PCT")); s != "" {
-		if v, err := strconv.ParseFloat(s, 64); err == nil && v >= 0.5 && v <= 50 {
+		if v, err := strconv.ParseFloat(s, 64); err == nil && v == 0 {
+			return 0
+		} else if err == nil && v >= 0.5 && v <= 50 {
 			return 1 + v/100.0
 		}
 	}
@@ -3288,11 +3294,11 @@ func monitor(w *Wallet, mint, bcAddr, sym, source string) {
 			}
 
 			age := time.Since(opened)
-			if age <= earlyStopWin && mult <= earlyStopMult {
+			if earlyStopWin > 0 && age <= earlyStopWin && mult <= earlyStopMult {
 				w.closePos(mint, fmt.Sprintf("EARLY STOP -%.0f%% (%.0fs)", (1-earlyStopMult)*100, earlyStopWin.Seconds()), price)
 				return
 			}
-			if peak >= entry*impulsePeak && mult <= impulseFloor {
+			if impulsePeak > 1 && peak >= entry*impulsePeak && mult <= impulseFloor {
 				w.closePos(mint, fmt.Sprintf("IMPULSE LOST (было +%.1f%%, now %.1f%%)", (impulsePeak-1)*100, (mult-1)*100), price)
 				return
 			}
@@ -3352,7 +3358,7 @@ func monitor(w *Wallet, mint, bcAddr, sym, source string) {
 				w.closePos(mint, "БРЕЙК-ИВН после импульса", price)
 				return
 			}
-			if time.Since(opened) >= flatAfter && mult >= flatMin && mult <= flatMax {
+			if flatAfter > 0 && time.Since(opened) >= flatAfter && mult >= flatMin && mult <= flatMax {
 				w.closePos(mint, fmt.Sprintf("FLAT EXIT (%.0fs, x%.3f)", flatAfter.Seconds(), mult), price)
 				return
 			}

@@ -1108,8 +1108,7 @@ func checkAll(ctx context.Context) bool {
 
 		solOut := calcSolOut(state.VTK, state.VSR, p.Tokens)
 		solNet := solOut - solOut/100
-		rentRefund := uint64(2_039_280)
-		pnl := float64(solNet+rentRefund)/float64(p.Spent) - 1.0
+		pnl := float64(solNet)/float64(p.Spent) - 1.0
 		age := time.Since(p.Entry)
 
 		if pnl > p.HiPnl {

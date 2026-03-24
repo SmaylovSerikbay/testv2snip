@@ -1381,7 +1381,7 @@ func activateFeeGuard(d time.Duration, reason string) {
 
 func maxDrawdownPct() float64 {
 	if s := strings.TrimSpace(os.Getenv("MAX_DRAWDOWN_PCT")); s != "" {
-		if v, err := strconv.ParseFloat(s, 64); err == nil && v >= 1 && v <= 90 {
+		if v, err := strconv.ParseFloat(s, 64); err == nil && v >= 1 && v <= 99 {
 			return v
 		}
 	}
@@ -2748,7 +2748,7 @@ func (w *Wallet) open(tok NewToken, sym string, spot float64) bool {
 		w.mu.Lock()
 		ddPct := maxDrawdownPct()
 		stopBal := w.Start * (1 - ddPct/100.0)
-		if w.Balance <= stopBal {
+		if ddPct < 99 && w.Balance <= stopBal {
 			w.mu.Unlock()
 			consoleMu.Lock()
 			fmt.Printf("%s open reject %s | drawdown_stop (bal=%.2f <= %.2f, max_dd=%.0f%%)\n",

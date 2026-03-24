@@ -1,3 +1,6 @@
 .env
 *.exe
 *.out
+targets.json
+positions.json
+copybot

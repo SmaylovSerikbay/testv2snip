@@ -165,6 +165,10 @@ var (
 	tgtLossMu sync.Mutex
 	tgtLosses = map[string]int{}
 
+	// Per-target buy cooldown (prevent spam from single wallet)
+	tgtCDMu  sync.Mutex
+	tgtCDMap = map[string]time.Time{}
+
 	bhMu    sync.RWMutex
 	bhHash  solana.Hash
 	bhStale int64 // unix seconds when fetched
@@ -851,6 +855,14 @@ func doBuy(ctx context.Context, sig Signal) {
 	if len(cfg.Key) != 64 {
 		return
 	}
+
+	tgtCDMu.Lock()
+	if t, ok := tgtCDMap[sig.Wallet]; ok && time.Since(t) < 2*time.Minute {
+		tgtCDMu.Unlock()
+		return
+	}
+	tgtCDMap[sig.Wallet] = time.Now()
+	tgtCDMu.Unlock()
 
 	rpcWait()
 	bal, bErr := rpcCl.GetBalance(ctx, cfg.Key.PublicKey(), rpc.CommitmentConfirmed)

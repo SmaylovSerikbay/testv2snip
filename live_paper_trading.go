@@ -2093,7 +2093,24 @@ func parseCreateTx(sig string) (mint, creator string, createBlockTime *time.Time
 		return false
 	}
 	mint, creator, createBlockTime, isCreate, err := getTransactionBase64Fast(sig, wantCreate)
-	if err != nil {
+	if err != nil || mint == "" {
+		if data, jsonErr := getTransactionJSONParsedFast(sig); jsonErr == nil {
+			jsonMint, jsonCreator, jsonBlockTime, jsonIsCreate := parseTxMintCreator(data, wantCreate)
+			if creator == "" {
+				creator = jsonCreator
+			}
+			if createBlockTime == nil && jsonBlockTime != nil {
+				createBlockTime = jsonBlockTime
+			}
+			if mint == "" {
+				mint = jsonMint
+			}
+			if !isCreate {
+				isCreate = jsonIsCreate
+			}
+		}
+	}
+	if err != nil && mint == "" {
 		return "", "", nil
 	}
 	if !isCreate {

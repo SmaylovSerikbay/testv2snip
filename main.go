@@ -156,6 +156,11 @@ var (
 	cdMap      = map[string]time.Time{} // mint → last attempt
 	cdDuration = 3 * time.Minute
 
+	// Buy lifecycle: separate context + waitgroup for in-flight buys
+	buyCtx    context.Context
+	buyCancel context.CancelFunc
+	buyWg     sync.WaitGroup
+
 	// Per-target consecutive loss tracking
 	tgtLossMu sync.Mutex
 	tgtLosses = map[string]int{}
@@ -234,6 +239,7 @@ func main() {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
+	buyCtx, buyCancel = context.WithCancel(ctx)
 
 	if hasKey {
 		rpcWait()
@@ -256,10 +262,12 @@ func main() {
 	osSig := make(chan os.Signal, 1)
 	signal.Notify(osSig, os.Interrupt)
 	<-osSig
-	log.Println("[EXIT] Останавливаем... ждём закрытия позиций")
+	log.Println("[EXIT] Останавливаем... отменяем покупки")
 
-	// Перестаём принимать новые сигналы
 	close(signalCh)
+	buyCancel()
+	buyWg.Wait()
+	log.Println("[EXIT] Все покупки завершены, закрываем позиции...")
 
 	// Даём монитору 30 секунд чтобы закрыть открытые позиции
 	posMu.RLock()
@@ -398,7 +406,7 @@ func cachedBH(ctx context.Context) solana.Hash {
 	h := bhHash
 	age := time.Now().Unix() - bhStale
 	bhMu.RUnlock()
-	if age < 40 {
+	if age < 20 {
 		return h
 	}
 	rpcWait()
@@ -465,7 +473,7 @@ func scrape(ctx context.Context) {
 	tgtMu.Lock()
 	added := 0
 	for w, cnt := range freq {
-		if cnt < 3 {
+		if cnt < 2 {
 			continue
 		}
 		if _, ok := targets[w]; !ok && len(targets) < cfg.MaxTargets {
@@ -785,7 +793,11 @@ func runExecutor(ctx context.Context) {
 			if !ok {
 				return
 			}
-			go doBuy(ctx, sig)
+			buyWg.Add(1)
+			go func() {
+				defer buyWg.Done()
+				doBuy(buyCtx, sig)
+			}()
 		}
 	}
 }
@@ -806,9 +818,11 @@ func setMintCooldown(mint string) {
 }
 
 func doBuy(ctx context.Context, sig Signal) {
+	if ctx.Err() != nil {
+		return
+	}
 	mint := sig.Mint.String()
 
-	// ── Cooldown: не заходить в одну монету повторно ──
 	if mintOnCooldown(mint) {
 		return
 	}
@@ -941,8 +955,16 @@ func doBuy(ctx context.Context, sig Signal) {
 
 	setMintCooldown(mint)
 
+	if ctx.Err() != nil {
+		return
+	}
+
 	rpcWait()
-	txSig, err := rpcCl.SendTransactionWithOpts(ctx, tx, rpc.TransactionOpts{SkipPreflight: false})
+	noRetry := uint(0)
+	txSig, err := rpcCl.SendTransactionWithOpts(ctx, tx, rpc.TransactionOpts{
+		SkipPreflight: false,
+		MaxRetries:    &noRetry,
+	})
 	if err != nil {
 		errMsg := fmt.Sprintf("%v", err)
 		if len(errMsg) > 200 {
@@ -1028,19 +1050,30 @@ func confirmTx(ctx context.Context, txSig solana.Signature, tag, mintStr string,
 // ═══════════════════════════════════════════════════════════════════════════════
 
 func runMonitor(ctx context.Context) {
-	t := time.NewTicker(time.Duration(cfg.MonitorMs) * time.Millisecond)
+	normalInterval := time.Duration(cfg.MonitorMs) * time.Millisecond
+	fastInterval := 500 * time.Millisecond
+	t := time.NewTicker(normalInterval)
 	defer t.Stop()
+	fast := false
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case <-t.C:
-			checkAll(ctx)
+			hasProfit := checkAll(ctx)
+			if hasProfit && !fast {
+				t.Reset(fastInterval)
+				fast = true
+			} else if !hasProfit && fast {
+				t.Reset(normalInterval)
+				fast = false
+			}
 		}
 	}
 }
 
-func checkAll(ctx context.Context) {
+func checkAll(ctx context.Context) bool {
+	hasProfit := false
 	posMu.Lock()
 	defer posMu.Unlock()
 
@@ -1063,7 +1096,7 @@ func checkAll(ctx context.Context) {
 			continue
 		}
 
-		state, _, err := readBC(ctx, p.Mint)
+		state, bc, err := readBC(ctx, p.Mint)
 		if err != nil {
 			continue
 		}
@@ -1075,11 +1108,16 @@ func checkAll(ctx context.Context) {
 
 		solOut := calcSolOut(state.VTK, state.VSR, p.Tokens)
 		solNet := solOut - solOut/100
-		pnl := float64(solNet)/float64(p.Spent) - 1.0
+		rentRefund := uint64(2_039_280)
+		pnl := float64(solNet+rentRefund)/float64(p.Spent) - 1.0
 		age := time.Since(p.Entry)
 
 		if pnl > p.HiPnl {
 			p.HiPnl = pnl
+		}
+
+		if pnl > 0.05 {
+			hasProfit = true
 		}
 
 		var reason string
@@ -1103,7 +1141,7 @@ func checkAll(ctx context.Context) {
 
 		p.LastSellTry = time.Now()
 		profitable := pnl > 0
-		ok := doSell(ctx, p, reason)
+		ok := doSell(ctx, p, reason, state, bc)
 		if ok {
 			delete(pos, mint)
 			trackTargetResult(p.Wallet, profitable)
@@ -1111,6 +1149,7 @@ func checkAll(ctx context.Context) {
 			p.SellFails++
 		}
 	}
+	return hasProfit
 }
 
 func trackTargetResult(wallet string, win bool) {
@@ -1130,15 +1169,23 @@ func trackTargetResult(wallet string, win bool) {
 	tgtLossMu.Unlock()
 }
 
-func doSell(ctx context.Context, p *Position, reason string) bool {
+func doSell(ctx context.Context, p *Position, reason string, cachedState *BondingCurve, cachedBC solana.PublicKey) bool {
 	if len(cfg.Key) != 64 {
 		return false
 	}
 
 	mintStr := p.Mint.String()
-	state, bc, err := readBC(ctx, p.Mint)
-	if err != nil || state.Done {
-		return false
+	var state *BondingCurve
+	var bc solana.PublicKey
+	if cachedState != nil {
+		state = cachedState
+		bc = cachedBC
+	} else {
+		var err error
+		state, bc, err = readBC(ctx, p.Mint)
+		if err != nil || state.Done {
+			return false
+		}
 	}
 
 	user := cfg.Key.PublicKey()
@@ -1157,7 +1204,8 @@ func doSell(ctx context.Context, p *Position, reason string) bool {
 
 	solOut := calcSolOut(state.VTK, state.VSR, sellAmt)
 	solNet := solOut - solOut/100
-	minSol := solNet * (10000 - cfg.Slip) / 10000
+	sellSlip := uint64(5000)
+	minSol := solNet * (10000 - sellSlip) / 10000
 	pnl := float64(solNet)/float64(p.Spent)*100 - 100
 
 	creatorVault, _, _ := solana.FindProgramAddress(
@@ -1235,7 +1283,11 @@ func doSell(ctx context.Context, p *Position, reason string) bool {
 	})
 
 	rpcWait()
-	txSig, err := rpcCl.SendTransactionWithOpts(ctx, tx, rpc.TransactionOpts{SkipPreflight: false})
+	noRetry := uint(0)
+	txSig, err := rpcCl.SendTransactionWithOpts(ctx, tx, rpc.TransactionOpts{
+		SkipPreflight: true,
+		MaxRetries:    &noRetry,
+	})
 	if err != nil {
 		errMsg := fmt.Sprintf("%v", err)
 		if len(errMsg) > 200 {

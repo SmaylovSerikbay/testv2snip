@@ -1176,6 +1176,42 @@ func flatExitMaxMult() float64 {
 	return 1.01
 }
 
+func earlyStopWindow() time.Duration {
+	if s := strings.TrimSpace(os.Getenv("EARLY_STOP_WINDOW_SEC")); s != "" {
+		if v, err := strconv.Atoi(s); err == nil && v >= 5 && v <= 180 {
+			return time.Duration(v) * time.Second
+		}
+	}
+	return 45 * time.Second
+}
+
+func earlyStopLossMult() float64 {
+	if s := strings.TrimSpace(os.Getenv("EARLY_STOP_LOSS_PCT")); s != "" {
+		if v, err := strconv.ParseFloat(s, 64); err == nil && v >= 1 && v <= 50 {
+			return 1 - v/100.0
+		}
+	}
+	return 0.90 // -10%
+}
+
+func impulseProtectPeakMult() float64 {
+	if s := strings.TrimSpace(os.Getenv("IMPULSE_PROTECT_PEAK_PCT")); s != "" {
+		if v, err := strconv.ParseFloat(s, 64); err == nil && v >= 0.5 && v <= 50 {
+			return 1 + v/100.0
+		}
+	}
+	return 1.02 // после +2%
+}
+
+func impulseProtectFloorMult() float64 {
+	if s := strings.TrimSpace(os.Getenv("IMPULSE_PROTECT_FLOOR_PCT")); s != "" {
+		if v, err := strconv.ParseFloat(s, 64); err == nil && v >= -20 && v <= 10 {
+			return 1 + v/100.0
+		}
+	}
+	return 0.995 // не отдаём ниже -0.5% после зафиксированного импульса
+}
+
 func ultraDevFilterEnabled() bool {
 	s := strings.TrimSpace(strings.ToLower(os.Getenv("ULTRA_DEV_FILTER")))
 	if s == "0" || s == "false" || s == "no" {
@@ -3131,6 +3167,10 @@ func monitor(w *Wallet, mint, bcAddr, sym, source string) {
 	flatAfter := flatExitAfter()
 	flatMin := flatExitMinMult()
 	flatMax := flatExitMaxMult()
+	earlyStopWin := earlyStopWindow()
+	earlyStopMult := earlyStopLossMult()
+	impulsePeak := impulseProtectPeakMult()
+	impulseFloor := impulseProtectFloorMult()
 	var lastMult float64
 	var lastPrint time.Time
 	var lastFailPrint time.Time
@@ -3248,6 +3288,14 @@ func monitor(w *Wallet, mint, bcAddr, sym, source string) {
 			}
 
 			age := time.Since(opened)
+			if age <= earlyStopWin && mult <= earlyStopMult {
+				w.closePos(mint, fmt.Sprintf("EARLY STOP -%.0f%% (%.0fs)", (1-earlyStopMult)*100, earlyStopWin.Seconds()), price)
+				return
+			}
+			if peak >= entry*impulsePeak && mult <= impulseFloor {
+				w.closePos(mint, fmt.Sprintf("IMPULSE LOST (было +%.1f%%, now %.1f%%)", (impulsePeak-1)*100, (mult-1)*100), price)
+				return
+			}
 			// Dynamic exit: после +15% фиксируем минимум +5%; также выходим при просадке 15% от пика.
 			if peak >= entry*1.15 {
 				if price <= entry*1.05 {

@@ -1529,11 +1529,17 @@ func swapPumpFunSellAll(ctx context.Context, rpcClient *solanarpc.Client, wallet
 		return solana.Signature{}, 0, err
 	}
 	bal, err := rpcClient.GetTokenAccountBalance(ctx, ata, solanarpc.CommitmentProcessed)
+	if isMissingAccountErr(err) {
+		return solana.Signature{}, 0, nil
+	}
 	if err != nil || bal == nil || bal.Value == nil {
 		return solana.Signature{}, 0, fmt.Errorf("token balance: %w", err)
 	}
 	raw, err := strconv.ParseUint(bal.Value.Amount, 10, 64)
-	if err != nil || raw == 0 {
+	if err != nil {
+		return solana.Signature{}, 0, err
+	}
+	if raw == 0 {
 		return solana.Signature{}, 0, fmt.Errorf("zero token balance")
 	}
 	return swapPumpFunSellWithFallback(ctx, rpcClient, wallet, mint, raw, slipBps)
@@ -1556,6 +1562,15 @@ func isIncorrectProgramIDErr(err error) bool {
 	s := strings.ToLower(err.Error())
 	return strings.Contains(s, "incorrectprogramid") ||
 		strings.Contains(s, "incorrect program id for instruction")
+}
+
+func isMissingAccountErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	s := strings.ToLower(err.Error())
+	return strings.Contains(s, "could not find account") ||
+		strings.Contains(s, "invalid param") && strings.Contains(s, "account")
 }
 
 func buildSellFallbackAmounts(rawAmount uint64) []uint64 {
@@ -1744,11 +1759,17 @@ func PumpDirectSellFraction(mintStr string, fraction float64) (sig string, soldR
 		return "", 0, 0, err
 	}
 	bal, err := rpcPumpDirect().GetTokenAccountBalance(ctx, ata, solanarpc.CommitmentProcessed)
+	if isMissingAccountErr(err) {
+		return "", 0, 0, nil
+	}
 	if err != nil || bal == nil || bal.Value == nil {
 		return "", 0, 0, fmt.Errorf("token balance: %w", err)
 	}
 	raw, err := strconv.ParseUint(bal.Value.Amount, 10, 64)
-	if err != nil || raw == 0 {
+	if err != nil {
+		return "", 0, 0, err
+	}
+	if raw == 0 {
 		return "", 0, 0, fmt.Errorf("zero token balance")
 	}
 	if fraction <= 0 || fraction > 1 {

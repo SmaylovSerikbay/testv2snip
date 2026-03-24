@@ -3280,6 +3280,13 @@ func (w *Wallet) closePosLive(pos *Position, reason string, spot float64) {
 	syncWalletBalanceUSDFresh(w)
 
 	net := float64(solOut) / 1e9 * solUSD
+	if sig == "" && solOut == 0 {
+		// ATA already gone or token balance already zero: close using current spot estimate
+		// instead of showing a fake near-total loss.
+		if spot > 0 {
+			net = exitNetAfterSell(pos.Tokens, spot)
+		}
+	}
 	pnl := net - pos.CapitalUSD
 	pct := 0.0
 	if pos.CapitalUSD > 0 {

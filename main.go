@@ -919,10 +919,29 @@ func doBuy(ctx context.Context, sig Signal) {
 	addPos(sig.Mint, tokOut, cfg.BuyLamp, sig.Wallet, tokProg)
 	statBuys.Add(1)
 
-	go confirmTx(ctx, txSig, "BUY", mint, func() {
-		removePos(mint)
-		log.Printf("[BUY] Удалена фантомная позиция: %s", short(mint))
-	})
+	go func() {
+		confirmTx(ctx, txSig, "BUY", mint, func() {
+			removePos(mint)
+			log.Printf("[BUY] Удалена фантомная позиция: %s", short(mint))
+			return
+		})
+		// После подтверждения — обновить p.Tokens реальным балансом ATA
+		user := cfg.Key.PublicKey()
+		ata := findATA(user, sig.Mint, tokProg)
+		real := getTokenBalance(ctx, ata)
+		if real > 0 {
+			posMu.Lock()
+			if p, ok := pos[mint]; ok {
+				old := p.Tokens
+				p.Tokens = real
+				if old != real {
+					log.Printf("[BUY] Баланс скорр.: %s | %d → %d tok (%.0f%%)",
+						short(mint), old, real, float64(real)/float64(old)*100-100)
+				}
+			}
+			posMu.Unlock()
+		}
+	}()
 }
 
 func addPos(mint solana.PublicKey, tok, spent uint64, wallet string, tokProg solana.PublicKey) {
@@ -1029,15 +1048,17 @@ func checkAll(ctx context.Context) {
 
 		var reason string
 		switch {
-		case pnl >= cfg.TP:
+		case pnl >= cfg.TP && pnl > 0.03:
 			reason = fmt.Sprintf("TP +%.0f%%", pnl*100)
 		case pnl <= -cfg.SL:
 			reason = fmt.Sprintf("SL %.0f%%", pnl*100)
-		case p.HiPnl >= 0.05 && pnl < p.HiPnl-0.03:
-			reason = fmt.Sprintf("TRAIL peak+%.0f%% now%+.0f%%", p.HiPnl*100, pnl*100)
+		case p.HiPnl >= 0.05 && pnl < p.HiPnl-0.03 && pnl > 0.03:
+			reason = fmt.Sprintf("TRAIL peak+%.0f%% now+%.0f%%", p.HiPnl*100, pnl*100)
+		case p.HiPnl >= 0.05 && pnl < p.HiPnl-0.03 && pnl <= -cfg.SL:
+			reason = fmt.Sprintf("SL(trail) %.0f%%", pnl*100)
 		case age >= time.Duration(cfg.TimeKillSec)*time.Second && pnl < cfg.TimeKillMin:
 			reason = fmt.Sprintf("TIMEKILL %ds pnl=%+.1f%%", int(age.Seconds()), pnl*100)
-		case age >= 45*time.Second && pnl < 0.08:
+		case age >= 45*time.Second && pnl < 0.05:
 			reason = fmt.Sprintf("HARDKILL %ds pnl=%+.1f%%", int(age.Seconds()), pnl*100)
 		}
 		if reason == "" {

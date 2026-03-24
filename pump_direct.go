@@ -1577,6 +1577,16 @@ func swapPumpFunSellWithFallback(
 		rawAmount * 95 / 100,
 		rawAmount * 90 / 100,
 		rawAmount * 80 / 100,
+		rawAmount * 70 / 100,
+		rawAmount * 60 / 100,
+		rawAmount * 50 / 100,
+		rawAmount * 40 / 100,
+		rawAmount * 30 / 100,
+		rawAmount * 20 / 100,
+		rawAmount * 10 / 100,
+		rawAmount * 5 / 100,
+		rawAmount * 2 / 100,
+		rawAmount * 1 / 100,
 	}
 
 	var lastErr error

@@ -1,4 +1,4 @@
-package main
+﻿package main
 
 import (
 	"bytes"
@@ -25,8 +25,19 @@ import (
 	"github.com/joho/godotenv"
 )
 
-// Тестовые флаги окружения (для отладки, не для «боевой» охоты за качеством).
+// РўРµСЃС‚РѕРІС‹Рµ С„Р»Р°РіРё РѕРєСЂСѓР¶РµРЅРёСЏ (РґР»СЏ РѕС‚Р»Р°РґРєРё, РЅРµ РґР»СЏ В«Р±РѕРµРІРѕР№В» РѕС…РѕС‚С‹ Р·Р° РєР°С‡РµСЃС‚РІРѕРј).
 func envSkipVelocity() bool { return strings.TrimSpace(os.Getenv("SKIP_VELOCITY")) == "1" }
+func envSkipVelocityValue() (val bool, set bool) {
+	s := strings.TrimSpace(strings.ToLower(os.Getenv("SKIP_VELOCITY")))
+	switch s {
+	case "1", "true", "yes":
+		return true, true
+	case "0", "false", "no":
+		return false, true
+	default:
+		return false, false
+	}
+}
 func envSkipAntiScam() bool { return strings.TrimSpace(os.Getenv("SKIP_ANTI_SCAM")) == "1" }
 func turboModeEnabled() bool {
 	if !(liveTradingEnabled() && envSignalProfile() == "aggressive") {
@@ -39,8 +50,8 @@ func turboModeEnabled() bool {
 	return true
 }
 func shouldSkipVelocity() bool {
-	if envSkipVelocity() {
-		return true
+	if v, set := envSkipVelocityValue(); set {
+		return v
 	}
 	// В turbo-mode режем velocity-check ради скорости входа.
 	return turboModeEnabled()
@@ -56,14 +67,14 @@ func ultraFastEntryMode() bool {
 	if s == "1" || s == "true" || s == "yes" {
 		return true
 	}
-	// По умолчанию в live+aggressive turbo включаем максимально быстрый вход.
+	// РџРѕ СѓРјРѕР»С‡Р°РЅРёСЋ РІ live+aggressive turbo РІРєР»СЋС‡Р°РµРј РјР°РєСЃРёРјР°Р»СЊРЅРѕ Р±С‹СЃС‚СЂС‹Р№ РІС…РѕРґ.
 	return turboModeEnabled()
 }
 func shouldSkipAntiScam() bool {
 	if envSkipAntiScam() {
 		return true
 	}
-	// В live+aggressive по умолчанию режем анти-скам ради скорости входа.
+	// Р’ live+aggressive РїРѕ СѓРјРѕР»С‡Р°РЅРёСЋ СЂРµР¶РµРј Р°РЅС‚Рё-СЃРєР°Рј СЂР°РґРё СЃРєРѕСЂРѕСЃС‚Рё РІС…РѕРґР°.
 	if liveTradingEnabled() && envSignalProfile() == "aggressive" {
 		s := strings.TrimSpace(strings.ToLower(os.Getenv("AUTO_SKIP_ANTI_SCAM")))
 		if s == "0" || s == "false" || s == "no" {
@@ -91,129 +102,129 @@ func envSignalProfile() string {
 	}
 }
 
-// ════════════════════════════════════════════════════
-//  КОНФИГ
-// ════════════════════════════════════════════════════
+// в•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђ
+//  РљРћРќР¤РР“
+// в•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђ
 
 const (
 	HELIUS_API_KEY = "1859e3e5-5d82-476e-a121-8d5f57705cf7"
 	PAPER_BALANCE  = 7.0
-	// Доля баланса на одну сделку: при $7 → ~$1; после плюса ставка считается от нового банка
+	// Р”РѕР»СЏ Р±Р°Р»Р°РЅСЃР° РЅР° РѕРґРЅСѓ СЃРґРµР»РєСѓ: РїСЂРё $7 в†’ ~$1; РїРѕСЃР»Рµ РїР»СЋСЃР° СЃС‚Р°РІРєР° СЃС‡РёС‚Р°РµС‚СЃСЏ РѕС‚ РЅРѕРІРѕРіРѕ Р±Р°РЅРєР°
 	BET_PCT_OF_BALANCE = 1.0 / 7.0
-	MIN_STAKE_USD      = 0.25 // не открываем позицию мельче (пыль / шум)
-	MAX_POSITIONS      = 1    // снайпер: одна позиция — фокус и меньше шума
+	MIN_STAKE_USD      = 0.25 // РЅРµ РѕС‚РєСЂС‹РІР°РµРј РїРѕР·РёС†РёСЋ РјРµР»СЊС‡Рµ (РїС‹Р»СЊ / С€СѓРј)
+	MAX_POSITIONS      = 1    // СЃРЅР°Р№РїРµСЂ: РѕРґРЅР° РїРѕР·РёС†РёСЏ вЂ” С„РѕРєСѓСЃ Рё РјРµРЅСЊС€Рµ С€СѓРјР°
 
-	// Pump.fun: Global fee_basis_points = 100 → 1% с покупки и с продажи (документация программы)
+	// Pump.fun: Global fee_basis_points = 100 в†’ 1% СЃ РїРѕРєСѓРїРєРё Рё СЃ РїСЂРѕРґР°Р¶Рё (РґРѕРєСѓРјРµРЅС‚Р°С†РёСЏ РїСЂРѕРіСЂР°РјРјС‹)
 	PUMP_FEE_BPS = 100
-	// Проскальзывание для paper-оценки (live для pump берётся из pump_direct.go отдельно).
+	// РџСЂРѕСЃРєР°Р»СЊР·С‹РІР°РЅРёРµ РґР»СЏ paper-РѕС†РµРЅРєРё (live РґР»СЏ pump Р±РµСЂС‘С‚СЃСЏ РёР· pump_direct.go РѕС‚РґРµР»СЊРЅРѕ).
 	SLIPPAGE_BPS = 49
-	// Оценка сети на одну подпись (бумага); live — по факту RPC / pump
+	// РћС†РµРЅРєР° СЃРµС‚Рё РЅР° РѕРґРЅСѓ РїРѕРґРїРёСЃСЊ (Р±СѓРјР°РіР°); live вЂ” РїРѕ С„Р°РєС‚Сѓ RPC / pump
 	SOLANA_TX_LAMPORTS = 12_000.0
 
-	PRICE_TICK         = 1500 * time.Millisecond // 1.5s — чаще ловим памп
-	MAX_HOLD           = 300 * time.Second       // 5 минут — даём токену «подышать»
-	FAST_EXIT_AFTER    = 300 * time.Second       // если за 300с нет роста — выходим
-	FAST_EXIT_MIN_MULT = 1.00                    // 0% (без плюса)
-	// Сервисные интервалы/лимиты RPC для защиты от -32429.
+	PRICE_TICK         = 1500 * time.Millisecond // 1.5s вЂ” С‡Р°С‰Рµ Р»РѕРІРёРј РїР°РјРї
+	MAX_HOLD           = 300 * time.Second       // 5 РјРёРЅСѓС‚ вЂ” РґР°С‘Рј С‚РѕРєРµРЅСѓ В«РїРѕРґС‹С€Р°С‚СЊВ»
+	FAST_EXIT_AFTER    = 300 * time.Second       // РµСЃР»Рё Р·Р° 300СЃ РЅРµС‚ СЂРѕСЃС‚Р° вЂ” РІС‹С…РѕРґРёРј
+	FAST_EXIT_MIN_MULT = 1.00                    // 0% (Р±РµР· РїР»СЋСЃР°)
+	// РЎРµСЂРІРёСЃРЅС‹Рµ РёРЅС‚РµСЂРІР°Р»С‹/Р»РёРјРёС‚С‹ RPC РґР»СЏ Р·Р°С‰РёС‚С‹ РѕС‚ -32429.
 	BALANCE_CHECK_INTERVAL = 30 * time.Second
 	RPC_RETRY_BASE_DELAY   = 250 * time.Millisecond
 	RPC_MAX_RETRIES        = 4
 	RPC_MAX_CONCURRENT     = 8
 
-	// Recovery Mode ($3.9): узкое окно + ликвидность, чтобы не брать «пустые» мёртвые пулы.
+	// Recovery Mode ($3.9): СѓР·РєРѕРµ РѕРєРЅРѕ + Р»РёРєРІРёРґРЅРѕСЃС‚СЊ, С‡С‚РѕР±С‹ РЅРµ Р±СЂР°С‚СЊ В«РїСѓСЃС‚С‹РµВ» РјС‘СЂС‚РІС‹Рµ РїСѓР»С‹.
 	SNIPER_CURVE_MIN           = 0.0  // 0.0%
 	SNIPER_CURVE_MAX           = 0.25 // 25%
-	MIN_REAL_SOL               = 0.15 // минимум 0.15 SOL в кривой
-	FAST_HEAVY_CHECK_CURVE_MAX = 0.05 // тяжёлые RPC-фильтры только до 5% кривой
+	MIN_REAL_SOL               = 0.15 // РјРёРЅРёРјСѓРј 0.15 SOL РІ РєСЂРёРІРѕР№
+	FAST_HEAVY_CHECK_CURVE_MAX = 0.05 // С‚СЏР¶С‘Р»С‹Рµ RPC-С„РёР»СЊС‚СЂС‹ С‚РѕР»СЊРєРѕ РґРѕ 5% РєСЂРёРІРѕР№
 	CREATOR_BALANCE_CACHE_TTL  = 5 * time.Minute
 
-	// Анти-скам
-	CREATOR_SOL_MIN       = 2.0 // min 2 SOL у дева — только «жирные», не rug
+	// РђРЅС‚Рё-СЃРєР°Рј
+	CREATOR_SOL_MIN       = 2.0 // min 2 SOL Сѓ РґРµРІР° вЂ” С‚РѕР»СЊРєРѕ В«Р¶РёСЂРЅС‹РµВ», РЅРµ rug
 	CREATOR_SOL_SUSPECT   = 80.0
 	MAX_NONCURVE_PCT      = 0.12
-	TOP10_HOLDERS_MAX_PCT = 0.30 // топ-10 (excl curve) >30% — кластер, сольют
-	DEV_MAX_TXS_HOUR      = 7    // dev >7 tx/час — serial rugger (создаёт 4+ токенов)
+	TOP10_HOLDERS_MAX_PCT = 0.30 // С‚РѕРї-10 (excl curve) >30% вЂ” РєР»Р°СЃС‚РµСЂ, СЃРѕР»СЊСЋС‚
+	DEV_MAX_TXS_HOUR      = 7    // dev >7 tx/С‡Р°СЃ вЂ” serial rugger (СЃРѕР·РґР°С‘С‚ 4+ С‚РѕРєРµРЅРѕРІ)
 
-	// Выходы Final Recovery: hard SL -30%; TP только от +150%.
+	// Р’С‹С…РѕРґС‹ Final Recovery: hard SL -30%; TP С‚РѕР»СЊРєРѕ РѕС‚ +150%.
 	STOP_LOSS_HARD      = 0.70 // -30%
 	STOP_CONFIRM_LVL    = 0.70 // -30%
 	STOP_CONFIRM_N      = 1
-	SELL_SLIPPAGE_GUARD = 0.10            // >10% ожидаемого slip на выходе — подождать следующий тик
-	TAKE_PROFIT         = 1.75            // +75% — фиксируем весь объём
-	TRAIL_ACTIVATE      = 1.30            // трейлинг после +30%
-	TRAILING            = 0.12            // откат 12% от пика (было 16%)
-	TRAIL_MIN_AGE       = 5 * time.Second // был 10s — трейл раньше
-	TRAIL_MIN_PROFIT    = 1.05            // пол +5% (было +10%)
-	BREAKEVEN_ARM       = 1.30            // после +30% ставим стоп в ноль
-	SCRATCH_AFTER       = 2 * time.Minute // не зависаем в флэте слишком долго
-	SCRATCH_IF_BELOW    = 0.97            // скретч только если совсем плоско
-	NO_IMPULSE_AFTER    = 4 * time.Minute // «нет импульса» — после умеренной консолидации
-	NO_IMPULSE_NEED     = 1.04            // пик должен хотя бы +4% к входу, иначе выход
+	SELL_SLIPPAGE_GUARD = 0.10            // >10% РѕР¶РёРґР°РµРјРѕРіРѕ slip РЅР° РІС‹С…РѕРґРµ вЂ” РїРѕРґРѕР¶РґР°С‚СЊ СЃР»РµРґСѓСЋС‰РёР№ С‚РёРє
+	TAKE_PROFIT         = 1.75            // +75% вЂ” С„РёРєСЃРёСЂСѓРµРј РІРµСЃСЊ РѕР±СЉС‘Рј
+	TRAIL_ACTIVATE      = 1.30            // С‚СЂРµР№Р»РёРЅРі РїРѕСЃР»Рµ +30%
+	TRAILING            = 0.12            // РѕС‚РєР°С‚ 12% РѕС‚ РїРёРєР° (Р±С‹Р»Рѕ 16%)
+	TRAIL_MIN_AGE       = 5 * time.Second // Р±С‹Р» 10s вЂ” С‚СЂРµР№Р» СЂР°РЅСЊС€Рµ
+	TRAIL_MIN_PROFIT    = 1.05            // РїРѕР» +5% (Р±С‹Р»Рѕ +10%)
+	BREAKEVEN_ARM       = 1.30            // РїРѕСЃР»Рµ +30% СЃС‚Р°РІРёРј СЃС‚РѕРї РІ РЅРѕР»СЊ
+	SCRATCH_AFTER       = 2 * time.Minute // РЅРµ Р·Р°РІРёСЃР°РµРј РІ С„Р»СЌС‚Рµ СЃР»РёС€РєРѕРј РґРѕР»РіРѕ
+	SCRATCH_IF_BELOW    = 0.97            // СЃРєСЂРµС‚С‡ С‚РѕР»СЊРєРѕ РµСЃР»Рё СЃРѕРІСЃРµРј РїР»РѕСЃРєРѕ
+	NO_IMPULSE_AFTER    = 4 * time.Minute // В«РЅРµС‚ РёРјРїСѓР»СЊСЃР°В» вЂ” РїРѕСЃР»Рµ СѓРјРµСЂРµРЅРЅРѕР№ РєРѕРЅСЃРѕР»РёРґР°С†РёРё
+	NO_IMPULSE_NEED     = 1.04            // РїРёРє РґРѕР»Р¶РµРЅ С…РѕС‚СЏ Р±С‹ +4% Рє РІС…РѕРґСѓ, РёРЅР°С‡Рµ РІС‹С…РѕРґ
 
-	// Если create-транзакция старше — не считаем «только что залистились» (защита от кривых сигналов)
+	// Р•СЃР»Рё create-С‚СЂР°РЅР·Р°РєС†РёСЏ СЃС‚Р°СЂС€Рµ вЂ” РЅРµ СЃС‡РёС‚Р°РµРј В«С‚РѕР»СЊРєРѕ С‡С‚Рѕ Р·Р°Р»РёСЃС‚РёР»РёСЃСЊВ» (Р·Р°С‰РёС‚Р° РѕС‚ РєСЂРёРІС‹С… СЃРёРіРЅР°Р»РѕРІ)
 	MAX_CREATE_TX_AGE       = 30 * time.Minute
 	MAX_READY_TO_SEND_DELAY = 4000 * time.Millisecond
 
-	VELOCITY_PAUSE         = 150 * time.Millisecond // быстрее реакция на импульс
-	VELOCITY_MIN_DPROGRESS = 0.02                   // min +2% за паузу — только первая волна
+	VELOCITY_PAUSE         = 150 * time.Millisecond // Р±С‹СЃС‚СЂРµРµ СЂРµР°РєС†РёСЏ РЅР° РёРјРїСѓР»СЊСЃ
+	VELOCITY_MIN_DPROGRESS = 0.02                   // min +2% Р·Р° РїР°СѓР·Сѓ вЂ” С‚РѕР»СЊРєРѕ РїРµСЂРІР°СЏ РІРѕР»РЅР°
 	VELOCITY_MIN_DREALSOL  = 0.0
-	VELOCITY_MIN_DELTA_DP  = -0.0001 // -0.01% (разрешаем микро-откат на замере)
-	LIVE_FIXED_BUY_SOL     = 0.04    // фиксированная ставка в live
-	LIVE_BUY_BALANCE_SHARE = 0.85    // legacy (не используется в fixed live buy)
+	VELOCITY_MIN_DELTA_DP  = -0.0001 // -0.01% (СЂР°Р·СЂРµС€Р°РµРј РјРёРєСЂРѕ-РѕС‚РєР°С‚ РЅР° Р·Р°РјРµСЂРµ)
+	LIVE_FIXED_BUY_SOL     = 0.04    // С„РёРєСЃРёСЂРѕРІР°РЅРЅР°СЏ СЃС‚Р°РІРєР° РІ live
+	LIVE_BUY_BALANCE_SHARE = 0.85    // legacy (РЅРµ РёСЃРїРѕР»СЊР·СѓРµС‚СЃСЏ РІ fixed live buy)
 	ACTIVE_POSITIONS_FILE  = "current_trades.json"
 
-	// Логи: false = не печатать каждый отсев (только сводка раз в минуту + успешный ВХОД)
+	// Р›РѕРіРё: false = РЅРµ РїРµС‡Р°С‚Р°С‚СЊ РєР°Р¶РґС‹Р№ РѕС‚СЃРµРІ (С‚РѕР»СЊРєРѕ СЃРІРѕРґРєР° СЂР°Р· РІ РјРёРЅСѓС‚Сѓ + СѓСЃРїРµС€РЅС‹Р№ Р’РҐРћР”)
 	VERBOSE_REJECT_LOGS = false
 )
 
-// Wrapped SOL mint (wrap/совместимость)
+// Wrapped SOL mint (wrap/СЃРѕРІРјРµСЃС‚РёРјРѕСЃС‚СЊ)
 const WSOL_MINT = "So11111111111111111111111111111111111111112"
 
-// Частые SPL в tx — не mint pump-монеты (раньше цепляли первый баланс → USDC и т.д.)
+// Р§Р°СЃС‚С‹Рµ SPL РІ tx вЂ” РЅРµ mint pump-РјРѕРЅРµС‚С‹ (СЂР°РЅСЊС€Рµ С†РµРїР»СЏР»Рё РїРµСЂРІС‹Р№ Р±Р°Р»Р°РЅСЃ в†’ USDC Рё С‚.Рґ.)
 var ignoredTokenMints = map[string]bool{
 	WSOL_MINT: true,
 	"EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v": true, // USDC
 	"Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB": true, // USDT
 }
 
-// Счётчики отсева (без спама в консоль)
+// РЎС‡С‘С‚С‡РёРєРё РѕС‚СЃРµРІР° (Р±РµР· СЃРїР°РјР° РІ РєРѕРЅСЃРѕР»СЊ)
 var (
 	rejectMu           sync.Mutex
 	rejectCounts       = map[string]int64{}
-	rejectPrevSnapshot map[string]int64 // для дельты за минуту
-	// Единый вывод: stats и отсев идут из разных горутин — без мьютекса строки перемешиваются
+	rejectPrevSnapshot map[string]int64 // РґР»СЏ РґРµР»СЊС‚С‹ Р·Р° РјРёРЅСѓС‚Сѓ
+	// Р•РґРёРЅС‹Р№ РІС‹РІРѕРґ: stats Рё РѕС‚СЃРµРІ РёРґСѓС‚ РёР· СЂР°Р·РЅС‹С… РіРѕСЂСѓС‚РёРЅ вЂ” Р±РµР· РјСЊСЋС‚РµРєСЃР° СЃС‚СЂРѕРєРё РїРµСЂРµРјРµС€РёРІР°СЋС‚СЃСЏ
 	consoleMu sync.Mutex
 )
 
-// Воронка входа (накопительно с запуска) — видно, до какого шага доходят токены
+// Р’РѕСЂРѕРЅРєР° РІС…РѕРґР° (РЅР°РєРѕРїРёС‚РµР»СЊРЅРѕ СЃ Р·Р°РїСѓСЃРєР°) вЂ” РІРёРґРЅРѕ, РґРѕ РєР°РєРѕРіРѕ С€Р°РіР° РґРѕС…РѕРґСЏС‚ С‚РѕРєРµРЅС‹
 var (
-	funnelInWindow  int64 // прошли кривую+ликвидность, до velocity
-	funnelPassVel   int64 // прошли velocity
-	funnelPassScam  int64 // прошли анти-скам
+	funnelInWindow  int64 // РїСЂРѕС€Р»Рё РєСЂРёРІСѓСЋ+Р»РёРєРІРёРґРЅРѕСЃС‚СЊ, РґРѕ velocity
+	funnelPassVel   int64 // РїСЂРѕС€Р»Рё velocity
+	funnelPassScam  int64 // РїСЂРѕС€Р»Рё Р°РЅС‚Рё-СЃРєР°Рј
 	funnelOpenOK    int64 // open() = true
-	funnelOpenFail  int64 // open() = false (редко: баланс/лимит)
-	liveBuyInFlight int32 // защита от параллельных buy в live
+	funnelOpenFail  int64 // open() = false (СЂРµРґРєРѕ: Р±Р°Р»Р°РЅСЃ/Р»РёРјРёС‚)
+	liveBuyInFlight int32 // Р·Р°С‰РёС‚Р° РѕС‚ РїР°СЂР°Р»Р»РµР»СЊРЅС‹С… buy РІ live
 	feeGuardState   struct {
 		mu    sync.Mutex
 		until time.Time
 	}
 )
 
-// Подписи ключей в минутной сводке (рус./кратко)
+// РџРѕРґРїРёСЃРё РєР»СЋС‡РµР№ РІ РјРёРЅСѓС‚РЅРѕР№ СЃРІРѕРґРєРµ (СЂСѓСЃ./РєСЂР°С‚РєРѕ)
 var rejectLabelRU = map[string]string{
-	"no_mint":  "нет_mint",
-	"not_pump": "не_pump",
-	"stale_tx": "старый_tx",
-	"no_price": "нет_цены",
+	"no_mint":  "РЅРµС‚_mint",
+	"not_pump": "РЅРµ_pump",
+	"stale_tx": "СЃС‚Р°СЂС‹Р№_tx",
+	"no_price": "РЅРµС‚_С†РµРЅС‹",
 	"complete": "graduated",
-	"empty":    "пусто",
-	"late":     "поздно",
-	"low_sol":  "мало_SOL",
+	"empty":    "РїСѓСЃС‚Рѕ",
+	"late":     "РїРѕР·РґРЅРѕ",
+	"low_sol":  "РјР°Р»Рѕ_SOL",
 	"velocity": "velocity",
 	"vel_rpc":  "vel_RPC",
-	"vel_low":  "vel_мало",
-	"vel_late": "vel_поздно",
-	"scam":     "скам",
+	"vel_low":  "vel_РјР°Р»Рѕ",
+	"vel_late": "vel_РїРѕР·РґРЅРѕ",
+	"scam":     "СЃРєР°Рј",
 	"pda_err":  "PDA",
 }
 
@@ -236,9 +247,9 @@ func logRejectLine(key, sym, mint, detail string) {
 		return
 	}
 	if detail != "" {
-		fmt.Printf("%s %-18s %s\n", gray("—"), sym, detail)
+		fmt.Printf("%s %-18s %s\n", gray("вЂ”"), sym, detail)
 	} else {
-		fmt.Printf("%s %-18s %s\n", gray("—"), sym, key)
+		fmt.Printf("%s %-18s %s\n", gray("вЂ”"), sym, key)
 	}
 	if mint != "" {
 		fmt.Printf("   %s %s\n", gray("DEX"), cyan("https://dexscreener.com/solana/"+mint))
@@ -291,13 +302,13 @@ func printRejectSummary() {
 	if len(totalParts) == 0 {
 		return
 	}
-	deltaStr := strings.Join(deltaParts, " · ")
+	deltaStr := strings.Join(deltaParts, " В· ")
 	if deltaStr == "" {
-		deltaStr = "тихо"
+		deltaStr = "С‚РёС…Рѕ"
 	}
 	consoleMu.Lock()
 	defer consoleMu.Unlock()
-	fmt.Printf("%s за мин: %s  |  всего: %s\n", gray("📊 отсев"), deltaStr, strings.Join(totalParts, " · "))
+	fmt.Printf("%s Р·Р° РјРёРЅ: %s  |  РІСЃРµРіРѕ: %s\n", gray("рџ“Љ РѕС‚СЃРµРІ"), deltaStr, strings.Join(totalParts, " В· "))
 }
 
 func printFunnelLine() {
@@ -308,18 +319,18 @@ func printFunnelLine() {
 	sc := atomic.LoadInt64(&funnelPassScam)
 	ok := atomic.LoadInt64(&funnelOpenOK)
 	bad := atomic.LoadInt64(&funnelOpenFail)
-	fmt.Printf("%s воронка (с запуска): в_окне %d → velocity %d → скам %d → вход ok %d",
-		gray("◎"), iw, v, sc, ok)
+	fmt.Printf("%s РІРѕСЂРѕРЅРєР° (СЃ Р·Р°РїСѓСЃРєР°): РІ_РѕРєРЅРµ %d в†’ velocity %d в†’ СЃРєР°Рј %d в†’ РІС…РѕРґ ok %d",
+		gray("в—Ћ"), iw, v, sc, ok)
 	if bad > 0 {
-		fmt.Printf(" · вход fail %d", bad)
+		fmt.Printf(" В· РІС…РѕРґ fail %d", bad)
 	}
 	fmt.Println()
 	if iw == 0 {
-		fmt.Println(gray("   (если «в_окне»=0 — почти всё отсекается до velocity: no_price / пусто / поздно / low_sol)"))
+		fmt.Println(gray("   (РµСЃР»Рё В«РІ_РѕРєРЅРµВ»=0 вЂ” РїРѕС‡С‚Рё РІСЃС‘ РѕС‚СЃРµРєР°РµС‚СЃСЏ РґРѕ velocity: no_price / РїСѓСЃС‚Рѕ / РїРѕР·РґРЅРѕ / low_sol)"))
 	} else if v == 0 {
-		fmt.Println(gray(fmt.Sprintf("   (были в окне кривой, но velocity ещё ни разу не прошёл — узкое место; проф=%s)", envSignalProfile())))
+		fmt.Println(gray(fmt.Sprintf("   (Р±С‹Р»Рё РІ РѕРєРЅРµ РєСЂРёРІРѕР№, РЅРѕ velocity РµС‰С‘ РЅРё СЂР°Р·Сѓ РЅРµ РїСЂРѕС€С‘Р» вЂ” СѓР·РєРѕРµ РјРµСЃС‚Рѕ; РїСЂРѕС„=%s)", envSignalProfile())))
 	} else if sc == 0 {
-		fmt.Println(gray("   (velocity был, анти-скам пока не пропустил ни одного)"))
+		fmt.Println(gray("   (velocity Р±С‹Р», Р°РЅС‚Рё-СЃРєР°Рј РїРѕРєР° РЅРµ РїСЂРѕРїСѓСЃС‚РёР» РЅРё РѕРґРЅРѕРіРѕ)"))
 	}
 }
 
@@ -330,7 +341,7 @@ func printEntryPace() {
 	consoleMu.Lock()
 	defer consoleMu.Unlock()
 	if len(times) < 2 {
-		fmt.Printf("%s входов пока мало для среднего интервала (нужно ≥2)\n", gray("◎"))
+		fmt.Printf("%s РІС…РѕРґРѕРІ РїРѕРєР° РјР°Р»Рѕ РґР»СЏ СЃСЂРµРґРЅРµРіРѕ РёРЅС‚РµСЂРІР°Р»Р° (РЅСѓР¶РЅРѕ в‰Ґ2)\n", gray("в—Ћ"))
 		return
 	}
 	lastGap := times[len(times)-1].Sub(times[len(times)-2])
@@ -352,21 +363,21 @@ func printEntryPace() {
 		return
 	}
 	avg := sum / time.Duration(intervals)
-	fmt.Printf("%s сделки: входов %d · последний интервал %v · средний %v (цель ~2 мин в paper — не гарантия, зависит от сети)\n",
-		gray("◎"), len(times), lastGap.Round(time.Second), avg.Round(time.Second))
+	fmt.Printf("%s СЃРґРµР»РєРё: РІС…РѕРґРѕРІ %d В· РїРѕСЃР»РµРґРЅРёР№ РёРЅС‚РµСЂРІР°Р» %v В· СЃСЂРµРґРЅРёР№ %v (С†РµР»СЊ ~2 РјРёРЅ РІ paper вЂ” РЅРµ РіР°СЂР°РЅС‚РёСЏ, Р·Р°РІРёСЃРёС‚ РѕС‚ СЃРµС‚Рё)\n",
+		gray("в—Ћ"), len(times), lastGap.Round(time.Second), avg.Round(time.Second))
 }
 
 const PUMP_PROGRAM = "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P"
 
-// LAUNCHLAB_PROGRAM — Raydium LaunchLab (mainnet), см. docs.raydium.io
+// LAUNCHLAB_PROGRAM вЂ” Raydium LaunchLab (mainnet), СЃРј. docs.raydium.io
 const LAUNCHLAB_PROGRAM = "LanMV9sAd7wArD4vJFi2qDdfnVhFxYSUg6eADduJ3uj"
 
-// Pump.fun: decimals у монет на кривой = 6 (как в Global / bonding curve)
+// Pump.fun: decimals Сѓ РјРѕРЅРµС‚ РЅР° РєСЂРёРІРѕР№ = 6 (РєР°Рє РІ Global / bonding curve)
 const pumpTokenDecimals = 6
 
-// ════════════════════════════════════════════════════
-//  ЦВЕТА
-// ════════════════════════════════════════════════════
+// в•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђ
+//  Р¦Р’Р•РўРђ
+// в•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђ
 
 var (
 	green  = func(s string) string { return "\033[32m" + s + "\033[0m" }
@@ -377,20 +388,20 @@ var (
 	gray   = func(s string) string { return "\033[90m" + s + "\033[0m" }
 )
 
-// ════════════════════════════════════════════════════
-//  СТРУКТУРЫ
-// ════════════════════════════════════════════════════
+// в•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђ
+//  РЎРўР РЈРљРўРЈР Р«
+// в•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђ
 
 type NewToken struct {
 	Mint            string
 	BondingCurve    string // pump: bonding curve PDA | launchlab: pool state PDA
 	Sig             string
-	Source          string // "pump" | "launchlab" (пусто = pump)
+	Source          string // "pump" | "launchlab" (РїСѓСЃС‚Рѕ = pump)
 	DetectedAt      time.Time
 	FiltersPassedAt time.Time
 }
 
-// postTokenBal — элемент meta.postTokenBalances в getTransaction (jsonParsed)
+// postTokenBal вЂ” СЌР»РµРјРµРЅС‚ meta.postTokenBalances РІ getTransaction (jsonParsed)
 type postTokenBal struct {
 	Mint string `json:"mint"`
 }
@@ -409,13 +420,13 @@ type Position struct {
 	Mint           string
 	BondingCurve   string
 	Symbol         string
-	EntryPrice     float64 // эффективная $/токен на входе (после slip)
-	Tokens         float64 // условное кол-во токенов: USD в пул / EntryPrice
+	EntryPrice     float64 // СЌС„С„РµРєС‚РёРІРЅР°СЏ $/С‚РѕРєРµРЅ РЅР° РІС…РѕРґРµ (РїРѕСЃР»Рµ slip)
+	Tokens         float64 // СѓСЃР»РѕРІРЅРѕРµ РєРѕР»-РІРѕ С‚РѕРєРµРЅРѕРІ: USD РІ РїСѓР» / EntryPrice
 	PeakPrice      float64
-	CapitalUSD     float64 // сколько USD снято с баланса (гросс)
+	CapitalUSD     float64 // СЃРєРѕР»СЊРєРѕ USD СЃРЅСЏС‚Рѕ СЃ Р±Р°Р»Р°РЅСЃР° (РіСЂРѕСЃСЃ)
 	OpenedAt       time.Time
 	BreakevenArmed bool
-	// Боевой режим: фактические лампорты на входе и raw-баланс SPL для продажи
+	// Р‘РѕРµРІРѕР№ СЂРµР¶РёРј: С„Р°РєС‚РёС‡РµСЃРєРёРµ Р»Р°РјРїРѕСЂС‚С‹ РЅР° РІС…РѕРґРµ Рё raw-Р±Р°Р»Р°РЅСЃ SPL РґР»СЏ РїСЂРѕРґР°Р¶Рё
 	Live        bool
 	TokenRaw    uint64
 	BuyLamports uint64
@@ -423,7 +434,7 @@ type Position struct {
 	Source      string // pump | launchlab
 }
 
-// snapshotPosition — копия полей без mutex (для closePos из горутины мониторинга).
+// snapshotPosition вЂ” РєРѕРїРёСЏ РїРѕР»РµР№ Р±РµР· mutex (РґР»СЏ closePos РёР· РіРѕСЂСѓС‚РёРЅС‹ РјРѕРЅРёС‚РѕСЂРёРЅРіР°).
 func snapshotPosition(p *Position) *Position {
 	return &Position{
 		Mint:           p.Mint,
@@ -454,8 +465,8 @@ type ClosedTrade struct {
 	Symbol     string
 	Mint       string
 	CapitalUSD float64
-	ExitNetUSD float64 // что вернулось на кошелёк после всех комиссий
-	FeesUSD    float64 // суммарно комиссии (оценка)
+	ExitNetUSD float64 // С‡С‚Рѕ РІРµСЂРЅСѓР»РѕСЃСЊ РЅР° РєРѕС€РµР»С‘Рє РїРѕСЃР»Рµ РІСЃРµС… РєРѕРјРёСЃСЃРёР№
+	FeesUSD    float64 // СЃСѓРјРјР°СЂРЅРѕ РєРѕРјРёСЃСЃРёРё (РѕС†РµРЅРєР°)
 	PnL        float64
 	PnLPct     float64
 	Reason     string
@@ -468,7 +479,7 @@ type Wallet struct {
 	Start   float64
 	Pos     map[string]*Position
 	Closed  []ClosedTrade
-	// Сводка по типу выхода (учимся на минусах)
+	// РЎРІРѕРґРєР° РїРѕ С‚РёРїСѓ РІС‹С…РѕРґР° (СѓС‡РёРјСЃСЏ РЅР° РјРёРЅСѓСЃР°С…)
 	ExitWin  map[string]int
 	ExitLoss map[string]int
 }
@@ -545,11 +556,11 @@ func (w *Wallet) loadActivePositions() {
 		if pp.Mint == "" || pp.BondingCurve == "" || !pp.Live {
 			continue
 		}
-		// Не поднимаем сильно старые сделки после рестарта: они блокируют новые входы при MAX_POSITIONS=1.
+		// РќРµ РїРѕРґРЅРёРјР°РµРј СЃРёР»СЊРЅРѕ СЃС‚Р°СЂС‹Рµ СЃРґРµР»РєРё РїРѕСЃР»Рµ СЂРµСЃС‚Р°СЂС‚Р°: РѕРЅРё Р±Р»РѕРєРёСЂСѓСЋС‚ РЅРѕРІС‹Рµ РІС…РѕРґС‹ РїСЂРё MAX_POSITIONS=1.
 		if pp.OpenedAt.IsZero() || time.Since(pp.OpenedAt) > (maxHoldDuration()+90*time.Second) {
 			continue
 		}
-		// Если в кошельке уже нет токенов — позиция закрыта, но могла остаться в файле после аварийного рестарта.
+		// Р•СЃР»Рё РІ РєРѕС€РµР»СЊРєРµ СѓР¶Рµ РЅРµС‚ С‚РѕРєРµРЅРѕРІ вЂ” РїРѕР·РёС†РёСЏ Р·Р°РєСЂС‹С‚Р°, РЅРѕ РјРѕРіР»Р° РѕСЃС‚Р°С‚СЊСЃСЏ РІ С„Р°Р№Р»Рµ РїРѕСЃР»Рµ Р°РІР°СЂРёР№РЅРѕРіРѕ СЂРµСЃС‚Р°СЂС‚Р°.
 		if strings.TrimSpace(pp.Source) != "launchlab" {
 			if raw, err := PumpDirectTokenRawBalance(pp.Mint); err == nil {
 				if raw == 0 {
@@ -606,50 +617,50 @@ func newWallet() *Wallet {
 	return w
 }
 
-// bucketExitReason — короткий ярлык для статистики
+// bucketExitReason вЂ” РєРѕСЂРѕС‚РєРёР№ СЏСЂР»С‹Рє РґР»СЏ СЃС‚Р°С‚РёСЃС‚РёРєРё
 func bucketExitReason(reason string) string {
 	switch {
-	case strings.HasPrefix(reason, "ТЕЙК"):
-		return "тейк"
-	case strings.Contains(reason, "СТОП"):
-		return "стоп"
-	case strings.Contains(reason, "ТРЕЙЛИНГ"):
-		return "трейл"
-	case strings.Contains(reason, "БРЕЙК"):
-		return "брейкивн"
-	case strings.Contains(reason, "СКРЕТЧ"):
-		return "скретч"
-	case strings.Contains(reason, "НЕТ ИМПУЛЬСА"):
-		return "нет_импульса"
-	case strings.Contains(reason, "ТАЙМАУТ"):
-		return "таймаут"
-	case strings.Contains(reason, "МИГРАЦИЯ"):
-		return "миграция"
-	case strings.Contains(reason, "УМЕР"):
-		return "нет_данных"
+	case strings.HasPrefix(reason, "РўР•Р™Рљ"):
+		return "С‚РµР№Рє"
+	case strings.Contains(reason, "РЎРўРћРџ"):
+		return "СЃС‚РѕРї"
+	case strings.Contains(reason, "РўР Р•Р™Р›РРќР“"):
+		return "С‚СЂРµР№Р»"
+	case strings.Contains(reason, "Р‘Р Р•Р™Рљ"):
+		return "Р±СЂРµР№РєРёРІРЅ"
+	case strings.Contains(reason, "РЎРљР Р•РўР§"):
+		return "СЃРєСЂРµС‚С‡"
+	case strings.Contains(reason, "РќР•Рў РРњРџРЈР›Р¬РЎРђ"):
+		return "РЅРµС‚_РёРјРїСѓР»СЊСЃР°"
+	case strings.Contains(reason, "РўРђР™РњРђРЈРў"):
+		return "С‚Р°Р№РјР°СѓС‚"
+	case strings.Contains(reason, "РњРР“Р РђР¦РРЇ"):
+		return "РјРёРіСЂР°С†РёСЏ"
+	case strings.Contains(reason, "РЈРњР•Р "):
+		return "РЅРµС‚_РґР°РЅРЅС‹С…"
 	default:
-		return "прочее"
+		return "РїСЂРѕС‡РµРµ"
 	}
 }
 
 func lossLearningHint(reason string) string {
 	switch bucketExitReason(reason) {
-	case "стоп":
-		return "Часто стоп: ужесточить вход (выше curve min / сильнее velocity) или не ослаблять скам."
-	case "скретч", "нет_импульса":
-		return "Слабый разгон: поднять SNIPER_CURVE_MIN или velocity, чтобы не ловить «пустые» импульсы."
-	case "брейкивн":
-		return "Откат после пика: норм защита капитала; при частых — смотреть TRAIL/вход позже по кривой."
-	case "таймаут", "нет_данных":
-		return "Долго без движения / RPC: проверить сеть; при частых таймаутах уменьшить MAX_HOLD."
-	case "миграция":
-		return "Ушло в Raydium: фикс по правилам; не ошибка стратегии."
+	case "СЃС‚РѕРї":
+		return "Р§Р°СЃС‚Рѕ СЃС‚РѕРї: СѓР¶РµСЃС‚РѕС‡РёС‚СЊ РІС…РѕРґ (РІС‹С€Рµ curve min / СЃРёР»СЊРЅРµРµ velocity) РёР»Рё РЅРµ РѕСЃР»Р°Р±Р»СЏС‚СЊ СЃРєР°Рј."
+	case "СЃРєСЂРµС‚С‡", "РЅРµС‚_РёРјРїСѓР»СЊСЃР°":
+		return "РЎР»Р°Р±С‹Р№ СЂР°Р·РіРѕРЅ: РїРѕРґРЅСЏС‚СЊ SNIPER_CURVE_MIN РёР»Рё velocity, С‡С‚РѕР±С‹ РЅРµ Р»РѕРІРёС‚СЊ В«РїСѓСЃС‚С‹РµВ» РёРјРїСѓР»СЊСЃС‹."
+	case "Р±СЂРµР№РєРёРІРЅ":
+		return "РћС‚РєР°С‚ РїРѕСЃР»Рµ РїРёРєР°: РЅРѕСЂРј Р·Р°С‰РёС‚Р° РєР°РїРёС‚Р°Р»Р°; РїСЂРё С‡Р°СЃС‚С‹С… вЂ” СЃРјРѕС‚СЂРµС‚СЊ TRAIL/РІС…РѕРґ РїРѕР·Р¶Рµ РїРѕ РєСЂРёРІРѕР№."
+	case "С‚Р°Р№РјР°СѓС‚", "РЅРµС‚_РґР°РЅРЅС‹С…":
+		return "Р”РѕР»РіРѕ Р±РµР· РґРІРёР¶РµРЅРёСЏ / RPC: РїСЂРѕРІРµСЂРёС‚СЊ СЃРµС‚СЊ; РїСЂРё С‡Р°СЃС‚С‹С… С‚Р°Р№РјР°СѓС‚Р°С… СѓРјРµРЅСЊС€РёС‚СЊ MAX_HOLD."
+	case "РјРёРіСЂР°С†РёСЏ":
+		return "РЈС€Р»Рѕ РІ Raydium: С„РёРєСЃ РїРѕ РїСЂР°РІРёР»Р°Рј; РЅРµ РѕС€РёР±РєР° СЃС‚СЂР°С‚РµРіРёРё."
 	default:
-		return "Смотри полный Reason в логе выхода и сводку ExitLoss в кошельке."
+		return "РЎРјРѕС‚СЂРё РїРѕР»РЅС‹Р№ Reason РІ Р»РѕРіРµ РІС‹С…РѕРґР° Рё СЃРІРѕРґРєСѓ ExitLoss РІ РєРѕС€РµР»СЊРєРµ."
 	}
 }
 
-// Времена успешных входов — оценка среднего интервала между сделками
+// Р’СЂРµРјРµРЅР° СѓСЃРїРµС€РЅС‹С… РІС…РѕРґРѕРІ вЂ” РѕС†РµРЅРєР° СЃСЂРµРґРЅРµРіРѕ РёРЅС‚РµСЂРІР°Р»Р° РјРµР¶РґСѓ СЃРґРµР»РєР°РјРё
 var (
 	recentEntryMu    sync.Mutex
 	recentEntryTimes []time.Time
@@ -664,7 +675,7 @@ func recordSuccessfulEntry() {
 	}
 }
 
-// stakeFromBalance — гросс USD на вход: n% от текущего баланса (сложный процент по сделкам).
+// stakeFromBalance вЂ” РіСЂРѕСЃСЃ USD РЅР° РІС…РѕРґ: n% РѕС‚ С‚РµРєСѓС‰РµРіРѕ Р±Р°Р»Р°РЅСЃР° (СЃР»РѕР¶РЅС‹Р№ РїСЂРѕС†РµРЅС‚ РїРѕ СЃРґРµР»РєР°Рј).
 func stakeFromBalance(balance float64) float64 {
 	if balance <= 0 {
 		return 0
@@ -679,9 +690,9 @@ func stakeFromBalance(balance float64) float64 {
 	return s
 }
 
-// ════════════════════════════════════════════════════
-//  RPC КЛИЕНТ
-// ════════════════════════════════════════════════════
+// в•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђ
+//  RPC РљР›РР•РќРў
+// в•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђ
 
 var httpClient = &http.Client{Timeout: 8 * time.Second}
 var rpcLimiter = make(chan struct{}, RPC_MAX_CONCURRENT)
@@ -708,7 +719,7 @@ var metadataCache struct {
 	m  map[string]metadataCacheEntry
 }
 
-// Курс SOL/USD (CoinGecko, иначе fallback в getSolUSD)
+// РљСѓСЂСЃ SOL/USD (CoinGecko, РёРЅР°С‡Рµ fallback РІ getSolUSD)
 var solUSDPrice struct {
 	mu  sync.RWMutex
 	USD float64
@@ -757,7 +768,7 @@ func refreshSolPriceUSD() {
 		return
 	}
 	if p < 40 || p > 600 {
-		return // отсекаем явный мусор API
+		return // РѕС‚СЃРµРєР°РµРј СЏРІРЅС‹Р№ РјСѓСЃРѕСЂ API
 	}
 	solUSDPrice.mu.Lock()
 	solUSDPrice.USD = p
@@ -771,14 +782,14 @@ func solanaTxFeeUSD() float64 {
 	return (SOLANA_TX_LAMPORTS / 1e9) * getSolUSD()
 }
 
-// Гросс USD → сколько дошло в кривую после 1% pump + комиссии сети на покупку
+// Р“СЂРѕСЃСЃ USD в†’ СЃРєРѕР»СЊРєРѕ РґРѕС€Р»Рѕ РІ РєСЂРёРІСѓСЋ РїРѕСЃР»Рµ 1% pump + РєРѕРјРёСЃСЃРёРё СЃРµС‚Рё РЅР° РїРѕРєСѓРїРєСѓ
 func usdToPoolAfterBuy(grossUSD float64) float64 {
 	return grossUSD - grossUSD*pumpFeePct() - solanaTxFeeUSD()
 }
 
 func effectiveBuyPrice(spot float64) float64 { return spot * (1 + slipPct()) }
 
-// Что вернётся на кошелёк после продажи (1% pump + slip + сеть)
+// Р§С‚Рѕ РІРµСЂРЅС‘С‚СЃСЏ РЅР° РєРѕС€РµР»С‘Рє РїРѕСЃР»Рµ РїСЂРѕРґР°Р¶Рё (1% pump + slip + СЃРµС‚СЊ)
 func exitNetAfterSell(tokens float64, spot float64) float64 {
 	if tokens <= 0 || spot <= 0 {
 		return 0
@@ -805,7 +816,7 @@ func heliusURL() string {
 }
 
 func apiReady() bool {
-	return HELIUS_API_KEY != "ВСТАВЬ_КЛЮЧ_СЮДА" && len(HELIUS_API_KEY) > 10
+	return HELIUS_API_KEY != "Р’РЎРўРђР’Р¬_РљР›Р®Р§_РЎР®Р”Рђ" && len(HELIUS_API_KEY) > 10
 }
 
 func rpc(method string, params []interface{}) ([]byte, error) {
@@ -924,18 +935,18 @@ func (w *Wallet) verifyBuyAsync(mint, sym, sig string, detectedAt time.Time) {
 	if ok {
 		if reason == "pending_confirmation" {
 			consoleMu.Lock()
-			fmt.Printf("%s BUY PENDING %s | sig=%s | waiting network confirmation\n", yellow("⏳"), sym, gray(sig))
+			fmt.Printf("%s BUY PENDING %s | sig=%s | waiting network confirmation\n", yellow("вЏі"), sym, gray(sig))
 			consoleMu.Unlock()
 		} else if !detectedAt.IsZero() {
 			consoleMu.Lock()
 			fmt.Printf("%s Transaction Confirmed | %s | +%dms\n",
-				gray("⏱"), "$"+short(mint), time.Since(detectedAt).Milliseconds())
+				gray("вЏ±"), "$"+short(mint), time.Since(detectedAt).Milliseconds())
 			consoleMu.Unlock()
 		}
 		return
 	}
 	consoleMu.Lock()
-	fmt.Printf("%s BUY FAILED %s | sig=%s | reason=%s\n", red("❌"), sym, gray(sig), reason)
+	fmt.Printf("%s BUY FAILED %s | sig=%s | reason=%s\n", red("вќЊ"), sym, gray(sig), reason)
 	consoleMu.Unlock()
 	w.mu.Lock()
 	if _, exists := w.Pos[mint]; exists {
@@ -1010,7 +1021,7 @@ func noPriceProfitLockMinMult() float64 {
 		}
 	}
 	if ultraFastEntryMode() {
-		return 1.004 // +0.4% достаточно, чтобы не отдавать уже пойманный микро-плюс
+		return 1.004 // +0.4% РґРѕСЃС‚Р°С‚РѕС‡РЅРѕ, С‡С‚РѕР±С‹ РЅРµ РѕС‚РґР°РІР°С‚СЊ СѓР¶Рµ РїРѕР№РјР°РЅРЅС‹Р№ РјРёРєСЂРѕ-РїР»СЋСЃ
 	}
 	return 1.01
 }
@@ -1022,7 +1033,7 @@ func noPricePanicSellPeakMult() float64 {
 		}
 	}
 	if ultraFastEntryMode() {
-		return 1.10 // если уже было +10% и цена пропала — выходим мгновенно
+		return 1.10 // РµСЃР»Рё СѓР¶Рµ Р±С‹Р»Рѕ +10% Рё С†РµРЅР° РїСЂРѕРїР°Р»Р° вЂ” РІС‹С…РѕРґРёРј РјРіРЅРѕРІРµРЅРЅРѕ
 	}
 	return 1.20
 }
@@ -1206,7 +1217,7 @@ func impulseProtectPeakMult() float64 {
 			return 1 + v/100.0
 		}
 	}
-	return 1.02 // после +2%
+	return 1.02 // РїРѕСЃР»Рµ +2%
 }
 
 func impulseProtectFloorMult() float64 {
@@ -1215,7 +1226,7 @@ func impulseProtectFloorMult() float64 {
 			return 1 + v/100.0
 		}
 	}
-	return 0.995 // не отдаём ниже -0.5% после зафиксированного импульса
+	return 0.995 // РЅРµ РѕС‚РґР°С‘Рј РЅРёР¶Рµ -0.5% РїРѕСЃР»Рµ Р·Р°С„РёРєСЃРёСЂРѕРІР°РЅРЅРѕРіРѕ РёРјРїСѓР»СЊСЃР°
 }
 
 func ultraDevFilterEnabled() bool {
@@ -1266,7 +1277,7 @@ func quickPumpTakeProfitMult() float64 {
 		}
 	}
 	if ultraFastEntryMode() {
-		return 1.35 // +35% в первые ~1.5с, потом стандартный TP
+		return 1.35 // +35% РІ РїРµСЂРІС‹Рµ ~1.5СЃ, РїРѕС‚РѕРј СЃС‚Р°РЅРґР°СЂС‚РЅС‹Р№ TP
 	}
 	return takeProfitMult()
 }
@@ -1317,7 +1328,7 @@ func stopConfirmLvlMult() float64 {
 }
 
 func liveFixedBuySOLValue() float64 {
-	// Совместимость: несколько имён переменных для фикс-ставки.
+	// РЎРѕРІРјРµСЃС‚РёРјРѕСЃС‚СЊ: РЅРµСЃРєРѕР»СЊРєРѕ РёРјС‘РЅ РїРµСЂРµРјРµРЅРЅС‹С… РґР»СЏ С„РёРєСЃ-СЃС‚Р°РІРєРё.
 	for _, k := range []string{"FIXED_STAKE_SOL", "FIXED_STAKE", "LIVE_FIXED_BUY_SOL", "BUY_SOL"} {
 		if s := strings.TrimSpace(os.Getenv(k)); s != "" {
 			if v, err := strconv.ParseFloat(s, 64); err == nil && v >= 0.001 && v <= 1.0 {
@@ -1325,7 +1336,7 @@ func liveFixedBuySOLValue() float64 {
 			}
 		}
 	}
-	// Safety fallback: в ultra-fast режиме используем мелкую ставку по умолчанию.
+	// Safety fallback: РІ ultra-fast СЂРµР¶РёРјРµ РёСЃРїРѕР»СЊР·СѓРµРј РјРµР»РєСѓСЋ СЃС‚Р°РІРєСѓ РїРѕ СѓРјРѕР»С‡Р°РЅРёСЋ.
 	if ultraFastEntryMode() {
 		return 0.005
 	}
@@ -1364,7 +1375,7 @@ func activateFeeGuard(d time.Duration, reason string) {
 	feeGuardState.until = time.Now().Add(d)
 	feeGuardState.mu.Unlock()
 	consoleMu.Lock()
-	fmt.Printf("%s fee-guard %ds: %s\n", yellow("⚠"), int(d.Seconds()), reason)
+	fmt.Printf("%s fee-guard %ds: %s\n", yellow("вљ "), int(d.Seconds()), reason)
 	consoleMu.Unlock()
 }
 
@@ -1383,7 +1394,7 @@ func printHotPathTrace(sym, src, status, detail string, parseMs, curveMs, checks
 	}
 	consoleMu.Lock()
 	fmt.Printf("%s HotPath | %s | %s | parse=%dms curve=%dms checks=%dms total=%dms | %s\n",
-		gray("⏱"), sym, src+"/"+status, parseMs, curveMs, checksMs, totalMs, detail)
+		gray("вЏ±"), sym, src+"/"+status, parseMs, curveMs, checksMs, totalMs, detail)
 	consoleMu.Unlock()
 }
 
@@ -1397,22 +1408,22 @@ func abortIfTooLate(tok NewToken, stage string) bool {
 	}
 	consoleMu.Lock()
 	if stage == "velocity_check" {
-		fmt.Printf("⚠️ LATENCY WARNING: High latency (%d ms) stage=%s, continuing\n", d.Milliseconds(), stage)
+		fmt.Printf("вљ пёЏ LATENCY WARNING: High latency (%d ms) stage=%s, continuing\n", d.Milliseconds(), stage)
 		consoleMu.Unlock()
 		return false
 	}
-	fmt.Printf("❌ TRADE ABORTED: Latency too high (%d ms) stage=%s\n", d.Milliseconds(), stage)
+	fmt.Printf("вќЊ TRADE ABORTED: Latency too high (%d ms) stage=%s\n", d.Milliseconds(), stage)
 	consoleMu.Unlock()
 	return true
 }
 
-// ════════════════════════════════════════════════════
-//  PUMP.FUN BONDING CURVE — реальная цена on-chain
+// в•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђ
+//  PUMP.FUN BONDING CURVE вЂ” СЂРµР°Р»СЊРЅР°СЏ С†РµРЅР° on-chain
 //
-//  Pump.fun хранит виртуальные резервы в bonding curve аккаунте.
-//  Цена токена = virtualSolReserves / virtualTokenReserves * SOL_PRICE
-//  Данные: bytes 8-56 аккаунта (после 8-байтного discriminator)
-// ════════════════════════════════════════════════════
+//  Pump.fun С…СЂР°РЅРёС‚ РІРёСЂС‚СѓР°Р»СЊРЅС‹Рµ СЂРµР·РµСЂРІС‹ РІ bonding curve Р°РєРєР°СѓРЅС‚Рµ.
+//  Р¦РµРЅР° С‚РѕРєРµРЅР° = virtualSolReserves / virtualTokenReserves * SOL_PRICE
+//  Р”Р°РЅРЅС‹Рµ: bytes 8-56 Р°РєРєР°СѓРЅС‚Р° (РїРѕСЃР»Рµ 8-Р±Р°Р№С‚РЅРѕРіРѕ discriminator)
+// в•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђ
 
 func parseBondingCurve(data []byte) (*BondingCurve, error) {
 	// Pump.fun bonding curve layout (borsh):
@@ -1437,7 +1448,7 @@ func parseBondingCurve(data []byte) (*BondingCurve, error) {
 	return bc, nil
 }
 
-// curveSnap — снимок кривой для входа и мониторинга
+// curveSnap вЂ” СЃРЅРёРјРѕРє РєСЂРёРІРѕР№ РґР»СЏ РІС…РѕРґР° Рё РјРѕРЅРёС‚РѕСЂРёРЅРіР°
 type curveSnap struct {
 	PriceUSD   float64
 	Progress   float64
@@ -1525,7 +1536,7 @@ func getCurveSnapshotUnified(bcAddr, source string) (*curveSnap, error) {
 	return getCurveSnapshot(bcAddr)
 }
 
-// Несколько попыток: create → кривая/pool иногда появляется в RPC с задержкой.
+// РќРµСЃРєРѕР»СЊРєРѕ РїРѕРїС‹С‚РѕРє: create в†’ РєСЂРёРІР°СЏ/pool РёРЅРѕРіРґР° РїРѕСЏРІР»СЏРµС‚СЃСЏ РІ RPC СЃ Р·Р°РґРµСЂР¶РєРѕР№.
 func getCurveSnapshotWithRetry(bcAddr string, source string) (*curveSnap, error) {
 	var last *curveSnap
 	var lastErr error
@@ -1547,38 +1558,38 @@ func getCurveSnapshotWithRetry(bcAddr string, source string) (*curveSnap, error)
 	return last, lastErr
 }
 
-// curveVelocityOK — второй замер после паузы: нужен заметный приток (покупки/боты).
-// rejectKey пустой при ok; иначе vel_rpc / vel_low / vel_late — для сводки отсева.
+// curveVelocityOK вЂ” РІС‚РѕСЂРѕР№ Р·Р°РјРµСЂ РїРѕСЃР»Рµ РїР°СѓР·С‹: РЅСѓР¶РµРЅ Р·Р°РјРµС‚РЅС‹Р№ РїСЂРёС‚РѕРє (РїРѕРєСѓРїРєРё/Р±РѕС‚С‹).
+// rejectKey РїСѓСЃС‚РѕР№ РїСЂРё ok; РёРЅР°С‡Рµ vel_rpc / vel_low / vel_late вЂ” РґР»СЏ СЃРІРѕРґРєРё РѕС‚СЃРµРІР°.
 func curveVelocityOK(bc string, snap0 *curveSnap, source string, createAt *time.Time) (snap1 *curveSnap, ok bool, detail string, rejectKey string) {
 	if snap0 == nil || snap0.Complete {
-		return nil, false, "нет снимка", "velocity"
+		return nil, false, "РЅРµС‚ СЃРЅРёРјРєР°", "velocity"
 	}
 	if shouldSkipVelocity() {
-		return snap0, true, "SKIP_VELOCITY/AUTO (без паузы и второго замера)", ""
+		return snap0, true, "SKIP_VELOCITY/AUTO (Р±РµР· РїР°СѓР·С‹ Рё РІС‚РѕСЂРѕРіРѕ Р·Р°РјРµСЂР°)", ""
 	}
 	pause, minDP, minDSol, mode := adaptiveVelocityParams(createAt, snap0)
 	time.Sleep(pause)
 	s1, err := getCurveSnapshotWithRetry(bc, source)
 	if err != nil || s1 == nil || s1.PriceUSD <= 0 {
-		return nil, false, "второй снимок кривой", "vel_rpc"
+		return nil, false, "РІС‚РѕСЂРѕР№ СЃРЅРёРјРѕРє РєСЂРёРІРѕР№", "vel_rpc"
 	}
 	if s1.Complete {
-		return nil, false, "кривая complete на втором замере", "complete"
+		return nil, false, "РєСЂРёРІР°СЏ complete РЅР° РІС‚РѕСЂРѕРј Р·Р°РјРµСЂРµ", "complete"
 	}
 	dP := s1.Progress - snap0.Progress
 	dSol := s1.RealSolSOL - snap0.RealSolSOL
-	// Recovery logic: допускаем небольшой отрицательный шум до -0.01%.
+	// Recovery logic: РґРѕРїСѓСЃРєР°РµРј РЅРµР±РѕР»СЊС€РѕР№ РѕС‚СЂРёС†Р°С‚РµР»СЊРЅС‹Р№ С€СѓРј РґРѕ -0.01%.
 	if dP < VELOCITY_MIN_DELTA_DP {
-		return s1, false, fmt.Sprintf("micro-velocity ниже порога (Δ%.3f%% < %.3f%% за %v)", dP*100, VELOCITY_MIN_DELTA_DP*100, pause), "vel_low"
+		return s1, false, fmt.Sprintf("micro-velocity РЅРёР¶Рµ РїРѕСЂРѕРіР° (О”%.3f%% < %.3f%% Р·Р° %v)", dP*100, VELOCITY_MIN_DELTA_DP*100, pause), "vel_low"
 	}
 	if dP < minDP && dSol < minDSol {
-		return s1, false, fmt.Sprintf("мало притока (Δ%.2f%% / +%.3f SOL за %v; проф=%s, need≈Δ%.2f%% или +%.3f SOL)",
+		return s1, false, fmt.Sprintf("РјР°Р»Рѕ РїСЂРёС‚РѕРєР° (О”%.2f%% / +%.3f SOL Р·Р° %v; РїСЂРѕС„=%s, needв‰€О”%.2f%% РёР»Рё +%.3f SOL)",
 			dP*100, dSol, pause, mode, minDP*100, minDSol), "vel_low"
 	}
 	if s1.Progress > SNIPER_CURVE_MAX+0.06 {
-		return s1, false, fmt.Sprintf("кривая уже %.1f%% — поздно", s1.Progress*100), "vel_late"
+		return s1, false, fmt.Sprintf("РєСЂРёРІР°СЏ СѓР¶Рµ %.1f%% вЂ” РїРѕР·РґРЅРѕ", s1.Progress*100), "vel_late"
 	}
-	return s1, true, fmt.Sprintf("Δ%.2f%% / +%.3f SOL за %v (%s)", dP*100, dSol, pause, mode), ""
+	return s1, true, fmt.Sprintf("О”%.2f%% / +%.3f SOL Р·Р° %v (%s)", dP*100, dSol, pause, mode), ""
 }
 
 func adaptiveVelocityParams(createAt *time.Time, snap0 *curveSnap) (pause time.Duration, minDP, minDSol float64, tag string) {
@@ -1599,8 +1610,8 @@ func adaptiveVelocityParams(createAt *time.Time, snap0 *curveSnap) (pause time.D
 		tag = "balanced"
 	}
 
-	// Адаптивность по возрасту create: на старте пулы живут быстрее, можно дать чуть мягче порог;
-	// если уже не «свежак», наоборот ужесточаем, чтобы не лезть в застой.
+	// РђРґР°РїС‚РёРІРЅРѕСЃС‚СЊ РїРѕ РІРѕР·СЂР°СЃС‚Сѓ create: РЅР° СЃС‚Р°СЂС‚Рµ РїСѓР»С‹ Р¶РёРІСѓС‚ Р±С‹СЃС‚СЂРµРµ, РјРѕР¶РЅРѕ РґР°С‚СЊ С‡СѓС‚СЊ РјСЏРіС‡Рµ РїРѕСЂРѕРі;
+	// РµСЃР»Рё СѓР¶Рµ РЅРµ В«СЃРІРµР¶Р°РєВ», РЅР°РѕР±РѕСЂРѕС‚ СѓР¶РµСЃС‚РѕС‡Р°РµРј, С‡С‚РѕР±С‹ РЅРµ Р»РµР·С‚СЊ РІ Р·Р°СЃС‚РѕР№.
 	if createAt != nil {
 		age := time.Since(*createAt)
 		if age <= 15*time.Second {
@@ -1622,13 +1633,13 @@ func adaptiveVelocityParams(createAt *time.Time, snap0 *curveSnap) (pause time.D
 			minDSol *= 1.15
 		}
 	}
-	minDP = math.Max(minDP, 0.02) // не ниже +2% — quality over quantity
+	minDP = math.Max(minDP, 0.02) // РЅРµ РЅРёР¶Рµ +2% вЂ” quality over quantity
 	return pause, minDP, minDSol, tag
 }
 
-// ════════════════════════════════════════════════════
-//  BONDING CURVE PDA — по официальным seeds pump.fun
-// ════════════════════════════════════════════════════
+// в•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђ
+//  BONDING CURVE PDA вЂ” РїРѕ РѕС„РёС†РёР°Р»СЊРЅС‹Рј seeds pump.fun
+// в•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђ
 
 func pumpBondingCurvePDA(mintAddr string) (string, error) {
 	mint, err := solana.PublicKeyFromBase58(mintAddr)
@@ -1646,7 +1657,7 @@ func pumpBondingCurvePDA(mintAddr string) (string, error) {
 	return pda.String(), nil
 }
 
-// pickMintFromPostBalances — приоритет mint …pump; не USDC/wSOL из того же tx
+// pickMintFromPostBalances вЂ” РїСЂРёРѕСЂРёС‚РµС‚ mint вЂ¦pump; РЅРµ USDC/wSOL РёР· С‚РѕРіРѕ Р¶Рµ tx
 func pickMintFromPostBalances(balances []postTokenBal) string {
 	var fallback string
 	for _, b := range balances {
@@ -1672,9 +1683,9 @@ func pickMintFromPostBalances(balances []postTokenBal) string {
 	return ""
 }
 
-// ════════════════════════════════════════════════════
-//  CREATE TX: mint + создатель (первый signer / fee payer)
-// ════════════════════════════════════════════════════
+// в•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђ
+//  CREATE TX: mint + СЃРѕР·РґР°С‚РµР»СЊ (РїРµСЂРІС‹Р№ signer / fee payer)
+// в•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђ
 
 func parseCreateTx(sig string) (mint, creator string, createBlockTime *time.Time) {
 	data, err := getTransactionJSONParsedFast(sig)
@@ -1720,7 +1731,7 @@ func getTransactionJSONParsedFast(sig string) ([]byte, error) {
 		return []interface{}{
 			sig,
 			map[string]interface{}{
-				// Для hot-path берём json (легче payload, быстрее ответа), парсер ниже поддерживает оба формата.
+				// Р”Р»СЏ hot-path Р±РµСЂС‘Рј json (Р»РµРіС‡Рµ payload, Р±С‹СЃС‚СЂРµРµ РѕС‚РІРµС‚Р°), РїР°СЂСЃРµСЂ РЅРёР¶Рµ РїРѕРґРґРµСЂР¶РёРІР°РµС‚ РѕР±Р° С„РѕСЂРјР°С‚Р°.
 				"encoding":                       "json",
 				"maxSupportedTransactionVersion": 0,
 				"commitment":                     commitment,
@@ -1728,7 +1739,7 @@ func getTransactionJSONParsedFast(sig string) ([]byte, error) {
 		}
 	}
 
-	// Быстрый путь для hot-path: сначала processed, чтобы не ждать подтверждение.
+	// Р‘С‹СЃС‚СЂС‹Р№ РїСѓС‚СЊ РґР»СЏ hot-path: СЃРЅР°С‡Р°Р»Р° processed, С‡С‚РѕР±С‹ РЅРµ Р¶РґР°С‚СЊ РїРѕРґС‚РІРµСЂР¶РґРµРЅРёРµ.
 	tries := 3
 	if turboModeEnabled() {
 		tries = 1
@@ -1748,7 +1759,7 @@ func getTransactionJSONParsedFast(sig string) ([]byte, error) {
 		}
 	}
 
-	// Fallback для совместимости со старыми/медленными узлами.
+	// Fallback РґР»СЏ СЃРѕРІРјРµСЃС‚РёРјРѕСЃС‚Рё СЃРѕ СЃС‚Р°СЂС‹РјРё/РјРµРґР»РµРЅРЅС‹РјРё СѓР·Р»Р°РјРё.
 	return rpc("getTransaction", params("confirmed"))
 }
 
@@ -1858,10 +1869,10 @@ func pickMintFromAccountKeys(keys []json.RawMessage) string {
 
 func formatCreateAge(t *time.Time) string {
 	if t == nil {
-		return "время блока n/a"
+		return "РІСЂРµРјСЏ Р±Р»РѕРєР° n/a"
 	}
 	age := time.Since(*t).Round(time.Second)
-	return fmt.Sprintf("%v назад · блок %s UTC", age, t.UTC().Format("02.01 15:04:05"))
+	return fmt.Sprintf("%v РЅР°Р·Р°Рґ В· Р±Р»РѕРє %s UTC", age, t.UTC().Format("02.01 15:04:05"))
 }
 
 func firstSignerFromKeys(keys []json.RawMessage) string {
@@ -1883,9 +1894,9 @@ func firstSignerFromKeys(keys []json.RawMessage) string {
 	return ""
 }
 
-// ════════════════════════════════════════════════════
-//  АНТИ-СКАМ: RPC
-// ════════════════════════════════════════════════════
+// в•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђ
+//  РђРќРўР-РЎРљРђРњ: RPC
+// в•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђ
 
 func rpcGetBalanceSOL(pub string) (float64, error) {
 	data, err := rpc("getBalance", []interface{}{pub, map[string]string{"commitment": "confirmed"}})
@@ -1960,7 +1971,7 @@ func rpcRefreshBalanceSOLCached(pub string) (float64, error) {
 	return sol, nil
 }
 
-// freezeAuthority ≠ null — опасно. mintAuthority часто = bonding curve / pool (норма) или null.
+// freezeAuthority в‰  null вЂ” РѕРїР°СЃРЅРѕ. mintAuthority С‡Р°СЃС‚Рѕ = bonding curve / pool (РЅРѕСЂРјР°) РёР»Рё null.
 func rpcMintAuthorities(mint, bondingCurve string, extraAllow ...string) (badMintAuth, badFreeze bool, err error) {
 	data, err := rpc("getAccountInfo", []interface{}{
 		mint, map[string]string{"encoding": "jsonParsed"},
@@ -2149,9 +2160,9 @@ func hasSocialLinksInMetadata(mint string) (bool, string) {
 	uri, err := rpcTokenMetadataURI(mint)
 	if err != nil {
 		metadataCache.mu.Lock()
-		metadataCache.m[mint] = metadataCacheEntry{ok: false, detail: "metadata URI недоступен", ts: time.Now()}
+		metadataCache.m[mint] = metadataCacheEntry{ok: false, detail: "metadata URI РЅРµРґРѕСЃС‚СѓРїРµРЅ", ts: time.Now()}
 		metadataCache.mu.Unlock()
-		return false, "metadata URI недоступен"
+		return false, "metadata URI РЅРµРґРѕСЃС‚СѓРїРµРЅ"
 	}
 	resp, err := httpClient.Get(uri)
 	if err != nil || resp.StatusCode != 200 {
@@ -2159,9 +2170,9 @@ func hasSocialLinksInMetadata(mint string) (bool, string) {
 			resp.Body.Close()
 		}
 		metadataCache.mu.Lock()
-		metadataCache.m[mint] = metadataCacheEntry{ok: false, detail: "metadata JSON недоступен", ts: time.Now()}
+		metadataCache.m[mint] = metadataCacheEntry{ok: false, detail: "metadata JSON РЅРµРґРѕСЃС‚СѓРїРµРЅ", ts: time.Now()}
 		metadataCache.mu.Unlock()
-		return false, "metadata JSON недоступен"
+		return false, "metadata JSON РЅРµРґРѕСЃС‚СѓРїРµРЅ"
 	}
 	defer resp.Body.Close()
 	body, err := io.ReadAll(resp.Body)
@@ -2177,9 +2188,9 @@ func hasSocialLinksInMetadata(mint string) (bool, string) {
 	hasWeb := strings.Contains(s, "http://") || strings.Contains(s, "https://") || strings.Contains(s, "\"website\"")
 	if !hasTg && !hasTw && !hasWeb {
 		metadataCache.mu.Lock()
-		metadataCache.m[mint] = metadataCacheEntry{ok: false, detail: "нет social (tg/twitter/website) в metadata", ts: time.Now()}
+		metadataCache.m[mint] = metadataCacheEntry{ok: false, detail: "РЅРµС‚ social (tg/twitter/website) РІ metadata", ts: time.Now()}
 		metadataCache.mu.Unlock()
-		return false, "нет social (tg/twitter/website) в metadata"
+		return false, "РЅРµС‚ social (tg/twitter/website) РІ metadata"
 	}
 	metadataCache.mu.Lock()
 	metadataCache.m[mint] = metadataCacheEntry{ok: true, detail: "social ok", ts: time.Now()}
@@ -2348,18 +2359,18 @@ func bundledBuyersCheck(mint, creator string, createAt *time.Time) (bool, string
 		}
 	}
 	if sameBlock > 5 {
-		return false, fmt.Sprintf("bundled attack: %d top holders в блоке dev", sameBlock)
+		return false, fmt.Sprintf("bundled attack: %d top holders РІ Р±Р»РѕРєРµ dev", sameBlock)
 	}
 	return true, fmt.Sprintf("bundle ok (%d)", sameBlock)
 }
 
-// Топ-10 холдеров (excl curve) >30% — кластер сольёт в первую секунду
+// РўРѕРї-10 С…РѕР»РґРµСЂРѕРІ (excl curve) >30% вЂ” РєР»Р°СЃС‚РµСЂ СЃРѕР»СЊС‘С‚ РІ РїРµСЂРІСѓСЋ СЃРµРєСѓРЅРґСѓ
 func rpcTop10HoldersClusterOK(mint, bondingCurve string) (ok bool, detail string) {
 	data, err := rpc("getTokenLargestAccounts", []interface{}{
 		mint, map[string]string{"commitment": "confirmed"},
 	})
 	if err != nil {
-		return true, "" // при ошибке пропускаем
+		return true, "" // РїСЂРё РѕС€РёР±РєРµ РїСЂРѕРїСѓСЃРєР°РµРј
 	}
 	var out struct {
 		Result struct {
@@ -2398,12 +2409,12 @@ func rpcTop10HoldersClusterOK(mint, bondingCurve string) (ok bool, detail string
 		n++
 	}
 	if total > 0 && top10NonCurve/total > TOP10_HOLDERS_MAX_PCT {
-		return false, fmt.Sprintf("топ-10 холдеров %.0f%% > %.0f%% — кластер сольёт", 100*top10NonCurve/total, 100*TOP10_HOLDERS_MAX_PCT)
+		return false, fmt.Sprintf("С‚РѕРї-10 С…РѕР»РґРµСЂРѕРІ %.0f%% > %.0f%% вЂ” РєР»Р°СЃС‚РµСЂ СЃРѕР»СЊС‘С‚", 100*top10NonCurve/total, 100*TOP10_HOLDERS_MAX_PCT)
 	}
 	return true, ""
 }
 
-// Топ-холдеры: кривая должна держать львиную долю; иначе — раздача/скам-паттерн
+// РўРѕРї-С…РѕР»РґРµСЂС‹: РєСЂРёРІР°СЏ РґРѕР»Р¶РЅР° РґРµСЂР¶Р°С‚СЊ Р»СЊРІРёРЅСѓСЋ РґРѕР»СЋ; РёРЅР°С‡Рµ вЂ” СЂР°Р·РґР°С‡Р°/СЃРєР°Рј-РїР°С‚С‚РµСЂРЅ
 func antiScamThresholds() (creatorMinSOL, creatorMaxSOL, minCurveShare, maxNonCurveShare float64) {
 	creatorMinSOL = CREATOR_SOL_MIN
 	creatorMaxSOL = CREATOR_SOL_SUSPECT
@@ -2416,7 +2427,7 @@ func antiScamThresholds() (creatorMinSOL, creatorMaxSOL, minCurveShare, maxNonCu
 		minCurveShare = 0.62
 		maxNonCurveShare = math.Min(maxNonCurveShare, 0.10)
 	case "aggressive":
-		creatorMinSOL = math.Min(creatorMinSOL, 2.0) // не ниже 2 SOL
+		creatorMinSOL = math.Min(creatorMinSOL, 2.0) // РЅРµ РЅРёР¶Рµ 2 SOL
 		minCurveShare = 0.45
 		maxNonCurveShare = math.Max(maxNonCurveShare, 0.18)
 	}
@@ -2439,7 +2450,7 @@ func rpcHolderDistributionOK(mint, bondingCurve, creator string, minCurveShare, 
 		} `json:"result"`
 	}
 	if err := json.Unmarshal(data, &out); err != nil || len(out.Result.Value) == 0 {
-		return false, "нет largest accounts"
+		return false, "РЅРµС‚ largest accounts"
 	}
 	totalStr, err := rpcGetTokenSupplyRaw(mint)
 	if err != nil {
@@ -2466,9 +2477,9 @@ func rpcHolderDistributionOK(mint, bondingCurve, creator string, minCurveShare, 
 			curveAmt += amt
 		} else {
 			nonCurve += amt
-			// создатель напрямую держит крупный офф-кривой стек — подозрительно
+			// СЃРѕР·РґР°С‚РµР»СЊ РЅР°РїСЂСЏРјСѓСЋ РґРµСЂР¶РёС‚ РєСЂСѓРїРЅС‹Р№ РѕС„С„-РєСЂРёРІРѕР№ СЃС‚РµРє вЂ” РїРѕРґРѕР·СЂРёС‚РµР»СЊРЅРѕ
 			if owner == creator && amt/total > 0.03 {
-				return false, fmt.Sprintf("создатель держит %.1f%% вне кривой", 100*amt/total)
+				return false, fmt.Sprintf("СЃРѕР·РґР°С‚РµР»СЊ РґРµСЂР¶РёС‚ %.1f%% РІРЅРµ РєСЂРёРІРѕР№", 100*amt/total)
 			}
 		}
 	}
@@ -2476,19 +2487,19 @@ func rpcHolderDistributionOK(mint, bondingCurve, creator string, minCurveShare, 
 		return false, detailTop10
 	}
 	if curveAmt/total < minCurveShare {
-		return false, fmt.Sprintf("в кривой только %.0f%% саплая (нужно ≥%.0f%%)", 100*curveAmt/total, 100*minCurveShare)
+		return false, fmt.Sprintf("РІ РєСЂРёРІРѕР№ С‚РѕР»СЊРєРѕ %.0f%% СЃР°РїР»Р°СЏ (РЅСѓР¶РЅРѕ в‰Ґ%.0f%%)", 100*curveAmt/total, 100*minCurveShare)
 	}
 	if nonCurve/total > maxNonCurveShare {
-		return false, fmt.Sprintf("%.0f%% токенов вне кривой (макс %.0f%%)", 100*nonCurve/total, 100*maxNonCurveShare)
+		return false, fmt.Sprintf("%.0f%% С‚РѕРєРµРЅРѕРІ РІРЅРµ РєСЂРёРІРѕР№ (РјР°РєСЃ %.0f%%)", 100*nonCurve/total, 100*maxNonCurveShare)
 	}
-	return true, fmt.Sprintf("кривая ~%.0f%% supply", 100*curveAmt/total)
+	return true, fmt.Sprintf("РєСЂРёРІР°СЏ ~%.0f%% supply", 100*curveAmt/total)
 }
 
-// mintAuthorityRef — pump: bonding curve PDA; launchlab: pool PDA (для сравнения с mintAuthority).
-// liquidityVault — аккаунт, где лежит основная ликвидность (pump: та же кривая; launchlab: pool_vault base).
+// mintAuthorityRef вЂ” pump: bonding curve PDA; launchlab: pool PDA (РґР»СЏ СЃСЂР°РІРЅРµРЅРёСЏ СЃ mintAuthority).
+// liquidityVault вЂ” Р°РєРєР°СѓРЅС‚, РіРґРµ Р»РµР¶РёС‚ РѕСЃРЅРѕРІРЅР°СЏ Р»РёРєРІРёРґРЅРѕСЃС‚СЊ (pump: С‚Р° Р¶Рµ РєСЂРёРІР°СЏ; launchlab: pool_vault base).
 func antiScamCheck(mint, mintAuthorityRef, liquidityVault, creator string, createAt *time.Time, extraMintAuth ...string) (ok bool, detail string) {
 	if creator == "" {
-		return false, "нет pubkey создателя"
+		return false, "РЅРµС‚ pubkey СЃРѕР·РґР°С‚РµР»СЏ"
 	}
 	sol, err := rpcGetBalanceSOLCached(creator, CREATOR_BALANCE_CACHE_TTL)
 	if err != nil {
@@ -2496,12 +2507,12 @@ func antiScamCheck(mint, mintAuthorityRef, liquidityVault, creator string, creat
 	}
 	creatorMinSOL, creatorMaxSOL, minCurveShare, maxNonCurveShare := antiScamThresholds()
 	if sol < creatorMinSOL {
-		return false, fmt.Sprintf("SOL создателя %.3f < %.2f", sol, creatorMinSOL)
+		return false, fmt.Sprintf("SOL СЃРѕР·РґР°С‚РµР»СЏ %.3f < %.2f", sol, creatorMinSOL)
 	}
 	if sol > creatorMaxSOL {
-		return false, fmt.Sprintf("SOL создателя %.1f > %.0f (подозр.)", sol, creatorMaxSOL)
+		return false, fmt.Sprintf("SOL СЃРѕР·РґР°С‚РµР»СЏ %.1f > %.0f (РїРѕРґРѕР·СЂ.)", sol, creatorMaxSOL)
 	}
-	// Обязательный anti-scam: у токена должна быть хотя бы одна social-ссылка.
+	// РћР±СЏР·Р°С‚РµР»СЊРЅС‹Р№ anti-scam: Сѓ С‚РѕРєРµРЅР° РґРѕР»Р¶РЅР° Р±С‹С‚СЊ С…РѕС‚СЏ Р±С‹ РѕРґРЅР° social-СЃСЃС‹Р»РєР°.
 	okSocial, socialDetail := hasSocialLinksInMetadata(mint)
 	if !okSocial {
 		return false, socialDetail
@@ -2512,16 +2523,16 @@ func antiScamCheck(mint, mintAuthorityRef, liquidityVault, creator string, creat
 			return false, "mint RPC"
 		}
 		if badMint {
-			return false, "mintAuthority не кривая (чужая чеканка)"
+			return false, "mintAuthority РЅРµ РєСЂРёРІР°СЏ (С‡СѓР¶Р°СЏ С‡РµРєР°РЅРєР°)"
 		}
 		if badFreeze {
-			return false, "freezeAuthority (заморозка счетов)"
+			return false, "freezeAuthority (Р·Р°РјРѕСЂРѕР·РєР° СЃС‡РµС‚РѕРІ)"
 		}
 		if okTop10, detailTop10 := rpcTop10HoldersClusterOK(mint, mintAuthorityRef); !okTop10 {
 			return false, detailTop10
 		}
 		if devCreatedTooMany(creator) {
-			return false, "dev serial rugger (>7 tx/час)"
+			return false, "dev serial rugger (>7 tx/С‡Р°СЃ)"
 		}
 		return true, fmt.Sprintf("fast anti-scam | %s | dev %.2f SOL", socialDetail, sol)
 	}
@@ -2544,11 +2555,11 @@ func antiScamCheck(mint, mintAuthorityRef, liquidityVault, creator string, creat
 			return
 		}
 		if badMint {
-			results <- filterResult{key: "mint", ok: false, detail: "mintAuthority не кривая (чужая чеканка)"}
+			results <- filterResult{key: "mint", ok: false, detail: "mintAuthority РЅРµ РєСЂРёРІР°СЏ (С‡СѓР¶Р°СЏ С‡РµРєР°РЅРєР°)"}
 			return
 		}
 		if badFreeze {
-			results <- filterResult{key: "mint", ok: false, detail: "freezeAuthority (заморозка счетов)"}
+			results <- filterResult{key: "mint", ok: false, detail: "freezeAuthority (Р·Р°РјРѕСЂРѕР·РєР° СЃС‡РµС‚РѕРІ)"}
 			return
 		}
 		results <- filterResult{key: "mint", ok: true, detail: "mint ok"}
@@ -2558,7 +2569,7 @@ func antiScamCheck(mint, mintAuthorityRef, liquidityVault, creator string, creat
 	go func() {
 		defer wg.Done()
 		if devCreatedTooMany(creator) {
-			results <- filterResult{key: "creator", ok: false, detail: "dev serial rugger (>7 tx/час)"}
+			results <- filterResult{key: "creator", ok: false, detail: "dev serial rugger (>7 tx/С‡Р°СЃ)"}
 			return
 		}
 		if sold, soldDetail := devSoldInFirstMinute(creator, createAt); sold {
@@ -2575,7 +2586,7 @@ func antiScamCheck(mint, mintAuthorityRef, liquidityVault, creator string, creat
 		results <- filterResult{key: "liquidity", ok: ok2, detail: hd}
 	}()
 
-	// social metadata check (уже проверен выше, оставляем статус для детализации)
+	// social metadata check (СѓР¶Рµ РїСЂРѕРІРµСЂРµРЅ РІС‹С€Рµ, РѕСЃС‚Р°РІР»СЏРµРј СЃС‚Р°С‚СѓСЃ РґР»СЏ РґРµС‚Р°Р»РёР·Р°С†РёРё)
 	go func() {
 		defer wg.Done()
 		results <- filterResult{key: "social", ok: true, detail: socialDetail}
@@ -2610,9 +2621,9 @@ func antiScamCheck(mint, mintAuthorityRef, liquidityVault, creator string, creat
 	return true, hd + fmt.Sprintf(" | %s | %s | dev %.2f SOL", socialInfo, bundleDetail, sol)
 }
 
-// ════════════════════════════════════════════════════
+// в•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђ
 //  WEBSOCKET
-// ════════════════════════════════════════════════════
+// в•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђ
 
 func pumpCreateFromLogs(logs []string) bool {
 	for _, l := range logs {
@@ -2623,7 +2634,7 @@ func pumpCreateFromLogs(logs []string) bool {
 	return false
 }
 
-// listenProgram — подписка на логи одной программы (Pump.fun или Raydium LaunchLab).
+// listenProgram вЂ” РїРѕРґРїРёСЃРєР° РЅР° Р»РѕРіРё РѕРґРЅРѕР№ РїСЂРѕРіСЂР°РјРјС‹ (Pump.fun РёР»Рё Raydium LaunchLab).
 func listenProgram(programID, prettyLabel string, wantLogs func([]string) bool, ch chan<- NewToken, tokenSrc string) {
 	endpoints := []string{
 		"wss://mainnet.helius-rpc.com/?api-key=" + HELIUS_API_KEY,
@@ -2639,7 +2650,7 @@ func listenProgram(programID, prettyLabel string, wantLogs func([]string) bool, 
 	for {
 		url := endpoints[ei%len(endpoints)]
 		ei++
-		fmt.Printf("%s WS [%s] → %s\n", cyan("🔌"), prettyLabel, url[:52]+"...")
+		fmt.Printf("%s WS [%s] в†’ %s\n", cyan("рџ”Њ"), prettyLabel, url[:52]+"...")
 		conn, resp, err := dialer.Dial(url, headers)
 		if err != nil {
 			code := 0
@@ -2647,16 +2658,16 @@ func listenProgram(programID, prettyLabel string, wantLogs func([]string) bool, 
 				code = resp.StatusCode
 			}
 			if code == 403 {
-				fmt.Println(red("❌ HTTP 403 — пробую другой endpoint..."))
+				fmt.Println(red("вќЊ HTTP 403 вЂ” РїСЂРѕР±СѓСЋ РґСЂСѓРіРѕР№ endpoint..."))
 			} else {
-				fmt.Printf("%s [%s] %v\n", red("❌"), prettyLabel, err)
+				fmt.Printf("%s [%s] %v\n", red("вќЊ"), prettyLabel, err)
 			}
 			time.Sleep(backoff)
 			backoff = time.Duration(math.Min(float64(backoff*2), float64(30*time.Second)))
 			continue
 		}
 		backoff = 3 * time.Second
-		fmt.Printf("%s WebSocket — %s\n", green("✓"), prettyLabel)
+		fmt.Printf("%s WebSocket вЂ” %s\n", green("вњ“"), prettyLabel)
 
 		conn.WriteJSON(map[string]interface{}{
 			"jsonrpc": "2.0", "id": 1,
@@ -2684,7 +2695,7 @@ func listenProgram(programID, prettyLabel string, wantLogs func([]string) bool, 
 		for {
 			_, msg, err := conn.ReadMessage()
 			if err != nil {
-				fmt.Printf("%s WS [%s] разорван: %s\n", yellow("⚠"), prettyLabel, err.Error())
+				fmt.Printf("%s WS [%s] СЂР°Р·РѕСЂРІР°РЅ: %s\n", yellow("вљ "), prettyLabel, err.Error())
 				close(stop)
 				conn.Close()
 				break
@@ -2714,14 +2725,14 @@ func listenProgram(programID, prettyLabel string, wantLogs func([]string) bool, 
 	}
 }
 
-// listenPumpWSS — отдельный WSS-слушатель логов Pump.fun для минимальной задержки на детекте.
+// listenPumpWSS вЂ” РѕС‚РґРµР»СЊРЅС‹Р№ WSS-СЃР»СѓС€Р°С‚РµР»СЊ Р»РѕРіРѕРІ Pump.fun РґР»СЏ РјРёРЅРёРјР°Р»СЊРЅРѕР№ Р·Р°РґРµСЂР¶РєРё РЅР° РґРµС‚РµРєС‚Рµ.
 func listenPumpWSS(ch chan<- NewToken) {
 	listenProgram(PUMP_PROGRAM, "Pump.fun", pumpCreateFromLogs, ch, "pump")
 }
 
-// ════════════════════════════════════════════════════
+// в•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђ
 //  WALLET
-// ════════════════════════════════════════════════════
+// в•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђ
 
 func (w *Wallet) open(tok NewToken, sym string, spot float64) bool {
 	if liveTradingEnabled() {
@@ -2732,14 +2743,14 @@ func (w *Wallet) open(tok NewToken, sym string, spot float64) bool {
 			w.mu.Unlock()
 			consoleMu.Lock()
 			fmt.Printf("%s open reject %s | drawdown_stop (bal=%.2f <= %.2f, max_dd=%.0f%%)\n",
-				yellow("⚠"), sym, w.Balance, stopBal, ddPct)
+				yellow("вљ "), sym, w.Balance, stopBal, ddPct)
 			consoleMu.Unlock()
 			return false
 		}
 		if len(w.Pos) >= MAX_POSITIONS {
 			w.mu.Unlock()
 			consoleMu.Lock()
-			fmt.Printf("%s open reject %s | position_limit=%d\n", yellow("⚠"), sym, MAX_POSITIONS)
+			fmt.Printf("%s open reject %s | position_limit=%d\n", yellow("вљ "), sym, MAX_POSITIONS)
 			consoleMu.Unlock()
 			return false
 		}
@@ -2778,28 +2789,28 @@ func (w *Wallet) open(tok NewToken, sym string, spot float64) bool {
 		Source:       tokenSource(tok),
 	}
 	tx := solanaTxFeeUSD()
-	fmt.Printf("\n%s ВХОД  %-18s | гросс $%.2f | в кривую ~$%.2f | pump %.0f%% + сеть ~$%.3f | eff $%.10f | баланс $%.2f\n",
-		cyan("→"), sym, capital, pool, pumpFeePct()*100, tx, entry, w.Balance)
+	fmt.Printf("\n%s Р’РҐРћР”  %-18s | РіСЂРѕСЃСЃ $%.2f | РІ РєСЂРёРІСѓСЋ ~$%.2f | pump %.0f%% + СЃРµС‚СЊ ~$%.3f | eff $%.10f | Р±Р°Р»Р°РЅСЃ $%.2f\n",
+		cyan("в†’"), sym, capital, pool, pumpFeePct()*100, tx, entry, w.Balance)
 	return true
 }
 
-// openLive — реальный свап SOL→токен только через Pump.fun bonding curve (pump_direct).
+// openLive вЂ” СЂРµР°Р»СЊРЅС‹Р№ СЃРІР°Рї SOLв†’С‚РѕРєРµРЅ С‚РѕР»СЊРєРѕ С‡РµСЂРµР· Pump.fun bonding curve (pump_direct).
 func (w *Wallet) openLive(tok NewToken, sym string, spot float64, capitalUSD float64) bool {
 	if abortIfTooLate(tok, "open_live_start") {
 		consoleMu.Lock()
-		fmt.Printf("%s open reject %s | latency_guard\n", yellow("⚠"), sym)
+		fmt.Printf("%s open reject %s | latency_guard\n", yellow("вљ "), sym)
 		consoleMu.Unlock()
 		return false
 	}
 	if feeGuardActive() {
 		consoleMu.Lock()
-		fmt.Printf("%s open reject %s | fee_guard_active\n", yellow("⚠"), sym)
+		fmt.Printf("%s open reject %s | fee_guard_active\n", yellow("вљ "), sym)
 		consoleMu.Unlock()
 		return false
 	}
 	if !liveUsePumpDirect(tok) {
 		consoleMu.Lock()
-		fmt.Println(yellow("⚠ LIVE: только Pump.fun на кривой — LaunchLab/другие источники в live отключены (бумага без изменений)."))
+		fmt.Println(yellow("вљ  LIVE: С‚РѕР»СЊРєРѕ Pump.fun РЅР° РєСЂРёРІРѕР№ вЂ” LaunchLab/РґСЂСѓРіРёРµ РёСЃС‚РѕС‡РЅРёРєРё РІ live РѕС‚РєР»СЋС‡РµРЅС‹ (Р±СѓРјР°РіР° Р±РµР· РёР·РјРµРЅРµРЅРёР№)."))
 		consoleMu.Unlock()
 		return false
 	}
@@ -2816,7 +2827,7 @@ func (w *Wallet) openLive(tok NewToken, sym string, spot float64, capitalUSD flo
 	}
 	if solBal <= 0 {
 		consoleMu.Lock()
-		fmt.Printf("%s open reject %s | zero_balance\n", yellow("⚠"), sym)
+		fmt.Printf("%s open reject %s | zero_balance\n", yellow("вљ "), sym)
 		consoleMu.Unlock()
 		return false
 	}
@@ -2829,21 +2840,21 @@ func (w *Wallet) openLive(tok NewToken, sym string, spot float64, capitalUSD flo
 	}
 	if solForSwap <= 0.001 {
 		consoleMu.Lock()
-		fmt.Printf("%s open reject %s | мало SOL после резерва (bal=%.4f SOL reserve=%.4f)\n",
-			yellow("⚠"), sym, solBal, reserve)
+		fmt.Printf("%s open reject %s | РјР°Р»Рѕ SOL РїРѕСЃР»Рµ СЂРµР·РµСЂРІР° (bal=%.4f SOL reserve=%.4f)\n",
+			yellow("вљ "), sym, solBal, reserve)
 		consoleMu.Unlock()
 		return false
 	}
 	lamports := uint64(solForSwap * 1e9)
 	if lamports < 50_000 {
 		consoleMu.Lock()
-		fmt.Printf("%s open reject %s | lamports_too_low=%d\n", yellow("⚠"), sym, lamports)
+		fmt.Printf("%s open reject %s | lamports_too_low=%d\n", yellow("вљ "), sym, lamports)
 		consoleMu.Unlock()
 		return false
 	}
 	if !atomic.CompareAndSwapInt32(&liveBuyInFlight, 0, 1) {
 		consoleMu.Lock()
-		fmt.Printf("%s open reject %s | buy_in_flight\n", yellow("⚠"), sym)
+		fmt.Printf("%s open reject %s | buy_in_flight\n", yellow("вљ "), sym)
 		consoleMu.Unlock()
 		return false
 	}
@@ -2854,7 +2865,7 @@ func (w *Wallet) openLive(tok NewToken, sym string, spot float64, capitalUSD flo
 	var sentAt time.Time
 	var err error
 	if !hotPathSilent() {
-		fmt.Println(gray("⏳ Pump.fun: прямая покупка на кривой…"))
+		fmt.Println(gray("вЏі Pump.fun: РїСЂСЏРјР°СЏ РїРѕРєСѓРїРєР° РЅР° РєСЂРёРІРѕР№вЂ¦"))
 	}
 	tokenRaw, sig, solIn, sentAt, err = PumpDirectBuy(tok.Mint, lamports)
 	if err != nil && isRateLimitErr(err) {
@@ -2863,7 +2874,7 @@ func (w *Wallet) openLive(tok NewToken, sym string, spot float64, capitalUSD flo
 	}
 	if err != nil {
 		consoleMu.Lock()
-		fmt.Printf("%s Pump buy %s | %v\n", red("❌"), sym, err)
+		fmt.Printf("%s Pump buy %s | %v\n", red("вќЊ"), sym, err)
 		consoleMu.Unlock()
 		if isInsufficientFeeErr(err) {
 			activateFeeGuard(45*time.Second, "insufficient funds for fee on buy")
@@ -2875,10 +2886,10 @@ func (w *Wallet) openLive(tok NewToken, sym string, spot float64, capitalUSD flo
 		delayMs := sentAt.Sub(tok.DetectedAt).Milliseconds()
 		consoleMu.Lock()
 		fmt.Printf("%s Transaction Sent | %s | %s | delay=%dms\n",
-			gray("⏱"), "$"+short(tok.Mint), sentAt.Format(time.RFC3339Nano), delayMs)
+			gray("вЏ±"), "$"+short(tok.Mint), sentAt.Format(time.RFC3339Nano), delayMs)
 		lat := getLastBuyLatency()
 		fmt.Printf("%s latency breakdown | filters=%dms | blockhash(cache)=%dms | signing=%dms | sending=%dms\n",
-			gray("⏱"), lat.FiltersMs, lat.BlockhashMs, lat.SigningMs, lat.SendingMs)
+			gray("вЏ±"), lat.FiltersMs, lat.BlockhashMs, lat.SigningMs, lat.SendingMs)
 		if !tok.FiltersPassedAt.IsZero() {
 			d1 := tok.FiltersPassedAt.Sub(tok.DetectedAt).Milliseconds()
 			d2 := sentAt.Sub(tok.FiltersPassedAt).Milliseconds()
@@ -2887,7 +2898,7 @@ func (w *Wallet) openLive(tok NewToken, sym string, spot float64, capitalUSD flo
 			}
 			d3 := int64(lat.SendingMs)
 			fmt.Printf("%s dt_detect_to_filter=%dms | dt_filter_to_sign=%dms | dt_sign_to_send=%dms\n",
-				gray("⏱"), d1, d2, d3)
+				gray("вЏ±"), d1, d2, d3)
 		}
 		consoleMu.Unlock()
 	}
@@ -2903,7 +2914,7 @@ func (w *Wallet) openLive(tok NewToken, sym string, spot float64, capitalUSD flo
 	defer w.mu.Unlock()
 	if len(w.Pos) >= MAX_POSITIONS {
 		consoleMu.Lock()
-		fmt.Printf("%s open reject %s | position_limit=%d\n", yellow("⚠"), sym, MAX_POSITIONS)
+		fmt.Printf("%s open reject %s | position_limit=%d\n", yellow("вљ "), sym, MAX_POSITIONS)
 		consoleMu.Unlock()
 		return false
 	}
@@ -2924,8 +2935,8 @@ func (w *Wallet) openLive(tok NewToken, sym string, spot float64, capitalUSD flo
 	go w.verifyBuyAsync(tok.Mint, sym, sig, tok.DetectedAt)
 	w.saveActivePositionsLocked()
 	bal := w.Balance
-	fmt.Printf("\n%s ВХОД LIVE %-18s | ~$%.2f SOL→токен | eff $%.10f | raw %d | %s | баланс $%.2f\n",
-		cyan("→"), sym, capitalEff, entry, tokenRaw, gray(sig), bal)
+	fmt.Printf("\n%s Р’РҐРћР” LIVE %-18s | ~$%.2f SOLв†’С‚РѕРєРµРЅ | eff $%.10f | raw %d | %s | Р±Р°Р»Р°РЅСЃ $%.2f\n",
+		cyan("в†’"), sym, capitalEff, entry, tokenRaw, gray(sig), bal)
 	return true
 }
 
@@ -2972,24 +2983,24 @@ func (w *Wallet) closePos(mint, reason string, spot float64) {
 	bal := w.Balance
 	w.mu.Unlock()
 
-	icon := green("✓")
+	icon := green("вњ“")
 	ps := green(fmt.Sprintf("+$%.2f (+%.0f%%)", pnl, pct))
 	if pnl < 0 {
-		icon = red("✗")
+		icon = red("вњ—")
 		ps = red(fmt.Sprintf("$%.2f (%.0f%%)", pnl, pct))
 	}
-	fmt.Printf("\n%s ВЫХОД %-18s | %s | нетто $%.2f (~комиссии ~$%.2f) | %-24s | %s | бал: $%.2f\n",
+	fmt.Printf("\n%s Р’Р«РҐРћР” %-18s | %s | РЅРµС‚С‚Рѕ $%.2f (~РєРѕРјРёСЃСЃРёРё ~$%.2f) | %-24s | %s | Р±Р°Р»: $%.2f\n",
 		icon, snap.Symbol, ps, net, feesEst, reason, dur, bal)
 	fmt.Printf("   %s %s\n", gray("DEX"), cyan(dexScreenerURL(snap.Mint)))
 	if pnl < 0 {
-		fmt.Printf("   %s [%s] %s\n", yellow("ⓘ учёт"), bk, lossLearningHint(reason))
+		fmt.Printf("   %s [%s] %s\n", yellow("в“ СѓС‡С‘С‚"), bk, lossLearningHint(reason))
 	}
 }
 
 func (w *Wallet) closePosLive(pos *Position, reason string, spot float64) {
 	if !liveUsePumpDirectClose(pos) {
 		consoleMu.Lock()
-		fmt.Println(yellow("⚠ LIVE выход: только Pump.fun на кривой — эта позиция не pump; закрой вручную на DEX."))
+		fmt.Println(yellow("вљ  LIVE РІС‹С…РѕРґ: С‚РѕР»СЊРєРѕ Pump.fun РЅР° РєСЂРёРІРѕР№ вЂ” СЌС‚Р° РїРѕР·РёС†РёСЏ РЅРµ pump; Р·Р°РєСЂРѕР№ РІСЂСѓС‡РЅСѓСЋ РЅР° DEX."))
 		consoleMu.Unlock()
 		syncWalletBalanceUSDFresh(w)
 		w.mu.Lock()
@@ -2998,12 +3009,12 @@ func (w *Wallet) closePosLive(pos *Position, reason string, spot float64) {
 		w.mu.Unlock()
 		return
 	}
-	// Не продаём в слишком плохой тик: если ожидаемое проскальзывание > 10%, ждём следующий цикл.
+	// РќРµ РїСЂРѕРґР°С‘Рј РІ СЃР»РёС€РєРѕРј РїР»РѕС…РѕР№ С‚РёРє: РµСЃР»Рё РѕР¶РёРґР°РµРјРѕРµ РїСЂРѕСЃРєР°Р»СЊР·С‹РІР°РЅРёРµ > 10%, Р¶РґС‘Рј СЃР»РµРґСѓСЋС‰РёР№ С†РёРєР».
 	if spot > 0 {
 		if estSlip, err := PumpDirectEstimateSellSlippage(pos.Mint, pos.TokenRaw, spot); err == nil && estSlip > SELL_SLIPPAGE_GUARD {
 			consoleMu.Lock()
 			fmt.Printf("%s wait better tick: est sell slippage %.1f%% > %.0f%%\n",
-				yellow("⏸"), estSlip*100, SELL_SLIPPAGE_GUARD*100)
+				yellow("вЏё"), estSlip*100, SELL_SLIPPAGE_GUARD*100)
 			consoleMu.Unlock()
 			w.mu.Lock()
 			w.Pos[pos.Mint] = pos
@@ -3014,12 +3025,12 @@ func (w *Wallet) closePosLive(pos *Position, reason string, spot float64) {
 	}
 	var sig string
 	var solOut uint64
-	fmt.Println(gray("⏳ Pump.fun: продажа на кривой…"))
+	fmt.Println(gray("вЏі Pump.fun: РїСЂРѕРґР°Р¶Р° РЅР° РєСЂРёРІРѕР№вЂ¦"))
 	sig, solOut, err := PumpDirectSellAll(pos.Mint)
 	solUSD := getSolUSD()
 	if err != nil {
 		consoleMu.Lock()
-		fmt.Printf("%s %v\n", red("❌ Pump sell:"), err)
+		fmt.Printf("%s %v\n", red("вќЊ Pump sell:"), err)
 		consoleMu.Unlock()
 		if isInsufficientFeeErr(err) {
 			activateFeeGuard(60*time.Second, "insufficient funds for fee on sell (need SOL for exit tx)")
@@ -3058,18 +3069,18 @@ func (w *Wallet) closePosLive(pos *Position, reason string, spot float64) {
 	bal := w.Balance
 	w.mu.Unlock()
 
-	icon := green("✓")
+	icon := green("вњ“")
 	ps := green(fmt.Sprintf("+$%.2f (+%.0f%%)", pnl, pct))
 	if pnl < 0 {
-		icon = red("✗")
+		icon = red("вњ—")
 		ps = red(fmt.Sprintf("$%.2f (%.0f%%)", pnl, pct))
 	}
-	fmt.Printf("\n%s ВЫХОД LIVE %-18s | %s | нетто ~$%.2f | %s | %s | бал: $%.2f\n",
+	fmt.Printf("\n%s Р’Р«РҐРћР” LIVE %-18s | %s | РЅРµС‚С‚Рѕ ~$%.2f | %s | %s | Р±Р°Р»: $%.2f\n",
 		icon, pos.Symbol, ps, net, reason, dur, bal)
 	fmt.Printf("   %s %s\n", gray("sig"), gray(sig))
 	fmt.Printf("   %s %s\n", gray("DEX"), cyan(dexScreenerURL(pos.Mint)))
 	if pnl < 0 {
-		fmt.Printf("   %s [%s] %s\n", yellow("ⓘ учёт"), bk, lossLearningHint(reason))
+		fmt.Printf("   %s [%s] %s\n", yellow("в“ СѓС‡С‘С‚"), bk, lossLearningHint(reason))
 	}
 }
 
@@ -3114,32 +3125,32 @@ func (w *Wallet) stats() {
 
 	consoleMu.Lock()
 	defer consoleMu.Unlock()
-	title := "PAPER WALLET — РЕАЛЬНЫЕ ДАННЫЕ"
+	title := "PAPER WALLET вЂ” Р Р•РђР›Р¬РќР«Р• Р”РђРќРќР«Р•"
 	if liveTradingEnabled() {
-		title = "LIVE WALLET — MAINNET (Pump.fun)"
+		title = "LIVE WALLET вЂ” MAINNET (Pump.fun)"
 	}
-	fmt.Println("\n" + bold("┌──────────────────────────────────────────────┐"))
-	fmt.Println(bold("│  " + title + "                    │"))
-	fmt.Println(bold("├──────────────────────────────────────────────┤"))
-	fmt.Printf("│  Баланс:   %-33s│\n", bs)
-	fmt.Printf("│  PnL:      %-33s│\n", ps)
-	fmt.Printf("│  Сделок:   %-33s│\n", fmt.Sprintf("%d закрыто | %d открыто", n, nOpen))
-	fmt.Printf("│  Win/Loss: %-33s│\n",
+	fmt.Println("\n" + bold("в”Њв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”ђ"))
+	fmt.Println(bold("в”‚  " + title + "                    в”‚"))
+	fmt.Println(bold("в”њв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”¤"))
+	fmt.Printf("в”‚  Р‘Р°Р»Р°РЅСЃ:   %-33sв”‚\n", bs)
+	fmt.Printf("в”‚  PnL:      %-33sв”‚\n", ps)
+	fmt.Printf("в”‚  РЎРґРµР»РѕРє:   %-33sв”‚\n", fmt.Sprintf("%d Р·Р°РєСЂС‹С‚Рѕ | %d РѕС‚РєСЂС‹С‚Рѕ", n, nOpen))
+	fmt.Printf("в”‚  Win/Loss: %-33sв”‚\n",
 		fmt.Sprintf("%s/%s  WR: %.0f%%",
 			green(fmt.Sprintf("%d", wins)),
 			red(fmt.Sprintf("%d", n-wins)), wr))
 	if len(lossBk) > 0 || len(winBk) > 0 {
-		fmt.Println(bold("├──────────────────────────────────────────────┤"))
+		fmt.Println(bold("в”њв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”¤"))
 		if len(winBk) > 0 {
-			fmt.Printf("│  Плюсы по выходу: %-26s│\n", gray(formatExitBuckets(winBk)))
+			fmt.Printf("в”‚  РџР»СЋСЃС‹ РїРѕ РІС‹С…РѕРґСѓ: %-26sв”‚\n", gray(formatExitBuckets(winBk)))
 		}
 		if len(lossBk) > 0 {
-			fmt.Printf("│  Минусы по выходу: %-25s│\n", yellow(formatExitBuckets(lossBk)))
+			fmt.Printf("в”‚  РњРёРЅСѓСЃС‹ РїРѕ РІС‹С…РѕРґСѓ: %-25sв”‚\n", yellow(formatExitBuckets(lossBk)))
 		}
 	}
-	fmt.Println(bold("└──────────────────────────────────────────────┘"))
+	fmt.Println(bold("в””в”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”"))
 	if bal >= 21 {
-		fmt.Println(green("🎉 ЦЕЛЬ $21 БЫЛА БЫ ДОСТИГНУТА!"))
+		fmt.Println(green("рџЋ‰ Р¦Р•Р›Р¬ $21 Р‘Р«Р›Рђ Р‘Р« Р”РћРЎРўРР“РќРЈРўРђ!"))
 	}
 }
 
@@ -3156,7 +3167,7 @@ func formatExitBuckets(m map[string]int) string {
 	return strings.Join(parts, " ")
 }
 
-// runPaperSelfTest — один виртуальный вход и выход (без mainnet), чтобы проверить PnL и комиссии за секунды.
+// runPaperSelfTest вЂ” РѕРґРёРЅ РІРёСЂС‚СѓР°Р»СЊРЅС‹Р№ РІС…РѕРґ Рё РІС‹С…РѕРґ (Р±РµР· mainnet), С‡С‚РѕР±С‹ РїСЂРѕРІРµСЂРёС‚СЊ PnL Рё РєРѕРјРёСЃСЃРёРё Р·Р° СЃРµРєСѓРЅРґС‹.
 func runPaperSelfTest() {
 	dw := newWallet()
 	mint := "SelfTestMintSelfTestMintSelfTestMintPuump"
@@ -3167,16 +3178,16 @@ func runPaperSelfTest() {
 	consoleMu.Lock()
 	defer consoleMu.Unlock()
 
-	fmt.Println(bold("\n═══ PAPER SELF-TEST (кошелёк + комиссии, без WebSocket) ═══"))
-	fmt.Printf("Стартовый баланс: $%.2f · ставка в live: %.3f SOL (fixed)\n\n",
+	fmt.Println(bold("\nв•ђв•ђв•ђ PAPER SELF-TEST (РєРѕС€РµР»С‘Рє + РєРѕРјРёСЃСЃРёРё, Р±РµР· WebSocket) в•ђв•ђв•ђ"))
+	fmt.Printf("РЎС‚Р°СЂС‚РѕРІС‹Р№ Р±Р°Р»Р°РЅСЃ: $%.2f В· СЃС‚Р°РІРєР° РІ live: %.3f SOL (fixed)\n\n",
 		dw.Start, liveFixedBuySOLValue())
 
 	if !dw.open(tok, sym, spot) {
-		fmt.Println(red("open() не прошёл — мало баланса или ставка"))
+		fmt.Println(red("open() РЅРµ РїСЂРѕС€С‘Р» вЂ” РјР°Р»Рѕ Р±Р°Р»Р°РЅСЃР° РёР»Рё СЃС‚Р°РІРєР°"))
 		return
 	}
 
-	exitSpot := spot * 1.10 // +10% к spot — ожидаем плюс после комиссий
+	exitSpot := spot * 1.10 // +10% Рє spot вЂ” РѕР¶РёРґР°РµРј РїР»СЋСЃ РїРѕСЃР»Рµ РєРѕРјРёСЃСЃРёР№
 	dw.closePos(mint, "SELFTEST +10% spot", exitSpot)
 
 	dw.mu.Lock()
@@ -3188,18 +3199,18 @@ func runPaperSelfTest() {
 	}
 	dw.mu.Unlock()
 
-	fmt.Printf("\n%s Итог: баланс $%.2f · последняя сделка PnL %+.2f USD\n", bold("●"), bal, lastPnL)
+	fmt.Printf("\n%s РС‚РѕРі: Р±Р°Р»Р°РЅСЃ $%.2f В· РїРѕСЃР»РµРґРЅСЏСЏ СЃРґРµР»РєР° PnL %+.2f USD\n", bold("в—Џ"), bal, lastPnL)
 	if lastPnL > 0 {
-		fmt.Println(green("✓ Цепочка вход → выход и учёт комиссий работает (плюс ожидаем при +10% spot)."))
+		fmt.Println(green("вњ“ Р¦РµРїРѕС‡РєР° РІС…РѕРґ в†’ РІС‹С…РѕРґ Рё СѓС‡С‘С‚ РєРѕРјРёСЃСЃРёР№ СЂР°Р±РѕС‚Р°РµС‚ (РїР»СЋСЃ РѕР¶РёРґР°РµРј РїСЂРё +10% spot)."))
 	} else {
-		fmt.Println(yellow("ⓘ PnL после комиссий не в плюсе — так бывает при узкой марже; логика кошелька всё равно отработала."))
+		fmt.Println(yellow("в“ PnL РїРѕСЃР»Рµ РєРѕРјРёСЃСЃРёР№ РЅРµ РІ РїР»СЋСЃРµ вЂ” С‚Р°Рє Р±С‹РІР°РµС‚ РїСЂРё СѓР·РєРѕР№ РјР°СЂР¶Рµ; Р»РѕРіРёРєР° РєРѕС€РµР»СЊРєР° РІСЃС‘ СЂР°РІРЅРѕ РѕС‚СЂР°Р±РѕС‚Р°Р»Р°."))
 	}
-	fmt.Println(gray("Live: go run . (без -selftest) — ждёт реальные create-токены; live_wallet + pump_direct."))
+	fmt.Println(gray("Live: go run . (Р±РµР· -selftest) вЂ” Р¶РґС‘С‚ СЂРµР°Р»СЊРЅС‹Рµ create-С‚РѕРєРµРЅС‹; live_wallet + pump_direct."))
 }
 
-// ════════════════════════════════════════════════════
-//  МОНИТОРИНГ — цена из bonding curve напрямую
-// ════════════════════════════════════════════════════
+// в•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђ
+//  РњРћРќРРўРћР РРќР“ вЂ” С†РµРЅР° РёР· bonding curve РЅР°РїСЂСЏРјСѓСЋ
+// в•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђ
 
 func monitor(w *Wallet, mint, bcAddr, sym, source string) {
 	ticker := time.NewTicker(monitorTickInterval())
@@ -3235,7 +3246,7 @@ func monitor(w *Wallet, mint, bcAddr, sym, source string) {
 	var lastFailPrint time.Time
 	var lastGoodPrice float64
 	var lastGoodAt time.Time
-	const monitorPrintMinMove = 0.0025 // ~0.25% к цене входа — новая строка
+	const monitorPrintMinMove = 0.0025 // ~0.25% Рє С†РµРЅРµ РІС…РѕРґР° вЂ” РЅРѕРІР°СЏ СЃС‚СЂРѕРєР°
 	monitorHeartbeat := 12 * time.Second
 
 	for {
@@ -3246,11 +3257,11 @@ func monitor(w *Wallet, mint, bcAddr, sym, source string) {
 			if snap != nil {
 				px = snap.PriceUSD
 			}
-			holdStr := fmt.Sprintf("%.0fс", maxHold.Seconds())
+			holdStr := fmt.Sprintf("%.0fСЃ", maxHold.Seconds())
 			if maxHold >= time.Minute {
-				holdStr = fmt.Sprintf("%.0f мин", maxHold.Minutes())
+				holdStr = fmt.Sprintf("%.0f РјРёРЅ", maxHold.Minutes())
 			}
-			w.closePos(mint, fmt.Sprintf("ТАЙМАУТ %s", holdStr), px)
+			w.closePos(mint, fmt.Sprintf("РўРђР™РњРђРЈРў %s", holdStr), px)
 			return
 
 		case <-ticker.C:
@@ -3270,7 +3281,7 @@ func monitor(w *Wallet, mint, bcAddr, sym, source string) {
 				entry := pos.EntryPrice
 				peak := pos.PeakPrice
 				pos.mu.Unlock()
-				// Если уже был зафиксирован плюс и внезапно пропала цена — выходим сразу, не отдаём прибыль.
+				// Р•СЃР»Рё СѓР¶Рµ Р±С‹Р» Р·Р°С„РёРєСЃРёСЂРѕРІР°РЅ РїР»СЋСЃ Рё РІРЅРµР·Р°РїРЅРѕ РїСЂРѕРїР°Р»Р° С†РµРЅР° вЂ” РІС‹С…РѕРґРёРј СЃСЂР°Р·Сѓ, РЅРµ РѕС‚РґР°С‘Рј РїСЂРёР±С‹Р»СЊ.
 				if livePos && consecutiveFails >= lockFails && entry > 0 {
 					lastGoodMult := 0.0
 					if lastGoodPrice > 0 {
@@ -3278,17 +3289,17 @@ func monitor(w *Wallet, mint, bcAddr, sym, source string) {
 					}
 					if lastGoodMult >= lockMinMult || peak >= entry*lockMinMult {
 						stale := time.Since(lastGoodAt).Round(100 * time.Millisecond)
-						w.closePos(mint, fmt.Sprintf("LOCK PROFIT (нет цены x%d, stale=%v)", consecutiveFails, stale), 0)
+						w.closePos(mint, fmt.Sprintf("LOCK PROFIT (РЅРµС‚ С†РµРЅС‹ x%d, stale=%v)", consecutiveFails, stale), 0)
 						return
 					}
 				}
 				if livePos && entry > 0 && peak >= entry*panicNoPricePeakMult {
-					w.closePos(mint, fmt.Sprintf("PANIC SELL (нет цены после пика +%.0f%%)", (panicNoPricePeakMult-1)*100), 0)
+					w.closePos(mint, fmt.Sprintf("PANIC SELL (РЅРµС‚ С†РµРЅС‹ РїРѕСЃР»Рµ РїРёРєР° +%.0f%%)", (panicNoPricePeakMult-1)*100), 0)
 					return
 				}
-				// В live/turbo первые секунды часто дают RPC-пустоту; не закрываем слишком рано.
+				// Р’ live/turbo РїРµСЂРІС‹Рµ СЃРµРєСѓРЅРґС‹ С‡Р°СЃС‚Рѕ РґР°СЋС‚ RPC-РїСѓСЃС‚РѕС‚Сѓ; РЅРµ Р·Р°РєСЂС‹РІР°РµРј СЃР»РёС€РєРѕРј СЂР°РЅРѕ.
 				if consecutiveFails > maxPriceFails && !(livePos && openedFor < 20*time.Second) {
-					w.closePos(mint, "ТОКЕН УМЕР (нет данных)", 0)
+					w.closePos(mint, "РўРћРљР•Рќ РЈРњР•Р  (РЅРµС‚ РґР°РЅРЅС‹С…)", 0)
 					return
 				}
 				if livePos && openedFor < 20*time.Second && consecutiveFails > maxPriceFails {
@@ -3297,7 +3308,7 @@ func monitor(w *Wallet, mint, bcAddr, sym, source string) {
 				now := time.Now()
 				shouldPrint := consecutiveFails <= 2 || (consecutiveFails%failLogEvery == 0)
 				if now.Sub(lastFailPrint) >= 1200*time.Millisecond && shouldPrint {
-					fmt.Printf("  %s %-18s | ошибка цены (%d/%d)\n", gray("?"), sym, consecutiveFails, maxPriceFails)
+					fmt.Printf("  %s %-18s | РѕС€РёР±РєР° С†РµРЅС‹ (%d/%d)\n", gray("?"), sym, consecutiveFails, maxPriceFails)
 					lastFailPrint = now
 				}
 				continue
@@ -3310,8 +3321,8 @@ func monitor(w *Wallet, mint, bcAddr, sym, source string) {
 			progress := snap.Progress
 
 			if snap.Complete {
-				fmt.Printf("  %s %-18s | КРИВАЯ ЗАВЕРШЕНА → миграция\n", yellow("🚀"), sym)
-				w.closePos(mint, "МИГРАЦИЯ (complete)", price)
+				fmt.Printf("  %s %-18s | РљР РР’РђРЇ Р—РђР’Р•Р РЁР•РќРђ в†’ РјРёРіСЂР°С†РёСЏ\n", yellow("рџљЂ"), sym)
+				w.closePos(mint, "РњРР“Р РђР¦РРЇ (complete)", price)
 				return
 			}
 
@@ -3337,13 +3348,13 @@ func monitor(w *Wallet, mint, bcAddr, sym, source string) {
 			if pct < 0 {
 				ps = red(fmt.Sprintf("%.1f%%", pct))
 			}
-			// Печать только при заметном движении mult или раз в heartbeat (без дублей)
+			// РџРµС‡Р°С‚СЊ С‚РѕР»СЊРєРѕ РїСЂРё Р·Р°РјРµС‚РЅРѕРј РґРІРёР¶РµРЅРёРё mult РёР»Рё СЂР°Р· РІ heartbeat (Р±РµР· РґСѓР±Р»РµР№)
 			now := time.Now()
 			if lastPrint.IsZero() || math.Abs(mult-lastMult) >= monitorPrintMinMove || now.Sub(lastPrint) >= monitorHeartbeat {
 				lastMult = mult
 				lastPrint = now
 				fmt.Printf("  %s %-18s | spot: %s | $%.10f | x%.3f | curve: %.1f%%\n",
-					cyan("◈"), sym, ps, price, mult, progress*100)
+					cyan("в—€"), sym, ps, price, mult, progress*100)
 			}
 
 			age := time.Since(opened)
@@ -3352,30 +3363,30 @@ func monitor(w *Wallet, mint, bcAddr, sym, source string) {
 				return
 			}
 			if impulsePeak > 1 && peak >= entry*impulsePeak && mult <= impulseFloor {
-				w.closePos(mint, fmt.Sprintf("IMPULSE LOST (было +%.1f%%, now %.1f%%)", (impulsePeak-1)*100, (mult-1)*100), price)
+				w.closePos(mint, fmt.Sprintf("IMPULSE LOST (Р±С‹Р»Рѕ +%.1f%%, now %.1f%%)", (impulsePeak-1)*100, (mult-1)*100), price)
 				return
 			}
-			// Dynamic exit: после +15% фиксируем минимум +5%; также выходим при просадке 15% от пика.
+			// Dynamic exit: РїРѕСЃР»Рµ +15% С„РёРєСЃРёСЂСѓРµРј РјРёРЅРёРјСѓРј +5%; С‚Р°РєР¶Рµ РІС‹С…РѕРґРёРј РїСЂРё РїСЂРѕСЃР°РґРєРµ 15% РѕС‚ РїРёРєР°.
 			if peak >= entry*1.15 {
 				if price <= entry*1.05 {
-					w.closePos(mint, "PROFIT LOCK (после +15% не отдаём ниже +5%)", price)
+					w.closePos(mint, "PROFIT LOCK (РїРѕСЃР»Рµ +15% РЅРµ РѕС‚РґР°С‘Рј РЅРёР¶Рµ +5%)", price)
 					return
 				}
 				if price <= peak*0.85 {
-					w.closePos(mint, fmt.Sprintf("DRAWDOWN EXIT (-15%% от пика x%.2f)", peak/entry), price)
+					w.closePos(mint, fmt.Sprintf("DRAWDOWN EXIT (-15%% РѕС‚ РїРёРєР° x%.2f)", peak/entry), price)
 					return
 				}
 			}
 			if quickWindow > 0 && livePos && age <= quickWindow {
 				if mult >= quickTP {
-					w.closePos(mint, fmt.Sprintf("QUICK PUMP ТЕЙК ~+%.0f%% (%.1fs)", (quickTP-1)*100, quickWindow.Seconds()), price)
+					w.closePos(mint, fmt.Sprintf("QUICK PUMP РўР•Р™Рљ ~+%.0f%% (%.1fs)", (quickTP-1)*100, quickWindow.Seconds()), price)
 					return
 				}
 			} else if mult >= takeProfit {
-				w.closePos(mint, fmt.Sprintf("ТЕЙК ~+%.0f%% spot", (takeProfit-1)*100), price)
+				w.closePos(mint, fmt.Sprintf("РўР•Р™Рљ ~+%.0f%% spot", (takeProfit-1)*100), price)
 				return
 			}
-			// Recovery: на +100% фиксируем половину, остаток ведём трейлингом.
+			// Recovery: РЅР° +100% С„РёРєСЃРёСЂСѓРµРј РїРѕР»РѕРІРёРЅСѓ, РѕСЃС‚Р°С‚РѕРє РІРµРґС‘Рј С‚СЂРµР№Р»РёРЅРіРѕРј.
 			if livePos && !halfTaken && mult >= 2.0 && tokenRaw > 10 {
 				if sig, soldRaw, solOut, err := PumpDirectSellFraction(mint, 0.5); err == nil && soldRaw > 0 {
 					w.mu.Lock()
@@ -3392,52 +3403,52 @@ func monitor(w *Wallet, mint, bcAddr, sym, source string) {
 					w.saveActivePositionsLocked()
 					w.mu.Unlock()
 					fmt.Printf("  %s %-18s | partial +100%%: sold 50%% | out %.4f SOL | %s\n",
-						green("↗"), sym, float64(solOut)/1e9, gray(sig))
+						green("в†—"), sym, float64(solOut)/1e9, gray(sig))
 				}
 			}
 
-			// Трейлинг: только после TRAIL_MIN_AGE; стоп = max(откат от пика, мин. +4% к входу)
+			// РўСЂРµР№Р»РёРЅРі: С‚РѕР»СЊРєРѕ РїРѕСЃР»Рµ TRAIL_MIN_AGE; СЃС‚РѕРї = max(РѕС‚РєР°С‚ РѕС‚ РїРёРєР°, РјРёРЅ. +4% Рє РІС…РѕРґСѓ)
 			if time.Since(opened) >= TRAIL_MIN_AGE && peak >= entry*TRAIL_ACTIVATE {
 				trailLine := peak * (1 - TRAILING)
 				floorLine := entry * TRAIL_MIN_PROFIT
 				stopLine := math.Max(trailLine, floorLine)
 				if price <= stopLine {
-					w.closePos(mint, fmt.Sprintf("ТРЕЙЛИНГ (пик x%.2f, пол ≥+%.0f%%)", peak/entry, (TRAIL_MIN_PROFIT-1)*100), price)
+					w.closePos(mint, fmt.Sprintf("РўР Р•Р™Р›РРќР“ (РїРёРє x%.2f, РїРѕР» в‰Ґ+%.0f%%)", peak/entry, (TRAIL_MIN_PROFIT-1)*100), price)
 					return
 				}
 			}
 
 			if breakeven && price < entry {
-				w.closePos(mint, "БРЕЙК-ИВН после импульса", price)
+				w.closePos(mint, "Р‘Р Р•Р™Рљ-РР’Рќ РїРѕСЃР»Рµ РёРјРїСѓР»СЊСЃР°", price)
 				return
 			}
 			if flatAfter > 0 && time.Since(opened) >= flatAfter && mult >= flatMin && mult <= flatMax {
 				w.closePos(mint, fmt.Sprintf("FLAT EXIT (%.0fs, x%.3f)", flatAfter.Seconds(), mult), price)
 				return
 			}
-			// Fast Exit: за 30с нет +5% — выходим, не ждём пока сольёт
+			// Fast Exit: Р·Р° 30СЃ РЅРµС‚ +5% вЂ” РІС‹С…РѕРґРёРј, РЅРµ Р¶РґС‘Рј РїРѕРєР° СЃРѕР»СЊС‘С‚
 			if time.Since(opened) >= fastExitAfter && mult < FAST_EXIT_MIN_MULT {
-				w.closePos(mint, fmt.Sprintf("FAST EXIT (нет +%.0f%% за %.0fс, spot %.1f%%)", (FAST_EXIT_MIN_MULT-1)*100, fastExitAfter.Seconds(), (mult-1)*100), price)
+				w.closePos(mint, fmt.Sprintf("FAST EXIT (РЅРµС‚ +%.0f%% Р·Р° %.0fСЃ, spot %.1f%%)", (FAST_EXIT_MIN_MULT-1)*100, fastExitAfter.Seconds(), (mult-1)*100), price)
 				return
 			}
-			// SCRATCH: флэт >2 мин — освобождаем капитал (если не вылетели по FAST EXIT)
+			// SCRATCH: С„Р»СЌС‚ >2 РјРёРЅ вЂ” РѕСЃРІРѕР±РѕР¶РґР°РµРј РєР°РїРёС‚Р°Р» (РµСЃР»Рё РЅРµ РІС‹Р»РµС‚РµР»Рё РїРѕ FAST EXIT)
 			if time.Since(opened) >= SCRATCH_AFTER && mult < SCRATCH_IF_BELOW {
-				w.closePos(mint, fmt.Sprintf("СКРЕТЧ (флэт %.0f мин, spot %.1f%%)", SCRATCH_AFTER.Minutes(), (mult-1)*100), price)
+				w.closePos(mint, fmt.Sprintf("РЎРљР Р•РўР§ (С„Р»СЌС‚ %.0f РјРёРЅ, spot %.1f%%)", SCRATCH_AFTER.Minutes(), (mult-1)*100), price)
 				return
 			}
-			// Final Recovery: не выходим по "слабому импульсу"/"нет импульса", даём позиции разыграться.
+			// Final Recovery: РЅРµ РІС‹С…РѕРґРёРј РїРѕ "СЃР»Р°Р±РѕРјСѓ РёРјРїСѓР»СЊСЃСѓ"/"РЅРµС‚ РёРјРїСѓР»СЊСЃР°", РґР°С‘Рј РїРѕР·РёС†РёРё СЂР°Р·С‹РіСЂР°С‚СЊСЃСЏ.
 			if price <= entry*stopConfirmLvl {
 				confirmedStopTicks++
 			} else {
 				confirmedStopTicks = 0
 			}
-			// "Fake stop-out" защита: подтверждение/порог по recovery настройкам.
+			// "Fake stop-out" Р·Р°С‰РёС‚Р°: РїРѕРґС‚РІРµСЂР¶РґРµРЅРёРµ/РїРѕСЂРѕРі РїРѕ recovery РЅР°СЃС‚СЂРѕР№РєР°Рј.
 			if price <= entry*stopLossHard || confirmedStopTicks >= STOP_CONFIRM_N {
 				pct := (1 - stopLossHard) * 100
 				if price <= entry*stopLossHard {
-					w.closePos(mint, fmt.Sprintf("СТОП -%.0f%% (hard)", pct), price)
+					w.closePos(mint, fmt.Sprintf("РЎРўРћРџ -%.0f%% (hard)", pct), price)
 				} else {
-					w.closePos(mint, fmt.Sprintf("СТОП подтверждён (-%.0f%%)", pct), price)
+					w.closePos(mint, fmt.Sprintf("РЎРўРћРџ РїРѕРґС‚РІРµСЂР¶РґС‘РЅ (-%.0f%%)", pct), price)
 				}
 				return
 			}
@@ -3445,9 +3456,9 @@ func monitor(w *Wallet, mint, bcAddr, sym, source string) {
 	}
 }
 
-// ════════════════════════════════════════════════════
-//  ВСПОМОГАТЕЛЬНЫЕ
-// ════════════════════════════════════════════════════
+// в•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђ
+//  Р’РЎРџРћРњРћР“РђРўР•Р›Р¬РќР«Р•
+// в•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђ
 
 func contains(s, sub string) bool {
 	if len(sub) > len(s) {
@@ -3468,18 +3479,18 @@ func short(a string) string {
 	return a
 }
 
-// DexScreener — график/пара по mint на Solana
+// DexScreener вЂ” РіСЂР°С„РёРє/РїР°СЂР° РїРѕ mint РЅР° Solana
 func dexScreenerURL(mint string) string {
 	return "https://dexscreener.com/solana/" + mint
 }
 
-// ════════════════════════════════════════════════════
+// в•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђ
 //  MAIN
-// ════════════════════════════════════════════════════
+// в•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђ
 
 func main() {
 	_ = godotenv.Load()
-	selftest := flag.Bool("selftest", false, "проверка виртуального кошелька и комиссий за секунды (без WebSocket), затем выход")
+	selftest := flag.Bool("selftest", false, "РїСЂРѕРІРµСЂРєР° РІРёСЂС‚СѓР°Р»СЊРЅРѕРіРѕ РєРѕС€РµР»СЊРєР° Рё РєРѕРјРёСЃСЃРёР№ Р·Р° СЃРµРєСѓРЅРґС‹ (Р±РµР· WebSocket), Р·Р°С‚РµРј РІС‹С…РѕРґ")
 	flag.Parse()
 	if *selftest {
 		refreshSolPriceUSD()
@@ -3488,59 +3499,59 @@ func main() {
 	}
 
 	if !apiReady() {
-		fmt.Println(red("❌ Вставь Helius API ключ в HELIUS_API_KEY"))
-		fmt.Println(yellow("   dev.helius.xyz → Sign Up → Create App"))
+		fmt.Println(red("вќЊ Р’СЃС‚Р°РІСЊ Helius API РєР»СЋС‡ РІ HELIUS_API_KEY"))
+		fmt.Println(yellow("   dev.helius.xyz в†’ Sign Up в†’ Create App"))
 		os.Exit(1)
 	}
 	if err := initLiveTrading(); err != nil {
-		fmt.Println(red("❌ " + err.Error()))
+		fmt.Println(red("вќЊ " + err.Error()))
 		os.Exit(1)
 	}
 
-	fmt.Println(bold("╔══════════════════════════════════════════════════════════╗"))
+	fmt.Println(bold("в•”в•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•—"))
 	if liveTradingEnabled() {
-		fmt.Println(bold("║   PUMP.FUN — БОЕВОЙ РЕЖИМ (MAINNET)                      ║"))
-		fmt.Println(bold("║   Реальные SOL · Pump.fun curve · риск потери капитала    ║"))
+		fmt.Println(bold("в•‘   PUMP.FUN вЂ” Р‘РћР•Р’РћР™ Р Р•Р–РРњ (MAINNET)                      в•‘"))
+		fmt.Println(bold("в•‘   Р РµР°Р»СЊРЅС‹Рµ SOL В· Pump.fun curve В· СЂРёСЃРє РїРѕС‚РµСЂРё РєР°РїРёС‚Р°Р»Р°    в•‘"))
 	} else {
-		fmt.Println(bold("║   PUMP.FUN LIVE PAPER TRADING                            ║"))
-		fmt.Println(bold("║   Реальные токены · Реальные цены · Виртуальные деньги  ║"))
+		fmt.Println(bold("в•‘   PUMP.FUN LIVE PAPER TRADING                            в•‘"))
+		fmt.Println(bold("в•‘   Р РµР°Р»СЊРЅС‹Рµ С‚РѕРєРµРЅС‹ В· Р РµР°Р»СЊРЅС‹Рµ С†РµРЅС‹ В· Р’РёСЂС‚СѓР°Р»СЊРЅС‹Рµ РґРµРЅСЊРіРё  в•‘"))
 	}
-	fmt.Println(bold("╚══════════════════════════════════════════════════════════╝"))
+	fmt.Println(bold("в•љв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ќ"))
 	if liveTradingEnabled() {
-		fmt.Println(green("✓ Helius WebSocket — Pump.fun (live поток)"))
+		fmt.Println(green("вњ“ Helius WebSocket вЂ” Pump.fun (live РїРѕС‚РѕРє)"))
 	} else {
-		fmt.Println(green("✓ Helius WebSocket — Pump.fun + Raydium LaunchLab (два потока)"))
+		fmt.Println(green("вњ“ Helius WebSocket вЂ” Pump.fun + Raydium LaunchLab (РґРІР° РїРѕС‚РѕРєР°)"))
 	}
-	fmt.Println(green("✓ Bonding Curve Price — прямо из on-chain данных"))
+	fmt.Println(green("вњ“ Bonding Curve Price вЂ” РїСЂСЏРјРѕ РёР· on-chain РґР°РЅРЅС‹С…"))
 	if liveTradingEnabled() {
-		fmt.Printf("%s LIVE кошелёк %s | %s\n", green("✓"), cyan(short(livePub.String())),
-			yellow("Только mint …pump на кривой; LaunchLab в live не торгуется."))
+		fmt.Printf("%s LIVE РєРѕС€РµР»С‘Рє %s | %s\n", green("вњ“"), cyan(short(livePub.String())),
+			yellow("РўРѕР»СЊРєРѕ mint вЂ¦pump РЅР° РєСЂРёРІРѕР№; LaunchLab РІ live РЅРµ С‚РѕСЂРіСѓРµС‚СЃСЏ."))
 		if useJitoEnabled() {
-			fmt.Println(green("✓ Jito bundles: ВКЛ (sendBundle)"))
+			fmt.Println(green("вњ“ Jito bundles: Р’РљР› (sendBundle)"))
 		} else {
-			fmt.Println(yellow("⚠ Jito bundles: ВЫКЛ (идет обычный RPC sendTransaction)"))
+			fmt.Println(yellow("вљ  Jito bundles: Р’Р«РљР› (РёРґРµС‚ РѕР±С‹С‡РЅС‹Р№ RPC sendTransaction)"))
 		}
 	}
 	if shouldSkipVelocity() {
-		fmt.Println(yellow("⚠ Velocity-check отключён (SKIP/AUTO) — больше входов, больше шума."))
+		fmt.Println(yellow("вљ  Velocity-check РѕС‚РєР»СЋС‡С‘РЅ (SKIP/AUTO) вЂ” Р±РѕР»СЊС€Рµ РІС…РѕРґРѕРІ, Р±РѕР»СЊС€Рµ С€СѓРјР°."))
 	}
 	if shouldSkipAntiScam() {
-		fmt.Println(red("⚠ Anti-scam фильтры отключены (SKIP/AUTO) — в live можно слить SOL на мусор."))
+		fmt.Println(red("вљ  Anti-scam С„РёР»СЊС‚СЂС‹ РѕС‚РєР»СЋС‡РµРЅС‹ (SKIP/AUTO) вЂ” РІ live РјРѕР¶РЅРѕ СЃР»РёС‚СЊ SOL РЅР° РјСѓСЃРѕСЂ."))
 	}
 	if turboModeEnabled() {
-		fmt.Println(yellow("⚠ TURBO mode (live+aggressive): ускоренный hot-path с минимальными проверками."))
+		fmt.Println(yellow("вљ  TURBO mode (live+aggressive): СѓСЃРєРѕСЂРµРЅРЅС‹Р№ hot-path СЃ РјРёРЅРёРјР°Р»СЊРЅС‹РјРё РїСЂРѕРІРµСЂРєР°РјРё."))
 	}
 	if ultraFastEntryMode() {
-		fmt.Println(red("⚠ ULTRA_FAST_ENTRY: вход сразу после parse mint (без curve/velocity/scam-гейтов)."))
-		fmt.Printf("%s ULTRA monitor: tick=%v | quick_tp=~+%.0f%% в первые %.1fs\n",
-			yellow("⚠"), monitorTickInterval(), (quickPumpTakeProfitMult()-1)*100, quickPumpWindow().Seconds())
+		fmt.Println(red("вљ  ULTRA_FAST_ENTRY: РІС…РѕРґ СЃСЂР°Р·Сѓ РїРѕСЃР»Рµ parse mint (Р±РµР· curve/velocity/scam-РіРµР№С‚РѕРІ)."))
+		fmt.Printf("%s ULTRA monitor: tick=%v | quick_tp=~+%.0f%% РІ РїРµСЂРІС‹Рµ %.1fs\n",
+			yellow("вљ "), monitorTickInterval(), (quickPumpTakeProfitMult()-1)*100, quickPumpWindow().Seconds())
 	}
 
 	refreshSolPriceUSD()
 	refreshDynamicPriorityFeeFromRPC()
 	startPumpHotCaches()
 	sp := getSolUSD()
-	fmt.Printf("%s SOL/USD: $%.2f (CoinGecko, автообновление ~90 с)\n", green("✓"), sp)
+	fmt.Printf("%s SOL/USD: $%.2f (CoinGecko, Р°РІС‚РѕРѕР±РЅРѕРІР»РµРЅРёРµ ~90 СЃ)\n", green("вњ“"), sp)
 	go func() {
 		t := time.NewTicker(90 * time.Second)
 		for range t.C {
@@ -3553,8 +3564,8 @@ func main() {
 			refreshDynamicPriorityFeeFromRPC()
 		}
 	}()
-	fmt.Printf("\n%s Режим: %s | кривая: %.1f%%–%.1f%% | min SOL: %.2f | velocity(base): %v (Δ≥%.2f%% или +%.3f SOL) | profile=%s | ончейн-фильтры\n",
-		bold("▶"), cyan("SNIPER"), SNIPER_CURVE_MIN*100, SNIPER_CURVE_MAX*100, MIN_REAL_SOL,
+	fmt.Printf("\n%s Р РµР¶РёРј: %s | РєСЂРёРІР°СЏ: %.1f%%вЂ“%.1f%% | min SOL: %.2f | velocity(base): %v (О”в‰Ґ%.2f%% РёР»Рё +%.3f SOL) | profile=%s | РѕРЅС‡РµР№РЅ-С„РёР»СЊС‚СЂС‹\n",
+		bold("в–¶"), cyan("SNIPER"), SNIPER_CURVE_MIN*100, SNIPER_CURVE_MAX*100, MIN_REAL_SOL,
 		velocityPause(), VELOCITY_MIN_DPROGRESS*100, VELOCITY_MIN_DREALSOL, envSignalProfile())
 	wallet := newWallet()
 	if liveTradingEnabled() {
@@ -3568,34 +3579,34 @@ func main() {
 	}
 	restored := wallet.activePositionSnapshots()
 	if liveTradingEnabled() && len(restored) > 0 {
-		fmt.Printf("%s Восстановлено активных позиций из %s: %d\n",
-			yellow("↺"), ACTIVE_POSITIONS_FILE, len(restored))
+		fmt.Printf("%s Р’РѕСЃСЃС‚Р°РЅРѕРІР»РµРЅРѕ Р°РєС‚РёРІРЅС‹С… РїРѕР·РёС†РёР№ РёР· %s: %d\n",
+			yellow("в†є"), ACTIVE_POSITIONS_FILE, len(restored))
 		for _, p := range restored {
 			go monitor(wallet, p.Mint, p.BondingCurve, p.Symbol, p.Source)
 		}
 	}
 	if liveTradingEnabled() {
-		fmt.Printf("%s Баланс: %s (ончейн) | Ставка: FIXED %.3f SOL (после резерва) | Макс позиций: %d\n",
-			bold("▶"), green(fmt.Sprintf("$%.2f", wallet.Balance)), liveFixedBuySOLValue(), MAX_POSITIONS)
+		fmt.Printf("%s Р‘Р°Р»Р°РЅСЃ: %s (РѕРЅС‡РµР№РЅ) | РЎС‚Р°РІРєР°: FIXED %.3f SOL (РїРѕСЃР»Рµ СЂРµР·РµСЂРІР°) | РњР°РєСЃ РїРѕР·РёС†РёР№: %d\n",
+			bold("в–¶"), green(fmt.Sprintf("$%.2f", wallet.Balance)), liveFixedBuySOLValue(), MAX_POSITIONS)
 	} else {
-		fmt.Printf("%s Баланс: %s | Ставка: %.2f%% от банка (min $%.2f) → сейчас ~$%.2f на сделку | Макс позиций: %d\n",
-			bold("▶"), green(fmt.Sprintf("$%.2f", PAPER_BALANCE)), BET_PCT_OF_BALANCE*100, MIN_STAKE_USD,
+		fmt.Printf("%s Р‘Р°Р»Р°РЅСЃ: %s | РЎС‚Р°РІРєР°: %.2f%% РѕС‚ Р±Р°РЅРєР° (min $%.2f) в†’ СЃРµР№С‡Р°СЃ ~$%.2f РЅР° СЃРґРµР»РєСѓ | РњР°РєСЃ РїРѕР·РёС†РёР№: %d\n",
+			bold("в–¶"), green(fmt.Sprintf("$%.2f", PAPER_BALANCE)), BET_PCT_OF_BALANCE*100, MIN_STAKE_USD,
 			stakeFromBalance(PAPER_BALANCE), MAX_POSITIONS)
 	}
-	fmt.Printf("%s DexScreener — по mint показывается вся история торгов; даты на оси — календарь свечей, не дата «создания ссылки». Свежесть листинга смотри в строке ⏱ (время блока create-тx).\n",
-		gray("ⓘ"))
-	fmt.Printf("%s Быстрая проверка кошелька: %s\n",
-		gray("ⓘ"), cyan("go run . -selftest"))
-	fmt.Printf("%s Цель «~1 вход / 2 мин» — ориентир: одна позиция + поток Pump.fun; смотри строку ◎ «средний интервал» раз в минуту.\n\n",
-		gray("ⓘ"))
+	fmt.Printf("%s DexScreener вЂ” РїРѕ mint РїРѕРєР°Р·С‹РІР°РµС‚СЃСЏ РІСЃСЏ РёСЃС‚РѕСЂРёСЏ С‚РѕСЂРіРѕРІ; РґР°С‚С‹ РЅР° РѕСЃРё вЂ” РєР°Р»РµРЅРґР°СЂСЊ СЃРІРµС‡РµР№, РЅРµ РґР°С‚Р° В«СЃРѕР·РґР°РЅРёСЏ СЃСЃС‹Р»РєРёВ». РЎРІРµР¶РµСЃС‚СЊ Р»РёСЃС‚РёРЅРіР° СЃРјРѕС‚СЂРё РІ СЃС‚СЂРѕРєРµ вЏ± (РІСЂРµРјСЏ Р±Р»РѕРєР° create-С‚x).\n",
+		gray("в“"))
+	fmt.Printf("%s Р‘С‹СЃС‚СЂР°СЏ РїСЂРѕРІРµСЂРєР° РєРѕС€РµР»СЊРєР°: %s\n",
+		gray("в“"), cyan("go run . -selftest"))
+	fmt.Printf("%s Р¦РµР»СЊ В«~1 РІС…РѕРґ / 2 РјРёРЅВ» вЂ” РѕСЂРёРµРЅС‚РёСЂ: РѕРґРЅР° РїРѕР·РёС†РёСЏ + РїРѕС‚РѕРє Pump.fun; СЃРјРѕС‚СЂРё СЃС‚СЂРѕРєСѓ в—Ћ В«СЃСЂРµРґРЅРёР№ РёРЅС‚РµСЂРІР°Р»В» СЂР°Р· РІ РјРёРЅСѓС‚Сѓ.\n\n",
+		gray("в“"))
 
 	tokenCh := make(chan NewToken, 200)
 	var seen sync.Map
-	// Больше слотов: пока один токен в sleep(velocity), остальные create обрабатываются
+	// Р‘РѕР»СЊС€Рµ СЃР»РѕС‚РѕРІ: РїРѕРєР° РѕРґРёРЅ С‚РѕРєРµРЅ РІ sleep(velocity), РѕСЃС‚Р°Р»СЊРЅС‹Рµ create РѕР±СЂР°Р±Р°С‚С‹РІР°СЋС‚СЃСЏ
 	sem := make(chan struct{}, RPC_MAX_CONCURRENT)
 
 	go listenPumpWSS(tokenCh)
-	// В live-режиме торгуем только Pump.fun curve: LaunchLab поток создаёт лишний шум/задержки.
+	// Р’ live-СЂРµР¶РёРјРµ С‚РѕСЂРіСѓРµРј С‚РѕР»СЊРєРѕ Pump.fun curve: LaunchLab РїРѕС‚РѕРє СЃРѕР·РґР°С‘С‚ Р»РёС€РЅРёР№ С€СѓРј/Р·Р°РґРµСЂР¶РєРё.
 	if !liveTradingEnabled() {
 		go listenProgram(LAUNCHLAB_PROGRAM, "Raydium LaunchLab", launchLabInitFromLogs, tokenCh, "launchlab")
 	}
@@ -3626,7 +3637,7 @@ func main() {
 						return
 					}
 					if mint == "" {
-						logRejectLine("no_mint", "?", "", "launchlab: нет mint в tx")
+						logRejectLine("no_mint", "?", "", "launchlab: РЅРµС‚ mint РІ tx")
 						return
 					}
 					bc, err = launchLabPoolPDA(mint)
@@ -3640,12 +3651,12 @@ func main() {
 						return
 					}
 					if mint == "" {
-						logRejectLine("no_mint", "?", "", "нет mint в create tx")
+						logRejectLine("no_mint", "?", "", "РЅРµС‚ mint РІ create tx")
 						return
 					}
 					if !strings.HasSuffix(mint, "pump") {
 						sym := "$" + short(mint)
-						logRejectLine("not_pump", sym, mint, "mint не …pump — не pump.fun токен")
+						logRejectLine("not_pump", sym, mint, "mint РЅРµ вЂ¦pump вЂ” РЅРµ pump.fun С‚РѕРєРµРЅ")
 						return
 					}
 					bc, err = pumpBondingCurvePDA(mint)
@@ -3681,7 +3692,7 @@ func main() {
 				if !hotPathSilent() {
 					consoleMu.Lock()
 					fmt.Printf("%s Token Detected | %s | %s | %s\n",
-						gray("⏱"), sym, src, tok.DetectedAt.Format(time.RFC3339Nano))
+						gray("вЏ±"), sym, src, tok.DetectedAt.Format(time.RFC3339Nano))
 					consoleMu.Unlock()
 				}
 				if src == "pump" && ultraFastEntryMode() {
@@ -3691,7 +3702,7 @@ func main() {
 						snap0, err := getCurveSnapshotWithRetry(bc, src)
 						curveDone = time.Now()
 						if err != nil || snap0 == nil || snap0.PriceUSD <= 0 {
-							logRejectLine("no_price", sym, mint, "ultra-quality: нет цены")
+							logRejectLine("no_price", sym, mint, "ultra-quality: РЅРµС‚ С†РµРЅС‹")
 							if !tok.DetectedAt.IsZero() {
 								total := time.Since(tok.DetectedAt).Milliseconds()
 								printHotPathTrace(sym, src, "reject:ultra_no_price", "curve snapshot unavailable", parseDone.Sub(traceStart).Milliseconds(), curveDone.Sub(parseDone).Milliseconds(), 0, total)
@@ -3737,7 +3748,7 @@ func main() {
 							time.Sleep(pause)
 							snap1, err := getCurveSnapshotWithRetry(bc, src)
 							if err != nil || snap1 == nil || snap1.PriceUSD <= 0 {
-								logRejectLine("vel_rpc", sym, mint, "ultra-quality: второй замер недоступен")
+								logRejectLine("vel_rpc", sym, mint, "ultra-quality: РІС‚РѕСЂРѕР№ Р·Р°РјРµСЂ РЅРµРґРѕСЃС‚СѓРїРµРЅ")
 								if !tok.DetectedAt.IsZero() {
 									total := time.Since(tok.DetectedAt).Milliseconds()
 									printHotPathTrace(sym, src, "reject:ultra_vel_rpc", "second snapshot unavailable", parseDone.Sub(traceStart).Milliseconds(), time.Since(parseDone).Milliseconds(), 0, total)
@@ -3747,7 +3758,7 @@ func main() {
 							dP := snap1.Progress - snap0.Progress
 							dSol := snap1.RealSolSOL - snap0.RealSolSOL
 							if dP < ultraMinDeltaProgress() && dSol < ultraMinDeltaSOL() {
-								logRejectLine("vel_low", sym, mint, fmt.Sprintf("ultra-quality: слабый импульс (Δ%.2f%% / +%.3f SOL)", dP*100, dSol))
+								logRejectLine("vel_low", sym, mint, fmt.Sprintf("ultra-quality: СЃР»Р°Р±С‹Р№ РёРјРїСѓР»СЊСЃ (О”%.2f%% / +%.3f SOL)", dP*100, dSol))
 								if !tok.DetectedAt.IsZero() {
 									total := time.Since(tok.DetectedAt).Milliseconds()
 									printHotPathTrace(sym, src, "reject:ultra_vel_low", "weak momentum", parseDone.Sub(traceStart).Milliseconds(), time.Since(parseDone).Milliseconds(), 0, total)
@@ -3828,10 +3839,10 @@ func main() {
 							if ultraQualityFilterEnabled() && snapFast != nil {
 								msg = fmt.Sprintf("ultra-quality: curve %.1f%% | SOL %.2f", snapFast.Progress*100, snapFast.RealSolSOL)
 							}
-							fmt.Printf("\n%s %-18s | %s | ULTRA_FAST_ENTRY → ВХОД\n",
-								green("✓"), sym, gray(msg))
+							fmt.Printf("\n%s %-18s | %s | ULTRA_FAST_ENTRY в†’ Р’РҐРћР”\n",
+								green("вњ“"), sym, gray(msg))
 							if createAt != nil {
-								fmt.Printf("   %s %s\n", gray("⏱"), formatCreateAge(createAt))
+								fmt.Printf("   %s %s\n", gray("вЏ±"), formatCreateAge(createAt))
 							}
 							fmt.Printf("   %s %s\n", gray("DEX"), cyan(dexScreenerURL(mint)))
 							consoleMu.Unlock()
@@ -3840,7 +3851,7 @@ func main() {
 					} else {
 						atomic.AddInt64(&funnelOpenFail, 1)
 						consoleMu.Lock()
-						fmt.Println(yellow("⚠ ВХОД отклонён open(): баланс, лимит, не pump в live, или RPC"))
+						fmt.Println(yellow("вљ  Р’РҐРћР” РѕС‚РєР»РѕРЅС‘РЅ open(): Р±Р°Р»Р°РЅСЃ, Р»РёРјРёС‚, РЅРµ pump РІ live, РёР»Рё RPC"))
 						consoleMu.Unlock()
 					}
 					return
@@ -3848,7 +3859,7 @@ func main() {
 
 				if createAt != nil && time.Since(*createAt) > MAX_CREATE_TX_AGE {
 					logRejectLine("stale_tx", sym, mint, fmt.Sprintf(
-						"create-тx старше %v (%s) — не свежий листинг", MAX_CREATE_TX_AGE, formatCreateAge(createAt)))
+						"create-С‚x СЃС‚Р°СЂС€Рµ %v (%s) вЂ” РЅРµ СЃРІРµР¶РёР№ Р»РёСЃС‚РёРЅРі", MAX_CREATE_TX_AGE, formatCreateAge(createAt)))
 					if !tok.DetectedAt.IsZero() {
 						total := time.Since(tok.DetectedAt).Milliseconds()
 						printHotPathTrace(sym, src, "reject:stale_tx", "stale create tx", parseDone.Sub(traceStart).Milliseconds(), 0, 0, total)
@@ -3865,7 +3876,7 @@ func main() {
 					return
 				}
 				if err != nil || snap0 == nil || snap0.PriceUSD <= 0 {
-					logRejectLine("no_price", sym, mint, "нет цены (кривая / pool)")
+					logRejectLine("no_price", sym, mint, "РЅРµС‚ С†РµРЅС‹ (РєСЂРёРІР°СЏ / pool)")
 					if !tok.DetectedAt.IsZero() {
 						total := time.Since(tok.DetectedAt).Milliseconds()
 						printHotPathTrace(sym, src, "reject:no_price", "curve snapshot unavailable", parseDone.Sub(traceStart).Milliseconds(), time.Since(parseDone).Milliseconds(), 0, total)
@@ -3881,7 +3892,7 @@ func main() {
 					return
 				}
 				if snap0.Progress < SNIPER_CURVE_MIN {
-					logRejectLine("empty", sym, mint, fmt.Sprintf("curve %.2f%% < %.1f%% — пусто",
+					logRejectLine("empty", sym, mint, fmt.Sprintf("curve %.2f%% < %.1f%% вЂ” РїСѓСЃС‚Рѕ",
 						snap0.Progress*100, SNIPER_CURVE_MIN*100))
 					if !tok.DetectedAt.IsZero() {
 						total := time.Since(tok.DetectedAt).Milliseconds()
@@ -3890,7 +3901,7 @@ func main() {
 					return
 				}
 				if snap0.Progress > SNIPER_CURVE_MAX {
-					logRejectLine("late", sym, mint, fmt.Sprintf("curve %.1f%% > %.1f%% — поздно",
+					logRejectLine("late", sym, mint, fmt.Sprintf("curve %.1f%% > %.1f%% вЂ” РїРѕР·РґРЅРѕ",
 						snap0.Progress*100, SNIPER_CURVE_MAX*100))
 					if !tok.DetectedAt.IsZero() {
 						total := time.Since(tok.DetectedAt).Milliseconds()
@@ -3927,7 +3938,7 @@ func main() {
 				if src == "launchlab" {
 					extraMint = []string{LAUNCHLAB_PROGRAM}
 				}
-				// velocity и antiScam параллельно — экономия ~200ms
+				// velocity Рё antiScam РїР°СЂР°Р»Р»РµР»СЊРЅРѕ вЂ” СЌРєРѕРЅРѕРјРёСЏ ~200ms
 				var snap1 *curveSnap
 				var vOK bool
 				var vDetail, vKey string
@@ -3942,7 +3953,7 @@ func main() {
 				go func() {
 					defer wg.Done()
 					if shouldSkipAntiScam() {
-						scamOK, scamMeta = true, "[anti-scam skip (SKIP/AUTO) — не для безопасной торговли]"
+						scamOK, scamMeta = true, "[anti-scam skip (SKIP/AUTO) вЂ” РЅРµ РґР»СЏ Р±РµР·РѕРїР°СЃРЅРѕР№ С‚РѕСЂРіРѕРІР»Рё]"
 					} else {
 						scamOK, scamMeta = antiScamCheck(mint, bc, liqVault, creator, createAt, extraMint...)
 					}
@@ -3968,7 +3979,7 @@ func main() {
 				}
 				atomic.AddInt64(&funnelPassVel, 1)
 				if src == "pump" && !turboModeEnabled() && snap1.Progress > FAST_HEAVY_CHECK_CURVE_MAX {
-					logRejectLine("late", sym, mint, fmt.Sprintf("fast-gate: curve %.1f%% > %.1f%% до тяжёлых RPC-проверок",
+					logRejectLine("late", sym, mint, fmt.Sprintf("fast-gate: curve %.1f%% > %.1f%% РґРѕ С‚СЏР¶С‘Р»С‹С… RPC-РїСЂРѕРІРµСЂРѕРє",
 						snap1.Progress*100, FAST_HEAVY_CHECK_CURVE_MAX*100))
 					if !tok.DetectedAt.IsZero() {
 						total := time.Since(tok.DetectedAt).Milliseconds()
@@ -3984,7 +3995,7 @@ func main() {
 					return
 				}
 				if !scamOK {
-					logRejectLine("scam", sym, mint, "фильтр: "+scamMeta)
+					logRejectLine("scam", sym, mint, "С„РёР»СЊС‚СЂ: "+scamMeta)
 					if !tok.DetectedAt.IsZero() {
 						total := time.Since(tok.DetectedAt).Milliseconds()
 						printHotPathTrace(sym, src, "reject:scam", scamMeta, parseDone.Sub(traceStart).Milliseconds(), curveDone.Sub(parseDone).Milliseconds(), time.Since(curveDone).Milliseconds(), total)
@@ -3996,7 +4007,7 @@ func main() {
 					if !hotPathSilent() {
 						consoleMu.Lock()
 						fmt.Printf("%s Filters Passed | %s | +%dms\n",
-							gray("⏱"), sym, delta.Milliseconds())
+							gray("вЏ±"), sym, delta.Milliseconds())
 						consoleMu.Unlock()
 					}
 					if delta > MAX_READY_TO_SEND_DELAY {
@@ -4022,12 +4033,12 @@ func main() {
 				if src == "launchlab" {
 					srcTag = cyan("LaunchLab")
 				}
-				fmt.Printf("\n%s %-18s | %s | $%.10f | curve %.1f%% | SOL %.2f | %s | %s → ВХОД\n",
-					green("✓"), sym, srcTag, price, progress*100, realSol, gray(vDetail), gray(scamMeta))
-				fmt.Printf("   %s %s\n", gray("⏱"), cyan(ageInfo))
+				fmt.Printf("\n%s %-18s | %s | $%.10f | curve %.1f%% | SOL %.2f | %s | %s в†’ Р’РҐРћР”\n",
+					green("вњ“"), sym, srcTag, price, progress*100, realSol, gray(vDetail), gray(scamMeta))
+				fmt.Printf("   %s %s\n", gray("вЏ±"), cyan(ageInfo))
 				fmt.Printf("   %s %s\n", gray("DEX"), cyan(dexScreenerURL(mint)))
 				if liveTradingEnabled() {
-					fmt.Println(gray("   ⏳ LIVE: подпись транзакции Pump.fun (RPC) — обычно несколько секунд."))
+					fmt.Println(gray("   вЏі LIVE: РїРѕРґРїРёСЃСЊ С‚СЂР°РЅР·Р°РєС†РёРё Pump.fun (RPC) вЂ” РѕР±С‹С‡РЅРѕ РЅРµСЃРєРѕР»СЊРєРѕ СЃРµРєСѓРЅРґ."))
 				}
 				consoleMu.Unlock()
 
@@ -4040,14 +4051,14 @@ func main() {
 				} else {
 					atomic.AddInt64(&funnelOpenFail, 1)
 					consoleMu.Lock()
-					fmt.Println(yellow("⚠ ВХОД отклонён open(): баланс, лимит, не pump в live, или RPC"))
+					fmt.Println(yellow("вљ  Р’РҐРћР” РѕС‚РєР»РѕРЅС‘РЅ open(): Р±Р°Р»Р°РЅСЃ, Р»РёРјРёС‚, РЅРµ pump РІ live, РёР»Рё RPC"))
 					consoleMu.Unlock()
 				}
 			}()
 		}
 	}()
 
-	// Статистика каждые 3 минуты
+	// РЎС‚Р°С‚РёСЃС‚РёРєР° РєР°Р¶РґС‹Рµ 3 РјРёРЅСѓС‚С‹
 	go func() {
 		t := time.NewTicker(3 * time.Minute)
 		for range t.C {
@@ -4055,7 +4066,7 @@ func main() {
 		}
 	}()
 
-	// Сводка отсева раз в минуту (без спама по каждому токену)
+	// РЎРІРѕРґРєР° РѕС‚СЃРµРІР° СЂР°Р· РІ РјРёРЅСѓС‚Сѓ (Р±РµР· СЃРїР°РјР° РїРѕ РєР°Р¶РґРѕРјСѓ С‚РѕРєРµРЅСѓ)
 	go func() {
 		t := time.NewTicker(1 * time.Minute)
 		for range t.C {
@@ -4065,16 +4076,16 @@ func main() {
 		}
 	}()
 
-	fmt.Println(gray("Нажми Ctrl+C для остановки\n"))
+	fmt.Println(gray("РќР°Р¶РјРё Ctrl+C РґР»СЏ РѕСЃС‚Р°РЅРѕРІРєРё\n"))
 	quit := make(chan os.Signal, 1)
 	signal.Notify(quit, os.Interrupt, syscall.SIGTERM)
 	<-quit
 
-	fmt.Println(yellow("\n⏹  Остановка..."))
+	fmt.Println(yellow("\nвЏ№  РћСЃС‚Р°РЅРѕРІРєР°..."))
 	wallet.stats()
 	wallet.mu.Lock()
 	if len(wallet.Closed) > 0 {
-		fmt.Println("\n" + bold("── История сделок ─────────────────────────────"))
+		fmt.Println("\n" + bold("в”Ђв”Ђ РСЃС‚РѕСЂРёСЏ СЃРґРµР»РѕРє в”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђ"))
 		for _, t := range wallet.Closed {
 			ps := green(fmt.Sprintf("+$%.2f", t.PnL))
 			if t.PnL < 0 {
@@ -4092,15 +4103,15 @@ func main() {
 	}
 	wallet.mu.Unlock()
 	if liveTradingEnabled() {
-		fmt.Println(yellow("\n⚠ LIVE: сделки были в mainnet — проверь баланс в кошельке."))
+		fmt.Println(yellow("\nвљ  LIVE: СЃРґРµР»РєРё Р±С‹Р»Рё РІ mainnet вЂ” РїСЂРѕРІРµСЂСЊ Р±Р°Р»Р°РЅСЃ РІ РєРѕС€РµР»СЊРєРµ."))
 	} else {
-		fmt.Println(bold("\n✓ Реальных денег не потрачено."))
+		fmt.Println(bold("\nвњ“ Р РµР°Р»СЊРЅС‹С… РґРµРЅРµРі РЅРµ РїРѕС‚СЂР°С‡РµРЅРѕ."))
 	}
 }
 
-// ════════════════════════════════════════════════════
-//  RAYDIUM LAUNCHLAB (в этом же файле — go run без launchlab.go)
-// ════════════════════════════════════════════════════
+// в•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђ
+//  RAYDIUM LAUNCHLAB (РІ СЌС‚РѕРј Р¶Рµ С„Р°Р№Р»Рµ вЂ” go run Р±РµР· launchlab.go)
+// в•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђ
 
 func launchLabBaseVault(poolAddr, mint string) (string, error) {
 	pool, err := solana.PublicKeyFromBase58(poolAddr)
@@ -4144,11 +4155,11 @@ func launchLabPoolPDA(mint string) (string, error) {
 
 func parseLaunchLabPoolData(raw []byte) (virtualA, virtualB, realA, realB, totalFund uint64, status, mintDecA uint8, err error) {
 	if len(raw) < 8+77 {
-		return 0, 0, 0, 0, 0, 0, 0, fmt.Errorf("короткий аккаунт pool")
+		return 0, 0, 0, 0, 0, 0, 0, fmt.Errorf("РєРѕСЂРѕС‚РєРёР№ Р°РєРєР°СѓРЅС‚ pool")
 	}
 	body := raw[8:]
 	if len(body) < 77 {
-		return 0, 0, 0, 0, 0, 0, 0, fmt.Errorf("короткое тело")
+		return 0, 0, 0, 0, 0, 0, 0, fmt.Errorf("РєРѕСЂРѕС‚РєРѕРµ С‚РµР»Рѕ")
 	}
 	status = body[17]
 	mintDecA = body[18]
@@ -4180,14 +4191,14 @@ func getLaunchLabSnapshot(poolAddr string) (*curveSnap, error) {
 		} `json:"result"`
 	}
 	if json.Unmarshal(data, &r) != nil || r.Result == nil || r.Result.Value == nil {
-		return nil, fmt.Errorf("нет pool аккаунта")
+		return nil, fmt.Errorf("РЅРµС‚ pool Р°РєРєР°СѓРЅС‚Р°")
 	}
 	if r.Result.Value.Owner != LAUNCHLAB_PROGRAM {
-		return nil, fmt.Errorf("owner не LaunchLab")
+		return nil, fmt.Errorf("owner РЅРµ LaunchLab")
 	}
 	arr := r.Result.Value.Data
 	if len(arr) < 1 {
-		return nil, fmt.Errorf("нет data")
+		return nil, fmt.Errorf("РЅРµС‚ data")
 	}
 	b64str, _ := arr[0].(string)
 	raw, err := base64.StdEncoding.DecodeString(b64str)
@@ -4255,3 +4266,4 @@ func parseLaunchLabCreateTx(sig string) (mint, creator string, createBlockTime *
 	}
 	return mint, creator, createBlockTime
 }
+

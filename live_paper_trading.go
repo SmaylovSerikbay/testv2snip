@@ -3359,6 +3359,7 @@ func listenProgram(programID, prettyLabel string, wantLogs func([]string) bool, 
 // listenPumpWSS вЂ” РѕС‚РґРµР»СЊРЅС‹Р№ WSS-СЃР»СѓС€Р°С‚РµР»СЊ Р»РѕРіРѕРІ Pump.fun РґР»СЏ РјРёРЅРёРјР°Р»СЊРЅРѕР№ Р·Р°РґРµСЂР¶РєРё РЅР° РґРµС‚РµРєС‚Рµ.
 func listenPumpWSS(ch chan<- NewToken) {
 	if liveTradingEnabled() {
+		go listenProgram(PUMP_PROGRAM, "Pump.fun Logs Fallback", pumpCreateFromLogs, ch, "pump")
 		listenProgramBlocks(PUMP_PROGRAM, "Pump.fun", pumpCreateFromLogs, ch, "pump")
 		return
 	}

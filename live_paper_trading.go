@@ -1041,7 +1041,7 @@ func ultraMinRealSOL() float64 {
 			return v
 		}
 	}
-	return 0.8
+	return 0.4
 }
 
 func ultraMinProgress() float64 {
@@ -1077,7 +1077,7 @@ func ultraMinDeltaProgress() float64 {
 			return v / 100.0
 		}
 	}
-	return 0.005 // 0.5%
+	return 0.002 // 0.2%
 }
 
 func ultraMinDeltaSOL() float64 {
@@ -1086,7 +1086,25 @@ func ultraMinDeltaSOL() float64 {
 			return v
 		}
 	}
-	return 0.03
+	return 0.01
+}
+
+func ultraSkipMomentumIfParseMs() int64 {
+	if s := strings.TrimSpace(os.Getenv("ULTRA_SKIP_MOMENTUM_IF_PARSE_MS")); s != "" {
+		if v, err := strconv.Atoi(s); err == nil && v >= 100 && v <= 2000 {
+			return int64(v)
+		}
+	}
+	return 550
+}
+
+func ultraSkipMomentumIfFirstSnapMs() int64 {
+	if s := strings.TrimSpace(os.Getenv("ULTRA_SKIP_MOMENTUM_IF_FIRST_SNAP_MS")); s != "" {
+		if v, err := strconv.Atoi(s); err == nil && v >= 50 && v <= 1500 {
+			return int64(v)
+		}
+	}
+	return 260
 }
 
 func ultraDevFilterEnabled() bool {
@@ -3489,6 +3507,7 @@ func main() {
 				if src == "pump" && ultraFastEntryMode() {
 					var snapFast *curveSnap
 					if ultraQualityFilterEnabled() {
+						parseMs := parseDone.Sub(traceStart).Milliseconds()
 						snap0, err := getCurveSnapshotWithRetry(bc, src)
 						curveDone = time.Now()
 						if err != nil || snap0 == nil || snap0.PriceUSD <= 0 {
@@ -3531,8 +3550,10 @@ func main() {
 							}
 							return
 						}
+						skipMomentum := parseMs >= ultraSkipMomentumIfParseMs() ||
+							curveDone.Sub(parseDone).Milliseconds() >= ultraSkipMomentumIfFirstSnapMs()
 						pause := ultraMomentumPause()
-						if pause > 0 {
+						if pause > 0 && !skipMomentum {
 							time.Sleep(pause)
 							snap1, err := getCurveSnapshotWithRetry(bc, src)
 							if err != nil || snap1 == nil || snap1.PriceUSD <= 0 {

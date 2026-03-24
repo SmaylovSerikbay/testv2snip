@@ -540,6 +540,7 @@ type Wallet struct {
 	Start   float64
 	Pos     map[string]*Position
 	Closed  []ClosedTrade
+	LiveSlotBusy bool
 	// РЎРІРѕРґРєР° РїРѕ С‚РёРїСѓ РІС‹С…РѕРґР° (СѓС‡РёРјСЃСЏ РЅР° РјРёРЅСѓСЃР°С…)
 	ExitWin  map[string]int
 	ExitLoss map[string]int
@@ -638,6 +639,7 @@ func (w *Wallet) loadActivePositions() {
 				pp.TokenRaw = raw
 			}
 		}
+		w.LiveSlotBusy = true
 		w.Pos[pp.Mint] = &Position{
 			Mint:           pp.Mint,
 			BondingCurve:   pp.BondingCurve,
@@ -716,6 +718,7 @@ func (w *Wallet) resumeLivePosition(pos *Position, why string) {
 		return
 	}
 	w.mu.Lock()
+	w.LiveSlotBusy = true
 	w.Pos[pos.Mint] = pos
 	w.saveActivePositionsLocked()
 	w.mu.Unlock()
@@ -1506,6 +1509,15 @@ func minFeeReserveSOLValue() float64 {
 		return 0.004
 	}
 	return 0.003
+}
+
+func buyOverheadReserveSOLValue() float64 {
+	if s := strings.TrimSpace(os.Getenv("BUY_OVERHEAD_RESERVE_SOL")); s != "" {
+		if v, err := strconv.ParseFloat(s, 64); err == nil && v >= 0.0005 && v <= 0.02 {
+			return v
+		}
+	}
+	return 0.0015
 }
 
 func isInsufficientFeeErr(err error) bool {
@@ -2935,10 +2947,10 @@ func (w *Wallet) open(tok NewToken, sym string, spot float64) bool {
 			consoleMu.Unlock()
 			return false
 		}
-		if len(w.Pos) >= MAX_POSITIONS {
+		if w.LiveSlotBusy || len(w.Pos) >= MAX_POSITIONS {
 			w.mu.Unlock()
 			consoleMu.Lock()
-			fmt.Printf("%s open reject %s | position_limit=%d\n", yellow("вљ "), sym, MAX_POSITIONS)
+			fmt.Printf("%s open reject %s | active_live_position\n", yellow("вљ "), sym)
 			consoleMu.Unlock()
 			return false
 		}
@@ -2948,7 +2960,7 @@ func (w *Wallet) open(tok NewToken, sym string, spot float64) bool {
 
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	if len(w.Pos) >= MAX_POSITIONS {
+	if w.LiveSlotBusy || len(w.Pos) >= MAX_POSITIONS {
 		return false
 	}
 	capital := stakeFromBalance(w.Balance)
@@ -3019,7 +3031,7 @@ func (w *Wallet) openLive(tok NewToken, sym string, spot float64, capitalUSD flo
 		consoleMu.Unlock()
 		return false
 	}
-	reserve := math.Max(liveReserveSOLValue(), minFeeReserveSOLValue())
+	reserve := math.Max(liveReserveSOLValue(), minFeeReserveSOLValue()) + buyOverheadReserveSOLValue()
 	_ = capitalUSD
 	availableAfterReserve := solBal - reserve
 	solForSwap := liveFixedBuySOLValue()
@@ -3108,12 +3120,13 @@ func (w *Wallet) openLive(tok NewToken, sym string, spot float64, capitalUSD flo
 
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	if len(w.Pos) >= MAX_POSITIONS {
+	if w.LiveSlotBusy || len(w.Pos) >= MAX_POSITIONS {
 		consoleMu.Lock()
-		fmt.Printf("%s open reject %s | position_limit=%d\n", yellow("вљ "), sym, MAX_POSITIONS)
+		fmt.Printf("%s open reject %s | active_live_position\n", yellow("вљ "), sym)
 		consoleMu.Unlock()
 		return false
 	}
+	w.LiveSlotBusy = true
 	w.Pos[tok.Mint] = &Position{
 		Mint:         tok.Mint,
 		BondingCurve: tok.BondingCurve,
@@ -3174,6 +3187,9 @@ func (w *Wallet) closePos(mint, reason string, spot float64) {
 		w.ExitLoss[bk]++
 	} else {
 		w.ExitWin[bk]++
+	}
+	if len(w.Pos) == 0 {
+		w.LiveSlotBusy = false
 	}
 	w.saveActivePositionsLocked()
 	bal := w.Balance

@@ -1236,8 +1236,8 @@ func swapPumpFun(ctx context.Context, rpcClient *solanarpc.Client, wallet solana
 	}
 
 	var (
-		sig      solana.Signature
-		sentAt   time.Time
+		sig       solana.Signature
+		sentAt    time.Time
 		signingMs int64
 		sendingMs int64
 		signedAt  time.Time
@@ -1558,19 +1558,21 @@ func isIncorrectProgramIDErr(err error) bool {
 		strings.Contains(s, "incorrect program id for instruction")
 }
 
-// swapPumpFunSellWithFallback вЂ” РїСЂРё 6024 РїСЂРѕР±СѓРµС‚ РјРµРЅСЊС€РёР№ РѕР±СЉС‘Рј, С‡С‚РѕР±С‹ РЅРµ Р·Р°СЃС‚СЂРµРІР°С‚СЊ РІ РїРѕР·РёС†РёРё.
-func swapPumpFunSellWithFallback(
-	ctx context.Context,
-	rpcClient *solanarpc.Client,
-	wallet solana.PrivateKey,
-	mint solana.PublicKey,
-	rawAmount uint64,
-	slipBps uint64,
-) (solana.Signature, uint64, error) {
+func buildSellFallbackAmounts(rawAmount uint64) []uint64 {
 	if rawAmount == 0 {
-		return solana.Signature{}, 0, fmt.Errorf("zero token amount")
+		return nil
 	}
-	amounts := []uint64{
+	seen := make(map[uint64]bool)
+	out := make([]uint64, 0, 32)
+	add := func(v uint64) {
+		if v == 0 || seen[v] {
+			return
+		}
+		seen[v] = true
+		out = append(out, v)
+	}
+
+	for _, v := range []uint64{
 		rawAmount,
 		rawAmount * 99 / 100,
 		rawAmount * 97 / 100,
@@ -1587,7 +1589,37 @@ func swapPumpFunSellWithFallback(
 		rawAmount * 5 / 100,
 		rawAmount * 2 / 100,
 		rawAmount * 1 / 100,
+	} {
+		add(v)
 	}
+	for v := rawAmount / 2; v > 0; v /= 2 {
+		add(v)
+		if v == 1 {
+			break
+		}
+	}
+	for _, v := range []uint64{100000, 50000, 10000, 5000, 1000, 500, 100, 50, 10, 5, 2, 1} {
+		if v <= rawAmount {
+			add(v)
+		}
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i] > out[j] })
+	return out
+}
+
+// swapPumpFunSellWithFallback вЂ” РїСЂРё 6024 РїСЂРѕР±СѓРµС‚ РјРµРЅСЊС€РёР№ РѕР±СЉС‘Рј, С‡С‚РѕР±С‹ РЅРµ Р·Р°СЃС‚СЂРµРІР°С‚СЊ РІ РїРѕР·РёС†РёРё.
+func swapPumpFunSellWithFallback(
+	ctx context.Context,
+	rpcClient *solanarpc.Client,
+	wallet solana.PrivateKey,
+	mint solana.PublicKey,
+	rawAmount uint64,
+	slipBps uint64,
+) (solana.Signature, uint64, error) {
+	if rawAmount == 0 {
+		return solana.Signature{}, 0, fmt.Errorf("zero token amount")
+	}
+	amounts := buildSellFallbackAmounts(rawAmount)
 
 	var lastErr error
 	for _, amt := range amounts {

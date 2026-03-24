@@ -1562,6 +1562,33 @@ func sellSlippageGuardValue() float64 {
 	return SELL_SLIPPAGE_GUARD
 }
 
+func sniperCurveMaxValue() float64 {
+	if s := strings.TrimSpace(os.Getenv("SNIPER_CURVE_MAX_PCT")); s != "" {
+		if v, err := strconv.ParseFloat(s, 64); err == nil && v >= 0.1 && v <= 100 {
+			return v / 100.0
+		}
+	}
+	return SNIPER_CURVE_MAX
+}
+
+func minRealSOLValue() float64 {
+	if s := strings.TrimSpace(os.Getenv("MIN_REAL_SOL")); s != "" {
+		if v, err := strconv.ParseFloat(s, 64); err == nil && v >= 0 {
+			return v
+		}
+	}
+	return MIN_REAL_SOL
+}
+
+func fastHeavyCheckCurveMaxValue() float64 {
+	if s := strings.TrimSpace(os.Getenv("FAST_HEAVY_CHECK_CURVE_MAX_PCT")); s != "" {
+		if v, err := strconv.ParseFloat(s, 64); err == nil && v >= 0.1 && v <= 100 {
+			return v / 100.0
+		}
+	}
+	return FAST_HEAVY_CHECK_CURVE_MAX
+}
+
 func printHotPathTrace(sym, src, status, detail string, parseMs, curveMs, checksMs int64, totalMs int64) {
 	if !hotPathTraceEnabled() {
 		return
@@ -3846,7 +3873,7 @@ func main() {
 		}
 	}()
 	fmt.Printf("\n%s Р РµР¶РёРј: %s | РєСЂРёРІР°СЏ: %.1f%%вЂ“%.1f%% | min SOL: %.2f | velocity(base): %v (О”в‰Ґ%.2f%% РёР»Рё +%.3f SOL) | profile=%s | РѕРЅС‡РµР№РЅ-С„РёР»СЊС‚СЂС‹\n",
-		bold("в–¶"), cyan("SNIPER"), SNIPER_CURVE_MIN*100, SNIPER_CURVE_MAX*100, MIN_REAL_SOL,
+		bold("в–¶"), cyan("SNIPER"), SNIPER_CURVE_MIN*100, sniperCurveMaxValue()*100, minRealSOLValue(),
 		velocityPause(), VELOCITY_MIN_DPROGRESS*100, VELOCITY_MIN_DREALSOL, envSignalProfile())
 	wallet := newWallet()
 	if liveTradingEnabled() {
@@ -4189,18 +4216,18 @@ func main() {
 					}
 					return
 				}
-				if snap0.Progress > SNIPER_CURVE_MAX {
+				if snap0.Progress > sniperCurveMaxValue() {
 					logRejectLine("late", sym, mint, fmt.Sprintf("curve %.1f%% > %.1f%% вЂ” РїРѕР·РґРЅРѕ",
-						snap0.Progress*100, SNIPER_CURVE_MAX*100))
+						snap0.Progress*100, sniperCurveMaxValue()*100))
 					if !tok.DetectedAt.IsZero() {
 						total := time.Since(tok.DetectedAt).Milliseconds()
 						printHotPathTrace(sym, src, "reject:late", "curve too late", parseDone.Sub(traceStart).Milliseconds(), time.Since(parseDone).Milliseconds(), 0, total)
 					}
 					return
 				}
-				if snap0.RealSolSOL < MIN_REAL_SOL {
+				if snap0.RealSolSOL < minRealSOLValue() {
 					logRejectLine("low_sol", sym, mint, fmt.Sprintf("real SOL %.2f < %.2f",
-						snap0.RealSolSOL, MIN_REAL_SOL))
+						snap0.RealSolSOL, minRealSOLValue()))
 					if !tok.DetectedAt.IsZero() {
 						total := time.Since(tok.DetectedAt).Milliseconds()
 						printHotPathTrace(sym, src, "reject:low_sol", "real SOL below threshold", parseDone.Sub(traceStart).Milliseconds(), time.Since(parseDone).Milliseconds(), 0, total)
@@ -4267,9 +4294,9 @@ func main() {
 					return
 				}
 				atomic.AddInt64(&funnelPassVel, 1)
-				if src == "pump" && !turboModeEnabled() && snap1.Progress > FAST_HEAVY_CHECK_CURVE_MAX {
+				if src == "pump" && !turboModeEnabled() && snap1.Progress > fastHeavyCheckCurveMaxValue() {
 					logRejectLine("late", sym, mint, fmt.Sprintf("fast-gate: curve %.1f%% > %.1f%% РґРѕ С‚СЏР¶С‘Р»С‹С… RPC-РїСЂРѕРІРµСЂРѕРє",
-						snap1.Progress*100, FAST_HEAVY_CHECK_CURVE_MAX*100))
+						snap1.Progress*100, fastHeavyCheckCurveMaxValue()*100))
 					if !tok.DetectedAt.IsZero() {
 						total := time.Since(tok.DetectedAt).Milliseconds()
 						printHotPathTrace(sym, src, "reject:late_fast_gate", "curve progressed during checks", parseDone.Sub(traceStart).Milliseconds(), curveDone.Sub(parseDone).Milliseconds(), time.Since(curveDone).Milliseconds(), total)

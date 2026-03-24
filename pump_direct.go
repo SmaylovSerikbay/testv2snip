@@ -73,6 +73,14 @@ var (
 		mu sync.Mutex
 		v  buyLatencyBreakdown
 	}
+	pumpGlobalFeesCache struct {
+		mu            sync.Mutex
+		feeRecipient  solana.PublicKey
+		feeBps        uint64
+		creatorFeeBps uint64
+		raw           []byte
+		ts            time.Time
+	}
 	recentBlockhashCache struct {
 		mu        sync.Mutex
 		blockhash solana.Hash
@@ -104,6 +112,8 @@ var (
 
 const jitoRateLimitCooldown = 12 * time.Second
 const mintInfoFastPathCooldown = 10 * time.Minute
+const pumpGlobalFeesCacheTTL = 30 * time.Second
+const pumpGlobalFeesStaleTTL = 5 * time.Minute
 
 func initPumpDirectFromEnv() {
 	if s := strings.TrimSpace(os.Getenv("PUMP_SLIPPAGE_BPS")); s != "" {
@@ -228,6 +238,56 @@ func getLastBuyLatency() buyLatencyBreakdown {
 	lastBuyLatency.mu.Lock()
 	defer lastBuyLatency.mu.Unlock()
 	return lastBuyLatency.v
+}
+
+func getPumpGlobalFeesCached(ctx context.Context, rpcClient *solanarpc.Client) (feeRecipient solana.PublicKey, feeBps, creatorFeeBps uint64, raw []byte, err error) {
+	pumpGlobalFeesCache.mu.Lock()
+	cachedAt := pumpGlobalFeesCache.ts
+	if !cachedAt.IsZero() && time.Since(cachedAt) <= pumpGlobalFeesCacheTTL && len(pumpGlobalFeesCache.raw) > 0 {
+		feeRecipient = pumpGlobalFeesCache.feeRecipient
+		feeBps = pumpGlobalFeesCache.feeBps
+		creatorFeeBps = pumpGlobalFeesCache.creatorFeeBps
+		raw = append([]byte(nil), pumpGlobalFeesCache.raw...)
+		pumpGlobalFeesCache.mu.Unlock()
+		return feeRecipient, feeBps, creatorFeeBps, raw, nil
+	}
+	staleRecipient := pumpGlobalFeesCache.feeRecipient
+	staleFeeBps := pumpGlobalFeesCache.feeBps
+	staleCreatorFeeBps := pumpGlobalFeesCache.creatorFeeBps
+	staleRaw := append([]byte(nil), pumpGlobalFeesCache.raw...)
+	staleAt := pumpGlobalFeesCache.ts
+	pumpGlobalFeesCache.mu.Unlock()
+
+	globalPK, _, derr := derivePumpGlobal()
+	if derr != nil {
+		return solana.PublicKey{}, 0, 0, nil, derr
+	}
+	gInfo, gerr := rpcClient.GetAccountInfoWithOpts(ctx, globalPK, &solanarpc.GetAccountInfoOpts{
+		Encoding:   solana.EncodingBase64,
+		Commitment: solanarpc.CommitmentProcessed,
+	})
+	if gerr != nil || gInfo == nil || gInfo.Value == nil || gInfo.Value.Data == nil {
+		if !staleAt.IsZero() && time.Since(staleAt) <= pumpGlobalFeesStaleTTL && len(staleRaw) > 0 {
+			return staleRecipient, staleFeeBps, staleCreatorFeeBps, staleRaw, nil
+		}
+		return solana.PublicKey{}, 0, 0, nil, fmt.Errorf("global account missing")
+	}
+	raw = gInfo.Value.Data.GetBinary()
+	feeRecipient, feeBps, creatorFeeBps, err = parsePumpGlobalFees(raw)
+	if err != nil {
+		if !staleAt.IsZero() && time.Since(staleAt) <= pumpGlobalFeesStaleTTL && len(staleRaw) > 0 {
+			return staleRecipient, staleFeeBps, staleCreatorFeeBps, staleRaw, nil
+		}
+		return solana.PublicKey{}, 0, 0, nil, err
+	}
+	pumpGlobalFeesCache.mu.Lock()
+	pumpGlobalFeesCache.feeRecipient = feeRecipient
+	pumpGlobalFeesCache.feeBps = feeBps
+	pumpGlobalFeesCache.creatorFeeBps = creatorFeeBps
+	pumpGlobalFeesCache.raw = append([]byte(nil), raw...)
+	pumpGlobalFeesCache.ts = time.Now()
+	pumpGlobalFeesCache.mu.Unlock()
+	return feeRecipient, feeBps, creatorFeeBps, raw, nil
 }
 
 // fastHotBuyMode: РІ РіРѕСЂСЏС‡РµРј РІС…РѕРґРµ РЅРµ РґРµР»Р°РµРј Р»РёС€РЅРёРµ pre-check RPC РїРµСЂРµРґ РѕС‚РїСЂР°РІРєРѕР№.
@@ -1085,18 +1145,12 @@ func swapPumpFun(ctx context.Context, rpcClient *solanarpc.Client, wallet solana
 	wg.Add(3)
 	go func() {
 		defer wg.Done()
-		gInfo, e := rpcClient.GetAccountInfoWithOpts(ctx, globalPK, &solanarpc.GetAccountInfoOpts{Encoding: solana.EncodingBase64, Commitment: solanarpc.CommitmentProcessed})
-		if e != nil || gInfo == nil || gInfo.Value == nil || gInfo.Value.Data == nil {
-			setErr(fmt.Errorf("global account missing"))
-			return
-		}
-		raw := gInfo.Value.Data.GetBinary()
-		globalRaw = raw
-		fr, fbps, cfbps, e := parsePumpGlobalFees(raw)
+		fr, fbps, cfbps, raw, e := getPumpGlobalFeesCached(ctx, rpcClient)
 		if e != nil {
 			setErr(e)
 			return
 		}
+		globalRaw = raw
 		feeRecipient, feeBps, creatorFeeBps = fr, fbps, cfbps
 	}()
 	go func() {
@@ -1405,11 +1459,7 @@ func swapPumpFunSellAmount(ctx context.Context, rpcClient *solanarpc.Client, wal
 	}
 
 	globalPK, _, _ := derivePumpGlobal()
-	gInfo, err := rpcClient.GetAccountInfoWithOpts(ctx, globalPK, &solanarpc.GetAccountInfoOpts{Encoding: solana.EncodingBase64, Commitment: solanarpc.CommitmentProcessed})
-	if err != nil || gInfo == nil || gInfo.Value == nil {
-		return solana.Signature{}, 0, fmt.Errorf("global")
-	}
-	feeRecipient, _, _, err := parsePumpGlobalFees(gInfo.Value.Data.GetBinary())
+	feeRecipient, _, _, _, err := getPumpGlobalFeesCached(ctx, rpcClient)
 	if err != nil {
 		return solana.Signature{}, 0, err
 	}

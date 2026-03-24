@@ -1125,6 +1125,15 @@ func ultraSkipMomentumMinRealSOL() float64 {
 	return 1.2
 }
 
+func ultraSkipMomentumMaxProgress() float64 {
+	if s := strings.TrimSpace(os.Getenv("ULTRA_SKIP_MOMENTUM_MAX_PROGRESS_PCT")); s != "" {
+		if v, err := strconv.ParseFloat(s, 64); err == nil && v >= 1 && v <= 100 {
+			return v / 100.0
+		}
+	}
+	return 0.18
+}
+
 func curveSnapshotRetryTries() int {
 	if s := strings.TrimSpace(os.Getenv("CURVE_SNAPSHOT_TRIES")); s != "" {
 		if v, err := strconv.Atoi(s); err == nil && v >= 1 && v <= 6 {
@@ -1135,6 +1144,36 @@ func curveSnapshotRetryTries() int {
 		return 3
 	}
 	return 3
+}
+
+func flatExitAfter() time.Duration {
+	if s := strings.TrimSpace(os.Getenv("FLAT_EXIT_AFTER_SEC")); s != "" {
+		if v, err := strconv.Atoi(s); err == nil && v >= 5 && v <= 300 {
+			return time.Duration(v) * time.Second
+		}
+	}
+	if ultraFastEntryMode() {
+		return 25 * time.Second
+	}
+	return 40 * time.Second
+}
+
+func flatExitMinMult() float64 {
+	if s := strings.TrimSpace(os.Getenv("FLAT_EXIT_MIN_PCT")); s != "" {
+		if v, err := strconv.ParseFloat(s, 64); err == nil && v >= -50 && v <= 50 {
+			return 1 + v/100.0
+		}
+	}
+	return 0.985
+}
+
+func flatExitMaxMult() float64 {
+	if s := strings.TrimSpace(os.Getenv("FLAT_EXIT_MAX_PCT")); s != "" {
+		if v, err := strconv.ParseFloat(s, 64); err == nil && v >= -50 && v <= 50 {
+			return 1 + v/100.0
+		}
+	}
+	return 1.01
 }
 
 func ultraDevFilterEnabled() bool {
@@ -3089,6 +3128,9 @@ func monitor(w *Wallet, mint, bcAddr, sym, source string) {
 	panicNoPricePeakMult := noPricePanicSellPeakMult()
 	quickWindow := quickPumpWindow()
 	quickTP := quickPumpTakeProfitMult()
+	flatAfter := flatExitAfter()
+	flatMin := flatExitMinMult()
+	flatMax := flatExitMaxMult()
 	var lastMult float64
 	var lastPrint time.Time
 	var lastFailPrint time.Time
@@ -3260,6 +3302,10 @@ func monitor(w *Wallet, mint, bcAddr, sym, source string) {
 
 			if breakeven && price < entry {
 				w.closePos(mint, "БРЕЙК-ИВН после импульса", price)
+				return
+			}
+			if time.Since(opened) >= flatAfter && mult >= flatMin && mult <= flatMax {
+				w.closePos(mint, fmt.Sprintf("FLAT EXIT (%.0fs, x%.3f)", flatAfter.Seconds(), mult), price)
 				return
 			}
 			// Fast Exit: за 30с нет +5% — выходим, не ждём пока сольёт
@@ -3605,6 +3651,14 @@ func main() {
 							curveDone = time.Now()
 						} else {
 							if skipMomentum {
+								if snap0.Progress > ultraSkipMomentumMaxProgress() {
+									logRejectLine("late", sym, mint, fmt.Sprintf("ultra-quality: skip-momentum max curve %.1f%% > %.1f%%", snap0.Progress*100, ultraSkipMomentumMaxProgress()*100))
+									if !tok.DetectedAt.IsZero() {
+										total := time.Since(tok.DetectedAt).Milliseconds()
+										printHotPathTrace(sym, src, "reject:ultra_skip_late", "skip-momentum at late curve", parseDone.Sub(traceStart).Milliseconds(), curveDone.Sub(parseDone).Milliseconds(), 0, total)
+									}
+									return
+								}
 								if snap0.Progress < ultraSkipMomentumMinProgress() || snap0.RealSolSOL < ultraSkipMomentumMinRealSOL() {
 									logRejectLine("vel_low", sym, mint, fmt.Sprintf("ultra-quality: skip-momentum gate (curve %.1f%% / SOL %.2f)", snap0.Progress*100, snap0.RealSolSOL))
 									if !tok.DetectedAt.IsZero() {

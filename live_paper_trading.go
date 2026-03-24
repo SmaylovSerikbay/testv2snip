@@ -546,7 +546,7 @@ func (w *Wallet) loadActivePositions() {
 			continue
 		}
 		// Не поднимаем сильно старые сделки после рестарта: они блокируют новые входы при MAX_POSITIONS=1.
-		if pp.OpenedAt.IsZero() || time.Since(pp.OpenedAt) > (MAX_HOLD+90*time.Second) {
+		if pp.OpenedAt.IsZero() || time.Since(pp.OpenedAt) > (maxHoldDuration()+90*time.Second) {
 			continue
 		}
 		// Если в кошельке уже нет токенов — позиция закрыта, но могла остаться в файле после аварийного рестарта.
@@ -1268,7 +1268,52 @@ func quickPumpTakeProfitMult() float64 {
 	if ultraFastEntryMode() {
 		return 1.35 // +35% в первые ~1.5с, потом стандартный TP
 	}
+	return takeProfitMult()
+}
+
+func maxHoldDuration() time.Duration {
+	if s := strings.TrimSpace(os.Getenv("MAX_HOLD_SEC")); s != "" {
+		if v, err := strconv.Atoi(s); err == nil && v >= 15 && v <= 1800 {
+			return time.Duration(v) * time.Second
+		}
+	}
+	return MAX_HOLD
+}
+
+func fastExitAfterDuration() time.Duration {
+	if s := strings.TrimSpace(os.Getenv("FAST_EXIT_AFTER_SEC")); s != "" {
+		if v, err := strconv.Atoi(s); err == nil && v >= 10 && v <= 1800 {
+			return time.Duration(v) * time.Second
+		}
+	}
+	return FAST_EXIT_AFTER
+}
+
+func takeProfitMult() float64 {
+	if s := strings.TrimSpace(os.Getenv("TAKE_PROFIT_PCT")); s != "" {
+		if v, err := strconv.ParseFloat(s, 64); err == nil && v >= 10 && v <= 400 {
+			return 1 + v/100.0
+		}
+	}
 	return TAKE_PROFIT
+}
+
+func stopLossHardMult() float64 {
+	if s := strings.TrimSpace(os.Getenv("STOP_LOSS_PCT")); s != "" {
+		if v, err := strconv.ParseFloat(s, 64); err == nil && v >= 1 && v <= 90 {
+			return 1 - v/100.0
+		}
+	}
+	return STOP_LOSS_HARD
+}
+
+func stopConfirmLvlMult() float64 {
+	if s := strings.TrimSpace(os.Getenv("STOP_CONFIRM_PCT")); s != "" {
+		if v, err := strconv.ParseFloat(s, 64); err == nil && v >= 1 && v <= 90 {
+			return 1 - v/100.0
+		}
+	}
+	return STOP_CONFIRM_LVL
 }
 
 func liveFixedBuySOLValue() float64 {
@@ -3155,7 +3200,12 @@ func runPaperSelfTest() {
 
 func monitor(w *Wallet, mint, bcAddr, sym, source string) {
 	ticker := time.NewTicker(monitorTickInterval())
-	timeout := time.NewTimer(MAX_HOLD)
+	maxHold := maxHoldDuration()
+	fastExitAfter := fastExitAfterDuration()
+	takeProfit := takeProfitMult()
+	stopLossHard := stopLossHardMult()
+	stopConfirmLvl := stopConfirmLvlMult()
+	timeout := time.NewTimer(maxHold)
 	defer ticker.Stop()
 	defer timeout.Stop()
 
@@ -3193,9 +3243,9 @@ func monitor(w *Wallet, mint, bcAddr, sym, source string) {
 			if snap != nil {
 				px = snap.PriceUSD
 			}
-			holdStr := fmt.Sprintf("%.0fс", MAX_HOLD.Seconds())
-			if MAX_HOLD >= time.Minute {
-				holdStr = fmt.Sprintf("%.0f мин", MAX_HOLD.Minutes())
+			holdStr := fmt.Sprintf("%.0fс", maxHold.Seconds())
+			if maxHold >= time.Minute {
+				holdStr = fmt.Sprintf("%.0f мин", maxHold.Minutes())
 			}
 			w.closePos(mint, fmt.Sprintf("ТАЙМАУТ %s", holdStr), px)
 			return
@@ -3318,8 +3368,8 @@ func monitor(w *Wallet, mint, bcAddr, sym, source string) {
 					w.closePos(mint, fmt.Sprintf("QUICK PUMP ТЕЙК ~+%.0f%% (%.1fs)", (quickTP-1)*100, quickWindow.Seconds()), price)
 					return
 				}
-			} else if mult >= TAKE_PROFIT {
-				w.closePos(mint, fmt.Sprintf("ТЕЙК ~+%.0f%% spot", (TAKE_PROFIT-1)*100), price)
+			} else if mult >= takeProfit {
+				w.closePos(mint, fmt.Sprintf("ТЕЙК ~+%.0f%% spot", (takeProfit-1)*100), price)
 				return
 			}
 			// Recovery: на +100% фиксируем половину, остаток ведём трейлингом.
@@ -3363,8 +3413,8 @@ func monitor(w *Wallet, mint, bcAddr, sym, source string) {
 				return
 			}
 			// Fast Exit: за 30с нет +5% — выходим, не ждём пока сольёт
-			if time.Since(opened) >= FAST_EXIT_AFTER && mult < FAST_EXIT_MIN_MULT {
-				w.closePos(mint, fmt.Sprintf("FAST EXIT (нет +%.0f%% за %.0fс, spot %.1f%%)", (FAST_EXIT_MIN_MULT-1)*100, FAST_EXIT_AFTER.Seconds(), (mult-1)*100), price)
+			if time.Since(opened) >= fastExitAfter && mult < FAST_EXIT_MIN_MULT {
+				w.closePos(mint, fmt.Sprintf("FAST EXIT (нет +%.0f%% за %.0fс, spot %.1f%%)", (FAST_EXIT_MIN_MULT-1)*100, fastExitAfter.Seconds(), (mult-1)*100), price)
 				return
 			}
 			// SCRATCH: флэт >2 мин — освобождаем капитал (если не вылетели по FAST EXIT)
@@ -3373,15 +3423,15 @@ func monitor(w *Wallet, mint, bcAddr, sym, source string) {
 				return
 			}
 			// Final Recovery: не выходим по "слабому импульсу"/"нет импульса", даём позиции разыграться.
-			if price <= entry*STOP_CONFIRM_LVL {
+			if price <= entry*stopConfirmLvl {
 				confirmedStopTicks++
 			} else {
 				confirmedStopTicks = 0
 			}
 			// "Fake stop-out" защита: подтверждение/порог по recovery настройкам.
-			if price <= entry*STOP_LOSS_HARD || confirmedStopTicks >= STOP_CONFIRM_N {
-				pct := (1 - STOP_LOSS_HARD) * 100
-				if price <= entry*STOP_LOSS_HARD {
+			if price <= entry*stopLossHard || confirmedStopTicks >= STOP_CONFIRM_N {
+				pct := (1 - stopLossHard) * 100
+				if price <= entry*stopLossHard {
 					w.closePos(mint, fmt.Sprintf("СТОП -%.0f%% (hard)", pct), price)
 				} else {
 					w.closePos(mint, fmt.Sprintf("СТОП подтверждён (-%.0f%%)", pct), price)

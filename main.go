@@ -1133,7 +1133,7 @@ func checkAll(ctx context.Context) bool {
 			p.HiPnl = pnl
 		}
 
-		if pnl > 0.03 {
+		if pnl > 0.02 {
 			hasProfit = true
 		}
 
@@ -1141,6 +1141,8 @@ func checkAll(ctx context.Context) bool {
 		switch {
 		case pnl >= cfg.TP:
 			reason = fmt.Sprintf("TP +%.0f%%", pnl*100)
+		case age <= 15*time.Second && pnl >= 0.05:
+			reason = fmt.Sprintf("QUICKTP %ds +%.0f%%", int(age.Seconds()), pnl*100)
 		case pnl <= -cfg.SL:
 			reason = fmt.Sprintf("SL %.0f%%", pnl*100)
 		case p.HiPnl >= 0.03 && pnl < p.HiPnl-0.02 && pnl > 0:
@@ -1149,7 +1151,7 @@ func checkAll(ctx context.Context) bool {
 			reason = fmt.Sprintf("SL(trail) %.0f%%", pnl*100)
 		case age >= time.Duration(cfg.TimeKillSec)*time.Second && pnl < cfg.TimeKillMin && pnl > -cfg.SL:
 			reason = fmt.Sprintf("TIMEKILL %ds pnl=%+.1f%%", int(age.Seconds()), pnl*100)
-		case age >= 120*time.Second && pnl < 0.05:
+		case age >= 60*time.Second && pnl < 0.05:
 			reason = fmt.Sprintf("HARDKILL %ds pnl=%+.1f%%", int(age.Seconds()), pnl*100)
 		}
 		if reason == "" {
@@ -1164,6 +1166,16 @@ func checkAll(ctx context.Context) bool {
 			trackTargetResult(p.Wallet, profitable)
 		} else {
 			p.SellFails++
+			if pnl <= -cfg.SL {
+				state2, bc2, err2 := readBC(ctx, p.Mint)
+				if err2 == nil {
+					log.Printf("[MON] Emergency retry sell: %s", short(mint))
+					if doSell(ctx, p, "EMERGENCY", state2, bc2) {
+						delete(pos, mint)
+						trackTargetResult(p.Wallet, false)
+					}
+				}
+			}
 		}
 	}
 	return hasProfit

@@ -1905,9 +1905,7 @@ func parseTxMintCreatorBase64(data []byte, wantLogs func([]string) bool) (mint, 
 			PostTokenBalances []postTokenBal `json:"postTokenBalances"`
 			LogMessages       []string       `json:"logMessages"`
 		} `json:"meta"`
-		Transaction struct {
-			Transaction []string `json:"transaction"`
-		} `json:"transaction"`
+		Transaction json.RawMessage `json:"transaction"`
 	}
 	if err := json.Unmarshal(wrap.Result, &r); err != nil {
 		return "", "", nil, false, err
@@ -1916,10 +1914,20 @@ func parseTxMintCreatorBase64(data []byte, wantLogs func([]string) bool) (mint, 
 		t := time.Unix(*r.BlockTime, 0)
 		createBlockTime = &t
 	}
-	if len(r.Transaction.Transaction) == 0 || r.Transaction.Transaction[0] == "" {
+	var rawEnvelope []string
+	if err := json.Unmarshal(r.Transaction, &rawEnvelope); err != nil || len(rawEnvelope) == 0 || rawEnvelope[0] == "" {
+		var nested struct {
+			Transaction []string `json:"transaction"`
+		}
+		if err := json.Unmarshal(r.Transaction, &nested); err != nil || len(nested.Transaction) == 0 || nested.Transaction[0] == "" {
+			return "", "", createBlockTime, false, fmt.Errorf("empty base64 tx")
+		}
+		rawEnvelope = nested.Transaction
+	}
+	if len(rawEnvelope) == 0 || rawEnvelope[0] == "" {
 		return "", "", createBlockTime, false, fmt.Errorf("empty base64 tx")
 	}
-	rawTx, err := base64.StdEncoding.DecodeString(r.Transaction.Transaction[0])
+	rawTx, err := base64.StdEncoding.DecodeString(rawEnvelope[0])
 	if err != nil {
 		return "", "", createBlockTime, false, err
 	}

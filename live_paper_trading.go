@@ -1107,6 +1107,36 @@ func ultraSkipMomentumIfFirstSnapMs() int64 {
 	return 260
 }
 
+func ultraSkipMomentumMinProgress() float64 {
+	if s := strings.TrimSpace(os.Getenv("ULTRA_SKIP_MOMENTUM_MIN_PROGRESS_PCT")); s != "" {
+		if v, err := strconv.ParseFloat(s, 64); err == nil && v >= 0 && v <= 100 {
+			return v / 100.0
+		}
+	}
+	return 0.08
+}
+
+func ultraSkipMomentumMinRealSOL() float64 {
+	if s := strings.TrimSpace(os.Getenv("ULTRA_SKIP_MOMENTUM_MIN_REAL_SOL")); s != "" {
+		if v, err := strconv.ParseFloat(s, 64); err == nil && v >= 0.01 && v <= 50 {
+			return v
+		}
+	}
+	return 1.2
+}
+
+func curveSnapshotRetryTries() int {
+	if s := strings.TrimSpace(os.Getenv("CURVE_SNAPSHOT_TRIES")); s != "" {
+		if v, err := strconv.Atoi(s); err == nil && v >= 1 && v <= 6 {
+			return v
+		}
+	}
+	if turboModeEnabled() {
+		return 3
+	}
+	return 3
+}
+
 func ultraDevFilterEnabled() bool {
 	s := strings.TrimSpace(strings.ToLower(os.Getenv("ULTRA_DEV_FILTER")))
 	if s == "0" || s == "false" || s == "no" {
@@ -1370,10 +1400,7 @@ func getCurveSnapshotUnified(bcAddr, source string) (*curveSnap, error) {
 func getCurveSnapshotWithRetry(bcAddr string, source string) (*curveSnap, error) {
 	var last *curveSnap
 	var lastErr error
-	tries := 3
-	if turboModeEnabled() {
-		tries = 2
-	}
+	tries := curveSnapshotRetryTries()
 	for attempt := 0; attempt < tries; attempt++ {
 		if attempt > 0 {
 			pause := 50 * attempt
@@ -3577,6 +3604,16 @@ func main() {
 							snapFast = snap1
 							curveDone = time.Now()
 						} else {
+							if skipMomentum {
+								if snap0.Progress < ultraSkipMomentumMinProgress() || snap0.RealSolSOL < ultraSkipMomentumMinRealSOL() {
+									logRejectLine("vel_low", sym, mint, fmt.Sprintf("ultra-quality: skip-momentum gate (curve %.1f%% / SOL %.2f)", snap0.Progress*100, snap0.RealSolSOL))
+									if !tok.DetectedAt.IsZero() {
+										total := time.Since(tok.DetectedAt).Milliseconds()
+										printHotPathTrace(sym, src, "reject:ultra_skip_gate", "skip-momentum quality too low", parseDone.Sub(traceStart).Milliseconds(), curveDone.Sub(parseDone).Milliseconds(), 0, total)
+									}
+									return
+								}
+							}
 							snapFast = snap0
 						}
 					}

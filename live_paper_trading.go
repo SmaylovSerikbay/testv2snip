@@ -1,4 +1,4 @@
-﻿package main
+package main
 
 import (
 	"bytes"
@@ -655,44 +655,55 @@ func newWallet() *Wallet {
 
 // bucketExitReason вЂ” РєРѕСЂРѕС‚РєРёР№ СЏСЂР»С‹Рє РґР»СЏ СЃС‚Р°С‚РёСЃС‚РёРєРё
 func bucketExitReason(reason string) string {
+	upper := strings.ToUpper(reason)
 	switch {
-	case strings.HasPrefix(reason, "РўР•Р™Рљ"):
-		return "С‚РµР№Рє"
-	case strings.Contains(reason, "РЎРўРћРџ"):
-		return "СЃС‚РѕРї"
-	case strings.Contains(reason, "РўР Р•Р™Р›РРќР“"):
-		return "С‚СЂРµР№Р»"
-	case strings.Contains(reason, "Р‘Р Р•Р™Рљ"):
-		return "Р±СЂРµР№РєРёРІРЅ"
-	case strings.Contains(reason, "РЎРљР Р•РўР§"):
-		return "СЃРєСЂРµС‚С‡"
-	case strings.Contains(reason, "РќР•Рў РРњРџРЈР›Р¬РЎРђ"):
-		return "РЅРµС‚_РёРјРїСѓР»СЊСЃР°"
-	case strings.Contains(reason, "РўРђР™РњРђРЈРў"):
-		return "С‚Р°Р№РјР°СѓС‚"
-	case strings.Contains(reason, "РњРР“Р РђР¦РРЇ"):
-		return "РјРёРіСЂР°С†РёСЏ"
-	case strings.Contains(reason, "РЈРњР•Р "):
-		return "РЅРµС‚_РґР°РЅРЅС‹С…"
+	case strings.HasPrefix(upper, "РўР•Р™Рљ"), strings.HasPrefix(upper, "TAKE"), strings.HasPrefix(upper, "QUICK PUMP"):
+		return "take"
+	case strings.Contains(upper, "LOCK PROFIT"), strings.Contains(upper, "PROFIT LOCK"):
+		return "profit_lock"
+	case strings.Contains(upper, "РЎРўРћРџ"), strings.Contains(upper, "STOP"):
+		return "stop"
+	case strings.Contains(upper, "РўР Р•Р™Р›"), strings.Contains(upper, "TRAIL"):
+		return "trail"
+	case strings.Contains(upper, "Р‘Р Р•Р™Рљ"), strings.Contains(upper, "BREAKEVEN"):
+		return "breakeven"
+	case strings.Contains(upper, "РЎРљР Р•РўР§"), strings.Contains(upper, "SCRATCH"), strings.Contains(upper, "FLAT EXIT"):
+		return "flat"
+	case strings.Contains(upper, "FAST EXIT"):
+		return "fast_exit"
+	case strings.Contains(upper, "РќР•Рў РРњРџРЈР›Р¬РЎРђ"), strings.Contains(upper, "IMPULSE LOST"):
+		return "impulse_lost"
+	case strings.Contains(upper, "DRAWDOWN EXIT"):
+		return "drawdown"
+	case strings.Contains(upper, "PANIC SELL"):
+		return "panic"
+	case strings.Contains(upper, "РўРђР™РњРђРЈРў"), strings.Contains(upper, "TIMEOUT"):
+		return "timeout"
+	case strings.Contains(upper, "РњРР“Р РђР¦РРЇ"), strings.Contains(upper, "MIGRATION"):
+		return "migration"
+	case strings.Contains(upper, "РЈРњР•Р "), strings.Contains(upper, "NO DATA"):
+		return "no_data"
 	default:
-		return "РїСЂРѕС‡РµРµ"
+		return "other"
 	}
 }
 
 func lossLearningHint(reason string) string {
 	switch bucketExitReason(reason) {
-	case "СЃС‚РѕРї":
-		return "Р§Р°СЃС‚Рѕ СЃС‚РѕРї: СѓР¶РµСЃС‚РѕС‡РёС‚СЊ РІС…РѕРґ (РІС‹С€Рµ curve min / СЃРёР»СЊРЅРµРµ velocity) РёР»Рё РЅРµ РѕСЃР»Р°Р±Р»СЏС‚СЊ СЃРєР°Рј."
-	case "СЃРєСЂРµС‚С‡", "РЅРµС‚_РёРјРїСѓР»СЊСЃР°":
-		return "РЎР»Р°Р±С‹Р№ СЂР°Р·РіРѕРЅ: РїРѕРґРЅСЏС‚СЊ SNIPER_CURVE_MIN РёР»Рё velocity, С‡С‚РѕР±С‹ РЅРµ Р»РѕРІРёС‚СЊ В«РїСѓСЃС‚С‹РµВ» РёРјРїСѓР»СЊСЃС‹."
-	case "Р±СЂРµР№РєРёРІРЅ":
-		return "РћС‚РєР°С‚ РїРѕСЃР»Рµ РїРёРєР°: РЅРѕСЂРј Р·Р°С‰РёС‚Р° РєР°РїРёС‚Р°Р»Р°; РїСЂРё С‡Р°СЃС‚С‹С… вЂ” СЃРјРѕС‚СЂРµС‚СЊ TRAIL/РІС…РѕРґ РїРѕР·Р¶Рµ РїРѕ РєСЂРёРІРѕР№."
-	case "С‚Р°Р№РјР°СѓС‚", "РЅРµС‚_РґР°РЅРЅС‹С…":
-		return "Р”РѕР»РіРѕ Р±РµР· РґРІРёР¶РµРЅРёСЏ / RPC: РїСЂРѕРІРµСЂРёС‚СЊ СЃРµС‚СЊ; РїСЂРё С‡Р°СЃС‚С‹С… С‚Р°Р№РјР°СѓС‚Р°С… СѓРјРµРЅСЊС€РёС‚СЊ MAX_HOLD."
-	case "РјРёРіСЂР°С†РёСЏ":
-		return "РЈС€Р»Рѕ РІ Raydium: С„РёРєСЃ РїРѕ РїСЂР°РІРёР»Р°Рј; РЅРµ РѕС€РёР±РєР° СЃС‚СЂР°С‚РµРіРёРё."
+	case "stop":
+		return "Stops dominate: tighten entry quality or let anti-scam stay strict."
+	case "flat", "fast_exit", "impulse_lost":
+		return "Weak follow-through: raise entry quality so we stop buying flat first impulses."
+	case "breakeven", "drawdown":
+		return "Reversal after a small pop: entries are early enough, but momentum is not holding."
+	case "timeout", "no_data":
+		return "Price feed/RPC is flaky or token stalled; check network and consider shorter holds."
+	case "migration":
+		return "Migration exit is expected behavior, not a strategy failure."
+	case "panic":
+		return "Price disappeared after a peak: liquidity and execution risk are still too high."
 	default:
-		return "РЎРјРѕС‚СЂРё РїРѕР»РЅС‹Р№ Reason РІ Р»РѕРіРµ РІС‹С…РѕРґР° Рё СЃРІРѕРґРєСѓ ExitLoss РІ РєРѕС€РµР»СЊРєРµ."
+		return "Check the full exit reason in the trade log for the exact trigger."
 	}
 }
 
@@ -3088,22 +3099,22 @@ func (w *Wallet) closePosLive(pos *Position, reason string, spot float64) {
 					yellow("⚠"), estSlip*100, guard*100, reason)
 				consoleMu.Unlock()
 			} else {
-			age := time.Since(pos.OpenedAt)
-			if age < 60*time.Second {
+				age := time.Since(pos.OpenedAt)
+				if age < 60*time.Second {
+					consoleMu.Lock()
+					fmt.Printf("%s wait better tick: est sell slippage %.1f%% > %.0f%%\n",
+						yellow("вЏё"), estSlip*100, guard*100)
+					consoleMu.Unlock()
+					w.mu.Lock()
+					w.Pos[pos.Mint] = pos
+					w.saveActivePositionsLocked()
+					w.mu.Unlock()
+					return
+				}
 				consoleMu.Lock()
-				fmt.Printf("%s wait better tick: est sell slippage %.1f%% > %.0f%%\n",
-					yellow("вЏё"), estSlip*100, guard*100)
+				fmt.Printf("%s stale position %.0fs: bypass slippage guard %.1f%% > %.0f%%\n",
+					yellow("вљ "), age.Seconds(), estSlip*100, guard*100)
 				consoleMu.Unlock()
-				w.mu.Lock()
-				w.Pos[pos.Mint] = pos
-				w.saveActivePositionsLocked()
-				w.mu.Unlock()
-				return
-			}
-			consoleMu.Lock()
-			fmt.Printf("%s stale position %.0fs: bypass slippage guard %.1f%% > %.0f%%\n",
-				yellow("вљ "), age.Seconds(), estSlip*100, guard*100)
-			consoleMu.Unlock()
 			}
 		}
 	}
@@ -4383,4 +4394,3 @@ func parseLaunchLabCreateTx(sig string) (mint, creator string, createBlockTime *
 	}
 	return mint, creator, createBlockTime
 }
-

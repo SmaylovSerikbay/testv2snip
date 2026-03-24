@@ -2202,7 +2202,7 @@ func parseTxMintCreator(data []byte, wantLogs func([]string) bool) (mint, creato
 func refillMintFromConfirmed(sig, creator string, createBlockTime *time.Time, wantLogs func([]string) bool) (mintOut, creatorOut string, blockTimeOut *time.Time) {
 	creatorOut = creator
 	blockTimeOut = createBlockTime
-	for attempt := 0; attempt < 3; attempt++ {
+	for attempt := 0; attempt < 5; attempt++ {
 		data, err := rpcFast("getTransaction", []interface{}{
 			sig,
 			map[string]interface{}{
@@ -2227,9 +2227,21 @@ func refillMintFromConfirmed(sig, creator string, createBlockTime *time.Time, wa
 			}
 			_ = ok
 		}
+		if data, err := getTransactionJSONParsedFast(sig); err == nil {
+			mint, parsedCreator, bt, _ := parseTxMintCreator(data, wantLogs)
+			if creatorOut == "" && parsedCreator != "" {
+				creatorOut = parsedCreator
+			}
+			if blockTimeOut == nil && bt != nil {
+				blockTimeOut = bt
+			}
+			if mint != "" {
+				return mint, creatorOut, blockTimeOut
+			}
+		}
 	sleepAndRetry:
-		if attempt < 2 {
-			time.Sleep(time.Duration(80*(attempt+1)) * time.Millisecond)
+		if attempt < 4 {
+			time.Sleep(time.Duration(120*(attempt+1)) * time.Millisecond)
 		}
 	}
 	return "", creatorOut, blockTimeOut
@@ -3376,8 +3388,8 @@ func listenProgram(programID, prettyLabel string, wantLogs func([]string) bool, 
 // listenPumpWSS вЂ” РѕС‚РґРµР»СЊРЅС‹Р№ WSS-СЃР»СѓС€Р°С‚РµР»СЊ Р»РѕРіРѕРІ Pump.fun РґР»СЏ РјРёРЅРёРјР°Р»СЊРЅРѕР№ Р·Р°РґРµСЂР¶РєРё РЅР° РґРµС‚РµРєС‚Рµ.
 func listenPumpWSS(ch chan<- NewToken) {
 	if liveTradingEnabled() {
-		go listenProgram(PUMP_PROGRAM, "Pump.fun Logs Fallback", pumpCreateFromLogs, ch, "pump")
-		listenProgramBlocks(PUMP_PROGRAM, "Pump.fun", pumpCreateFromLogs, ch, "pump")
+		go listenProgram(PUMP_PROGRAM, "Pump.fun Logs Fallback", pumpCreateFromLogs, ch, "pump_logs")
+		listenProgramBlocks(PUMP_PROGRAM, "Pump.fun", pumpCreateFromLogs, ch, "pump_block")
 		return
 	}
 	listenProgram(PUMP_PROGRAM, "Pump.fun", pumpCreateFromLogs, ch, "pump")
@@ -4402,7 +4414,11 @@ func main() {
 						}
 					}
 					if mint == "" {
-						logRejectLine("no_mint", "?", "", "РЅРµС‚ mint РІ create tx")
+						src := tok.Source
+						if src == "" {
+							src = "unknown"
+						}
+						logRejectLine("no_mint", "?", "", fmt.Sprintf("РЅРµС‚ mint РІ create tx | src=%s | sig=%s", src, short(tok.Sig)))
 						return
 					}
 					if !strings.HasSuffix(mint, "pump") {

@@ -113,6 +113,31 @@ func antiScamAllowRpcMiss() bool {
 	return envSignalProfile() != "strict"
 }
 
+func allowTransientAntiScamMiss(err error, kind string) bool {
+	if err == nil || !antiScamAllowRpcMiss() {
+		return false
+	}
+	s := strings.ToLower(strings.TrimSpace(err.Error()))
+	if isRateLimitErr(err) {
+		return true
+	}
+	if strings.Contains(s, "timeout") ||
+		strings.Contains(s, "deadline exceeded") ||
+		strings.Contains(s, "connection reset") ||
+		strings.Contains(s, "eof") ||
+		strings.Contains(s, "tempor") ||
+		strings.Contains(s, "unavailable") {
+		return true
+	}
+	if kind == "mint" && (strings.Contains(s, "mint parse") || strings.Contains(s, "not found")) {
+		return true
+	}
+	if kind == "metadata" && (strings.Contains(s, "metadata uri") || strings.Contains(s, "metadata json") || strings.Contains(s, "read error")) {
+		return true
+	}
+	return false
+}
+
 func antiScamCreatorMinSOL() float64 {
 	if s := strings.TrimSpace(os.Getenv("ANTI_SCAM_CREATOR_MIN_SOL")); s != "" {
 		if v, err := strconv.ParseFloat(s, 64); err == nil && v >= 0.05 && v <= 20 {
@@ -2577,9 +2602,7 @@ func antiScamCheck(mint, mintAuthorityRef, liquidityVault, creator string, creat
 	// РћР±СЏР·Р°С‚РµР»СЊРЅС‹Р№ anti-scam: Сѓ С‚РѕРєРµРЅР° РґРѕР»Р¶РЅР° Р±С‹С‚СЊ С…РѕС‚СЏ Р±С‹ РѕРґРЅР° social-СЃСЃС‹Р»РєР°.
 	okSocial, socialDetail := hasSocialLinksInMetadata(mint)
 	if !okSocial {
-		d := strings.ToLower(socialDetail)
-		transientMeta := strings.Contains(d, "metadata uri") || strings.Contains(d, "metadata json") || strings.Contains(d, "read error")
-		if !antiScamAllowRpcMiss() || !transientMeta {
+		if !allowTransientAntiScamMiss(fmt.Errorf("%s", socialDetail), "metadata") {
 			return false, socialDetail
 		}
 		okSocial = true
@@ -2588,7 +2611,9 @@ func antiScamCheck(mint, mintAuthorityRef, liquidityVault, creator string, creat
 	if fastAntiScamMode() {
 		badMint, badFreeze, err := rpcMintAuthorities(mint, mintAuthorityRef, extraMintAuth...)
 		if err != nil {
-			return false, "mint RPC"
+			if !allowTransientAntiScamMiss(err, "mint") {
+				return false, "mint RPC"
+			}
 		}
 		if badMint {
 			return false, "mintAuthority РЅРµ РєСЂРёРІР°СЏ (С‡СѓР¶Р°СЏ С‡РµРєР°РЅРєР°)"
@@ -2602,10 +2627,14 @@ func antiScamCheck(mint, mintAuthorityRef, liquidityVault, creator string, creat
 		if devCreatedTooMany(creator) {
 			return false, "dev serial rugger (>7 tx/С‡Р°СЃ)"
 		}
-		if solUnknown {
-			return true, fmt.Sprintf("fast anti-scam | %s | dev SOL n/a", socialDetail)
+		mintInfo := "mint ok"
+		if err != nil {
+			mintInfo = "mint unknown (RPC miss allowed)"
 		}
-		return true, fmt.Sprintf("fast anti-scam | %s | dev %.2f SOL", socialDetail, sol)
+		if solUnknown {
+			return true, fmt.Sprintf("fast anti-scam | %s | %s | dev SOL n/a", socialDetail, mintInfo)
+		}
+		return true, fmt.Sprintf("fast anti-scam | %s | %s | dev %.2f SOL", socialDetail, mintInfo, sol)
 	}
 
 	type filterResult struct {
@@ -2622,7 +2651,11 @@ func antiScamCheck(mint, mintAuthorityRef, liquidityVault, creator string, creat
 		defer wg.Done()
 		badMint, badFreeze, err := rpcMintAuthorities(mint, mintAuthorityRef, extraMintAuth...)
 		if err != nil {
-			results <- filterResult{key: "mint", ok: false, detail: "mint RPC"}
+			if allowTransientAntiScamMiss(err, "mint") {
+				results <- filterResult{key: "mint", ok: true, detail: "mint unknown (RPC miss allowed)"}
+			} else {
+				results <- filterResult{key: "mint", ok: false, detail: "mint RPC"}
+			}
 			return
 		}
 		if badMint {

@@ -1133,19 +1133,19 @@ func checkAll(ctx context.Context) bool {
 			p.HiPnl = pnl
 		}
 
-		if pnl > 0.05 {
+		if pnl > 0.03 {
 			hasProfit = true
 		}
 
 		var reason string
 		switch {
-		case pnl >= cfg.TP && pnl > 0.03:
+		case pnl >= cfg.TP:
 			reason = fmt.Sprintf("TP +%.0f%%", pnl*100)
 		case pnl <= -cfg.SL:
 			reason = fmt.Sprintf("SL %.0f%%", pnl*100)
-		case p.HiPnl >= 0.05 && pnl < p.HiPnl-0.03 && pnl > 0.03:
+		case p.HiPnl >= 0.03 && pnl < p.HiPnl-0.02 && pnl > 0:
 			reason = fmt.Sprintf("TRAIL peak+%.0f%% now+%.0f%%", p.HiPnl*100, pnl*100)
-		case p.HiPnl >= 0.05 && pnl < p.HiPnl-0.03 && pnl <= -cfg.SL:
+		case p.HiPnl >= 0.03 && pnl < p.HiPnl-0.02 && pnl <= 0:
 			reason = fmt.Sprintf("SL(trail) %.0f%%", pnl*100)
 		case age >= time.Duration(cfg.TimeKillSec)*time.Second && pnl < cfg.TimeKillMin && pnl > -cfg.SL:
 			reason = fmt.Sprintf("TIMEKILL %ds pnl=%+.1f%%", int(age.Seconds()), pnl*100)
@@ -1213,11 +1213,10 @@ func doSell(ctx context.Context, p *Position, reason string, cachedState *Bondin
 	assocBC := findATA(bc, p.Mint, tokProg)
 	assocUser := findATA(user, p.Mint, tokProg)
 
-	realBal := getTokenBalance(ctx, assocUser)
-	if realBal == 0 {
+	sellAmt := p.Tokens
+	if sellAmt == 0 {
 		return false
 	}
-	sellAmt := realBal
 
 	solOut := calcSolOut(state.VTK, state.VSR, sellAmt)
 	solNet := solOut - solOut/100

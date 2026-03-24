@@ -48,11 +48,9 @@ var (
 )
 
 func init() {
-	// buy_exact_sol_in discriminator (replaces old "global:buy")
 	copy(buyDisc[:], []byte{56, 252, 116, 8, 158, 223, 205, 95})
-	h := sha256.Sum256([]byte("global:sell"))
-	copy(sellDisc[:], h[:8])
-	h = sha256.Sum256([]byte("event:TradeEvent"))
+	copy(sellDisc[:], []byte{51, 230, 133, 164, 1, 127, 131, 173})
+	h := sha256.Sum256([]byte("event:TradeEvent"))
 	copy(tradeDisc[:], h[:8])
 	ea, _, _ := solana.FindProgramAddress([][]byte{[]byte("__event_authority")}, PumpProgram)
 	PumpEventAuth = ea
@@ -92,13 +90,15 @@ type Signal struct {
 }
 
 type Position struct {
-	Mint    solana.PublicKey
-	Tokens  uint64
-	Spent   uint64 // lamports
-	Entry   time.Time
-	Wallet  string
-	HiPnl   float64 // peak PnL for trailing stop
-	TokProg solana.PublicKey
+	Mint        solana.PublicKey
+	Tokens      uint64
+	Spent       uint64 // lamports
+	Entry       time.Time
+	Wallet      string
+	HiPnl       float64 // peak PnL for trailing stop
+	TokProg     solana.PublicKey
+	LastSellTry time.Time
+	SellFails   int
 }
 
 type BondingCurve struct {
@@ -432,7 +432,7 @@ func scrape(ctx context.Context) {
 	tgtMu.Lock()
 	added := 0
 	for w, cnt := range freq {
-		if cnt < 1 {
+		if cnt < 2 {
 			continue
 		}
 		if _, ok := targets[w]; !ok && len(targets) < cfg.MaxTargets {
@@ -815,7 +815,13 @@ func doBuy(ctx context.Context, sig Signal) {
 		return
 	}
 
-	if state.VSR < 3_000_000_000 {
+	if state.VSR < 5_000_000_000 {
+		setMintCooldown(mint)
+		return
+	}
+
+	// Не входить если осталось <20% токенов (bonding curve почти завершена — опасно)
+	if state.RTK > 0 && state.Supply > 0 && float64(state.RTK)/float64(state.Supply) < 0.20 {
 		setMintCooldown(mint)
 		return
 	}
@@ -984,6 +990,24 @@ func checkAll(ctx context.Context) {
 	defer posMu.Unlock()
 
 	for mint, p := range pos {
+		// Cooldown между попытками продажи: 5с + 5с за каждый фейл (макс 30с)
+		if !p.LastSellTry.IsZero() {
+			wait := time.Duration(5+p.SellFails*5) * time.Second
+			if wait > 30*time.Second {
+				wait = 30 * time.Second
+			}
+			if time.Since(p.LastSellTry) < wait {
+				continue
+			}
+		}
+
+		// Если 10 неудачных продаж подряд — удаляем позицию (монета мёртвая)
+		if p.SellFails >= 10 {
+			log.Printf("[MON] %s удалена (10 неудачных sell)", short(mint))
+			delete(pos, mint)
+			continue
+		}
+
 		state, _, err := readBC(ctx, p.Mint)
 		if err != nil {
 			continue
@@ -999,7 +1023,6 @@ func checkAll(ctx context.Context) {
 		pnl := float64(solNet)/float64(p.Spent) - 1.0
 		age := time.Since(p.Entry)
 
-		// Track peak PnL for trailing stop
 		if pnl > p.HiPnl {
 			p.HiPnl = pnl
 		}
@@ -1010,24 +1033,25 @@ func checkAll(ctx context.Context) {
 			reason = fmt.Sprintf("TP +%.0f%%", pnl*100)
 		case pnl <= -cfg.SL:
 			reason = fmt.Sprintf("SL %.0f%%", pnl*100)
-		// Trailing: был выше +8%, упал на 5% от пика → фиксируем прибыль
-		case p.HiPnl >= 0.08 && pnl < p.HiPnl-0.05:
+		case p.HiPnl >= 0.05 && pnl < p.HiPnl-0.03:
 			reason = fmt.Sprintf("TRAIL peak+%.0f%% now%+.0f%%", p.HiPnl*100, pnl*100)
 		case age >= time.Duration(cfg.TimeKillSec)*time.Second && pnl < cfg.TimeKillMin:
 			reason = fmt.Sprintf("TIMEKILL %ds pnl=%+.1f%%", int(age.Seconds()), pnl*100)
-		// Hard kill: 90 секунд без значительного роста
-		case age >= 90*time.Second && pnl < 0.10:
+		case age >= 45*time.Second && pnl < 0.08:
 			reason = fmt.Sprintf("HARDKILL %ds pnl=%+.1f%%", int(age.Seconds()), pnl*100)
 		}
 		if reason == "" {
 			continue
 		}
 
+		p.LastSellTry = time.Now()
 		profitable := pnl > 0
 		ok := doSell(ctx, p, reason)
 		if ok {
 			delete(pos, mint)
 			trackTargetResult(p.Wallet, profitable)
+		} else {
+			p.SellFails++
 		}
 	}
 }
@@ -1057,7 +1081,6 @@ func doSell(ctx context.Context, p *Position, reason string) bool {
 	mintStr := p.Mint.String()
 	state, bc, err := readBC(ctx, p.Mint)
 	if err != nil || state.Done {
-		log.Printf("[SELL] BC: %v | %s", err, short(mintStr))
 		return false
 	}
 
@@ -1070,14 +1093,10 @@ func doSell(ctx context.Context, p *Position, reason string) bool {
 	assocUser := findATA(user, p.Mint, tokProg)
 
 	realBal := getTokenBalance(ctx, assocUser)
-	sellAmt := realBal
-	if sellAmt == 0 {
-		sellAmt = p.Tokens
-	}
-	if sellAmt == 0 {
-		log.Printf("[SELL] Нет токенов: %s", short(mintStr))
+	if realBal == 0 {
 		return false
 	}
+	sellAmt := realBal
 
 	solOut := calcSolOut(state.VTK, state.VSR, sellAmt)
 	solNet := solOut - solOut/100

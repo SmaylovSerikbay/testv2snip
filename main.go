@@ -91,15 +91,20 @@ type Config struct {
 	MaxPositions    int
 	ScrapeIvl       time.Duration
 	MonitorMs       int
-	Live            bool
-	MinReserve      uint64  // min SOL balance to keep (lamports)
-	MaxSessionLoss  float64 // stop trading if session PnL <= -X%
-	WalletCD        time.Duration
-	MaxTokInfoLag   time.Duration // if token info fetch exceeds this, skip buy
-	MaxSignalLag    time.Duration // if total lag from signal to send exceeds this, skip buy
-	MinWhaleBuyLam  uint64        // min whale buy size to follow (lamports)
-	MinVSRLam       uint64        // min virtual SOL reserve (lamports)
-	MintCD          time.Duration // skip re-buy same mint for this long after attempt/skip
+	// Пока позиция «молодая» (сек после Entry) — держать быстрый тик монитора (иначе при обвале ждём до MONITOR_MS).
+	MonitorFastYoungSec int
+	// FLASHSL: в первые N сек при pnl <= -X% — резать хвост (0 = выкл.)
+	FlashSLWindow  time.Duration
+	FlashSLPct     float64
+	Live           bool
+	MinReserve     uint64  // min SOL balance to keep (lamports)
+	MaxSessionLoss float64 // stop trading if session PnL <= -X%
+	WalletCD       time.Duration
+	MaxTokInfoLag  time.Duration // if token info fetch exceeds this, skip buy
+	MaxSignalLag   time.Duration // if total lag from signal to send exceeds this, skip buy
+	MinWhaleBuyLam uint64        // min whale buy size to follow (lamports)
+	MinVSRLam      uint64        // min virtual SOL reserve (lamports)
+	MintCD         time.Duration // skip re-buy same mint for this long after attempt/skip
 	// BC retries when bonding curve account not yet readable (fresh mints)
 	BCRetryMax   int
 	BCRetrySleep time.Duration
@@ -112,6 +117,8 @@ type Config struct {
 	CopyWallets []string
 	// SCRAPE_AUTO_TARGETS=0 — только COPY_WALLETS; 1 (дефолт) — бот сам набирает цели по WS
 	ScrapeAutoTargets bool
+	// Мин. покупок в один и тот же mint для эвристики «same-mint»; 0 = не использовать (только profitOK / крупный бай)
+	ScrapeSameMintMin int
 }
 
 type Signal struct {
@@ -448,14 +455,29 @@ func main() {
 	}
 	log.Printf("[INIT] BuySlip %dbps SellSlip %dbps | PrioBuy %.4f PrioSell %.4f SOL",
 		cfg.Slip, cfg.SellSlip, float64(cfg.PrioLamp)/1e9, float64(cfg.PrioLampSell)/1e9)
-	log.Printf("[INIT] MaxTargets %d | MaxPos %d | Scrape %v | Monitor %dms",
-		cfg.MaxTargets, cfg.MaxPositions, cfg.ScrapeIvl, cfg.MonitorMs)
+	if cfg.MonitorFastYoungSec > 0 {
+		log.Printf("[INIT] MaxTargets %d | MaxPos %d | Scrape %v | Monitor %dms + fast %ds после входа",
+			cfg.MaxTargets, cfg.MaxPositions, cfg.ScrapeIvl, cfg.MonitorMs, cfg.MonitorFastYoungSec)
+	} else {
+		log.Printf("[INIT] MaxTargets %d | MaxPos %d | Scrape %v | Monitor %dms (fast только при pnl>+2%%)",
+			cfg.MaxTargets, cfg.MaxPositions, cfg.ScrapeIvl, cfg.MonitorMs)
+	}
+	if cfg.FlashSLWindow > 0 {
+		log.Printf("[INIT] FLASHSL первые %ds при ≤-%.0f%%", int(cfg.FlashSLWindow.Seconds()), cfg.FlashSLPct*100)
+	} else {
+		log.Printf("[INIT] FLASHSL выкл.")
+	}
 	log.Printf("[INIT] MinReserve %.4f SOL | MaxSessionLoss -%.0f%% (от стартового баланса, не сумма %% по сделкам)",
 		float64(cfg.MinReserve)/1e9, cfg.MaxSessionLoss)
 	log.Printf("[INIT] LagShields: tokeninfo<=%dms signal<=%dms",
 		cfg.MaxTokInfoLag.Milliseconds(), cfg.MaxSignalLag.Milliseconds())
 	log.Printf("[INIT] CopyFilters: whale>=%.2f SOL | minVSR>=%.1f SOL | mintCooldown=%v",
 		float64(cfg.MinWhaleBuyLam)/1e9, float64(cfg.MinVSRLam)/1e9, cfg.MintCD)
+	if cfg.ScrapeSameMintMin > 0 {
+		log.Printf("[INIT] Scrape: same-mint min=%d (эвристика N баёв в один mint; 0 в .env = только profit/крупный бай)", cfg.ScrapeSameMintMin)
+	} else {
+		log.Printf("[INIT] Scrape: same-mint выкл. — цели только profit>30%% или крупный бай (план A)")
+	}
 	log.Printf("[INIT] BC retries: max=%d sleep=%v lagBuf=%v | badEntry if скорр. < -%.0f%%",
 		cfg.BCRetryMax, cfg.BCRetrySleep, cfg.BCSigLagBuf, cfg.BadEntryPct)
 	if cfg.BreakevenMinPeak > 0 {
@@ -533,7 +555,7 @@ func main() {
 					log.Println("[EXIT] Все позиции закрыты")
 					break waitLoop
 				}
-				checkAll(ctx)
+				checkAll(ctx) // EXIT: не важен fast-тик
 			}
 		}
 		tick.Stop()
@@ -546,38 +568,42 @@ func main() {
 
 func loadCfg() Config {
 	c := Config{
-		BuyLamp:           7_000_000, // 0.007 SOL
-		Slip:              2000,      // 20% buy slippage
-		SellSlip:          4000,      // 40% sell slippage
-		PrioLamp:          2_000_000, // 0.002 SOL buy priority
-		PrioLampSell:      1_500_000, // 0.0015 SOL sell priority
-		TP:                0.40,
-		QuickTPPct:        0.22, // +22% за первые 15с — иначе ждём основной TP
-		EarlySLWindow:     5 * time.Second,
-		EarlySLPct:        0.08, // −8% в первые 5с — на pump часто шум; см. EARLYSL_* в .env
-		SL:                0.25,
-		BreakevenMinPeak:  0.30,
-		ScrapeAutoTargets: true,
-		TimeKillSec:       60,
-		TimeKillMin:       0.05,
-		MaxTargets:        50,
-		MaxPositions:      2,
-		ScrapeIvl:         3 * time.Minute,
-		MonitorMs:         1000,
-		MinReserve:        15_000_000, // 0.015 SOL
-		MaxSessionLoss:    30.0,       // -30%
-		WalletCD:          5 * time.Second,
-		MaxTokInfoLag:     500 * time.Millisecond,
-		MaxSignalLag:      250 * time.Millisecond,
-		JitoHTTPURL:       "https://mainnet.block-engine.jito.wtf/api/v1/transactions",
-		JitoHTTPTimeout:   400 * time.Millisecond,
-		MinWhaleBuyLam:    200_000_000,    // 0.2 SOL
-		MinVSRLam:         20_000_000_000, // 20 SOL liquidity floor
-		MintCD:            90 * time.Second,
-		BCRetryMax:        12,
-		BCRetrySleep:      100 * time.Millisecond,
-		BCSigLagBuf:       100 * time.Millisecond,
-		BadEntryPct:       20,
+		BuyLamp:             7_000_000, // 0.007 SOL
+		Slip:                2000,      // 20% buy slippage
+		SellSlip:            4000,      // 40% sell slippage
+		PrioLamp:            2_000_000, // 0.002 SOL buy priority
+		PrioLampSell:        1_500_000, // 0.0015 SOL sell priority
+		TP:                  0.40,
+		QuickTPPct:          0.22, // +22% за первые 15с — иначе ждём основной TP
+		EarlySLWindow:       5 * time.Second,
+		EarlySLPct:          0.08, // −8% в первые 5с — на pump часто шум; см. EARLYSL_* в .env
+		SL:                  0.25,
+		BreakevenMinPeak:    0.30,
+		ScrapeAutoTargets:   true,
+		TimeKillSec:         60,
+		TimeKillMin:         0.05,
+		MaxTargets:          50,
+		MaxPositions:        2,
+		ScrapeIvl:           3 * time.Minute,
+		MonitorMs:           1000,
+		MonitorFastYoungSec: 25,
+		FlashSLWindow:       4 * time.Second,
+		FlashSLPct:          0.12,       // −12% в первые 4с — до EARLYSL/SL
+		MinReserve:          15_000_000, // 0.015 SOL
+		MaxSessionLoss:      30.0,       // -30%
+		WalletCD:            5 * time.Second,
+		MaxTokInfoLag:       500 * time.Millisecond,
+		MaxSignalLag:        250 * time.Millisecond,
+		JitoHTTPURL:         "https://mainnet.block-engine.jito.wtf/api/v1/transactions",
+		JitoHTTPTimeout:     400 * time.Millisecond,
+		MinWhaleBuyLam:      200_000_000,    // 0.2 SOL
+		MinVSRLam:           20_000_000_000, // 20 SOL liquidity floor
+		MintCD:              90 * time.Second,
+		BCRetryMax:          12,
+		BCRetrySleep:        100 * time.Millisecond,
+		BCSigLagBuf:         100 * time.Millisecond,
+		BadEntryPct:         20,
+		ScrapeSameMintMin:   5, // вариант B: было жёстко 3
 	}
 	// EXCLUSIVE HELIUS: никаких иных RPC/WSS (старые эндпойнты полностью отключены)
 	if v := os.Getenv("HELIUS_API_KEY"); v != "" {
@@ -663,6 +689,11 @@ func loadCfg() Config {
 		}
 	}
 	c.MinVSRLam = evU("MIN_VSR_LAMPORTS", c.MinVSRLam)
+	if v := strings.TrimSpace(os.Getenv("SCRAPE_SAME_MINT_MIN")); v == "0" {
+		c.ScrapeSameMintMin = 0
+	} else {
+		c.ScrapeSameMintMin = int(evU("SCRAPE_SAME_MINT_MIN", uint64(c.ScrapeSameMintMin)))
+	}
 	if s := evU("MINT_COOLDOWN_SEC", 0); s > 0 {
 		c.MintCD = time.Duration(s) * time.Second
 	}
@@ -670,6 +701,21 @@ func loadCfg() Config {
 		c.ScrapeIvl = time.Duration(m) * time.Minute
 	}
 	c.MonitorMs = int(evU("MONITOR_MS", uint64(c.MonitorMs)))
+	if v := strings.TrimSpace(os.Getenv("MONITOR_FAST_YOUNG_SEC")); v != "" {
+		if v == "0" {
+			c.MonitorFastYoungSec = 0
+		} else if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			c.MonitorFastYoungSec = n
+		}
+	}
+	if v := strings.TrimSpace(os.Getenv("FLASH_SL_SEC")); v != "" {
+		if v == "0" {
+			c.FlashSLWindow = 0
+		} else if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			c.FlashSLWindow = time.Duration(n) * time.Second
+		}
+	}
+	c.FlashSLPct = evF("FLASH_SL_MIN_PCT", c.FlashSLPct*100) / 100
 	if n := evU("BC_RETRY_MAX", 0); n > 0 {
 		c.BCRetryMax = int(n)
 	}
@@ -870,7 +916,8 @@ func scrape(ctx context.Context) {
 					profitOK = true
 				}
 			}
-			if maxMintBuys < 3 && !profitOK && !ws.win24h2x {
+			sameMintOK := cfg.ScrapeSameMintMin > 0 && maxMintBuys >= cfg.ScrapeSameMintMin
+			if !sameMintOK && !profitOK && !ws.win24h2x {
 				continue
 			}
 			if _, ok := targets[w]; !ok && len(targets) < cfg.MaxTargets {
@@ -1853,11 +1900,12 @@ func runMonitor(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-t.C:
-			hasProfit := checkAll(ctx)
-			if hasProfit && !fast {
+			hasProfit, needFastYoung := checkAll(ctx)
+			wantFast := hasProfit || needFastYoung
+			if wantFast && !fast {
 				t.Reset(fastInterval)
 				fast = true
-			} else if !hasProfit && fast {
+			} else if !wantFast && fast {
 				t.Reset(normalInterval)
 				fast = false
 			}
@@ -1875,8 +1923,7 @@ type sellJob struct {
 	profitable bool
 }
 
-func checkAll(ctx context.Context) bool {
-	hasProfit := false
+func checkAll(ctx context.Context) (hasProfit bool, needFastYoung bool) {
 
 	type posSnap struct {
 		mint   string
@@ -1908,6 +1955,11 @@ func checkAll(ctx context.Context) bool {
 
 	var jobs []sellJob
 	for _, s := range snaps {
+		if cfg.MonitorFastYoungSec > 0 && s.p != nil && (!cfg.Live || s.p.Confirmed) {
+			if time.Since(s.p.Entry) < time.Duration(cfg.MonitorFastYoungSec)*time.Second {
+				needFastYoung = true
+			}
+		}
 		// Не пытаемся продавать до подтверждения BUY и получения реального баланса ATA.
 		// Иначе возможна гонка: SELL до BUY-confirm => "минус в SOL без видимого токена".
 		if cfg.Live && (s.p == nil || !s.p.Confirmed) {
@@ -1943,6 +1995,8 @@ func checkAll(ctx context.Context) bool {
 		switch {
 		case pnl >= cfg.TP:
 			reason = fmt.Sprintf("TP +%.0f%%", pnl*100)
+		case cfg.FlashSLWindow > 0 && age <= cfg.FlashSLWindow && pnl <= -cfg.FlashSLPct:
+			reason = fmt.Sprintf("FLASHSL %ds pnl=%+.1f%%", int(age.Seconds()), pnl*100)
 		case cfg.EarlySLWindow > 0 && age <= cfg.EarlySLWindow && pnl <= -cfg.EarlySLPct:
 			reason = fmt.Sprintf("EARLYSL %ds pnl=%+.1f%%", int(age.Seconds()), pnl*100)
 		case age <= 15*time.Second && pnl >= cfg.QuickTPPct:
@@ -1991,7 +2045,7 @@ func checkAll(ctx context.Context) bool {
 			}
 		}
 	}
-	return hasProfit
+	return hasProfit, needFastYoung
 }
 
 func trackTargetResult(wallet string, win bool) {

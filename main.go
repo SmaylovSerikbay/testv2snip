@@ -79,6 +79,7 @@ type Config struct {
 	JitoTipAcc     solana.PublicKey
 	JitoHTTP       bool
 	JitoHTTPURL    string
+	JitoHTTPTimeout time.Duration
 	TP             float64
 	SL             float64
 	TimeKillSec    int
@@ -93,11 +94,14 @@ type Config struct {
 	WalletCD       time.Duration
 	MaxTokInfoLag  time.Duration // if token info fetch exceeds this, skip buy
 	MaxSignalLag   time.Duration // if total lag from signal to send exceeds this, skip buy
+	MinWhaleBuyLam uint64        // min whale buy size to follow (lamports)
+	MinVSRLam      uint64        // min virtual SOL reserve (lamports)
 }
 
 type Signal struct {
 	Mint   solana.PublicKey
 	Wallet string
+	At     time.Time // when WS signal was received
 }
 
 type Position struct {
@@ -238,6 +242,16 @@ func rpcNote(err error) {
 	}
 }
 
+func accountExists(ctx context.Context, pk solana.PublicKey) bool {
+	rpcWait()
+	info, err := rpcClient().GetAccountInfoWithOpts(ctx, pk, &rpc.GetAccountInfoOpts{
+		Encoding:   solana.EncodingBase64,
+		Commitment: rpc.CommitmentConfirmed,
+	})
+	rpcNote(err)
+	return err == nil && info != nil && info.Value != nil
+}
+
 func requestWSRestart() {
 	select {
 	case wsRestartCh <- struct{}{}:
@@ -250,7 +264,8 @@ func sendTx(ctx context.Context, tx *solana.Transaction) (solana.Signature, erro
 		if sig, err := sendTxViaJitoHTTP(ctx, cfg.JitoHTTPURL, tx); err == nil {
 			return sig, nil
 		} else {
-			log.Printf("[JITO] sendTransaction failed, fallback to RPC: %v", err)
+			// В бою лучше НЕ покупать поздно через fallback RPC: это и даёт -10% на входе.
+			return solana.Signature{}, err
 		}
 	}
 	rpcWait()
@@ -281,7 +296,11 @@ func sendTxViaJitoHTTP(ctx context.Context, url string, tx *solana.Transaction) 
 	hreq, _ := http.NewRequestWithContext(ctx, "POST", url, bytes.NewReader(reqBody))
 	hreq.Header.Set("Content-Type", "application/json")
 	hreq.Header.Set("Accept", "application/json")
-	c := &http.Client{Timeout: 3 * time.Second}
+	to := cfg.JitoHTTPTimeout
+	if to <= 0 {
+		to = 400 * time.Millisecond
+	}
+	c := &http.Client{Timeout: to}
 	r, err := c.Do(hreq)
 	if err != nil {
 		return solana.Signature{}, err
@@ -398,6 +417,8 @@ func main() {
 		cfg.MaxTargets, cfg.MaxPositions, cfg.ScrapeIvl, cfg.MonitorMs)
 	log.Printf("[INIT] MinReserve %.4f SOL | MaxSessionLoss -%.0f%%",
 		float64(cfg.MinReserve)/1e9, cfg.MaxSessionLoss)
+	log.Printf("[INIT] LagShields: tokeninfo<=%dms signal<=%dms",
+		cfg.MaxTokInfoLag.Milliseconds(), cfg.MaxSignalLag.Milliseconds())
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -485,8 +506,11 @@ func loadCfg() Config {
 		MaxSessionLoss: 30.0,        // -30%
 		WalletCD:       5 * time.Second,
 		MaxTokInfoLag:  500 * time.Millisecond,
-		MaxSignalLag:   350 * time.Millisecond,
+		MaxSignalLag:   250 * time.Millisecond,
 		JitoHTTPURL:    "https://mainnet.block-engine.jito.wtf/api/v1/transactions",
+		JitoHTTPTimeout: 400 * time.Millisecond,
+		MinWhaleBuyLam: 200_000_000,      // 0.2 SOL
+		MinVSRLam:      20_000_000_000,   // 20 SOL liquidity floor
 	}
 	// EXCLUSIVE HELIUS: никаких иных RPC/WSS (старые эндпойнты полностью отключены)
 	if v := os.Getenv("HELIUS_API_KEY"); v != "" {
@@ -519,6 +543,9 @@ func loadCfg() Config {
 	if u := os.Getenv("JITO_HTTP_URL"); u != "" {
 		c.JitoHTTPURL = u
 	}
+	if ms := evU("JITO_HTTP_TIMEOUT_MS", 0); ms > 0 {
+		c.JitoHTTPTimeout = time.Duration(ms) * time.Millisecond
+	}
 	if a := os.Getenv("JITO_TIP_ACCOUNT"); a != "" {
 		if pk, err := solana.PublicKeyFromBase58(a); err == nil {
 			c.JitoTipAcc = pk
@@ -539,6 +566,12 @@ func loadCfg() Config {
 	if ms := evU("MAX_SIGNAL_LAG_MS", 0); ms > 0 {
 		c.MaxSignalLag = time.Duration(ms) * time.Millisecond
 	}
+	if v := os.Getenv("MIN_WHALE_BUY_SOL"); v != "" {
+		if f, err := strconv.ParseFloat(v, 64); err == nil && f > 0 {
+			c.MinWhaleBuyLam = uint64(f * 1e9)
+		}
+	}
+	c.MinVSRLam = evU("MIN_VSR_LAMPORTS", c.MinVSRLam)
 	if m := evU("SCRAPE_INTERVAL_MIN", 0); m > 0 {
 		c.ScrapeIvl = time.Duration(m) * time.Minute
 	}
@@ -1228,12 +1261,12 @@ func parseBuySignal(wallet string, logs []string) {
 	if ev == nil || ev.User.String() != wallet {
 		return
 	}
-	if ev.Sol < 30_000_000 {
+	if ev.Sol < cfg.MinWhaleBuyLam {
 		return
 	}
 
 	select {
-	case signalCh <- Signal{Mint: ev.Mint, Wallet: wallet}:
+	case signalCh <- Signal{Mint: ev.Mint, Wallet: wallet, At: time.Now()}:
 	default:
 		log.Println("[WS] signalCh full — пропуск")
 	}
@@ -1277,11 +1310,20 @@ func setMintCooldown(mint string) {
 }
 
 func doBuy(ctx context.Context, sig Signal) {
-	signalT := time.Now()
+	signalT := sig.At
+	if signalT.IsZero() {
+		signalT = time.Now()
+	}
 	if ctx.Err() != nil {
 		return
 	}
 	mint := sig.Mint.String()
+
+	// hard skip if the WS signal is already stale before we even start work
+	if cfg.MaxSignalLag > 0 && time.Since(signalT) > cfg.MaxSignalLag {
+		log.Printf("[BUY] Skip: signal stale %dms > %dms | %s", time.Since(signalT).Milliseconds(), cfg.MaxSignalLag.Milliseconds(), short(mint))
+		return
+	}
 
 	if circuitOpen.Load() {
 		log.Printf("[BUY] Skip: circuit breaker active | %s", short(mint))
@@ -1345,12 +1387,13 @@ func doBuy(ctx context.Context, sig Signal) {
 		preBalOK  bool
 		preTokPrg solana.PublicKey
 		tokInfoMs int64
+		preATAOK  bool
 		preState  *BondingCurve
 		preBC     solana.PublicKey
 		preBCErr  error
 	)
 	var pwg sync.WaitGroup
-	pwg.Add(3)
+	pwg.Add(4)
 	go func() {
 		defer pwg.Done()
 		rpcWait()
@@ -1369,6 +1412,13 @@ func doBuy(ctx context.Context, sig Signal) {
 	}()
 	go func() {
 		defer pwg.Done()
+		// check if ATA already exists (otherwise we need rent to create it)
+		user := cfg.Key.PublicKey()
+		ata := findATA(user, sig.Mint, solana.TokenProgramID)
+		preATAOK = accountExists(ctx, ata)
+	}()
+	go func() {
+		defer pwg.Done()
 		preState, preBC, preBCErr = readBC(ctx, sig.Mint)
 	}()
 	pwg.Wait()
@@ -1381,10 +1431,18 @@ func doBuy(ctx context.Context, sig Signal) {
 		return
 	}
 
-	if preBalOK && preBal < cfg.BuyLamp+cfg.MinReserve {
-		log.Printf("[BUY] Skip: balance reserve (%.4f SOL < %.4f needed) | %s",
-			float64(preBal)/1e9, float64(cfg.BuyLamp+cfg.MinReserve)/1e9, short(mint))
-		return
+	if preBalOK {
+		rentNeed := uint64(0)
+		if !preATAOK {
+			rentNeed = 2_100_000 // ~0.0021 SOL token account rent
+		}
+		feeBuf := uint64(600_000) // buffer for network/compute
+		need := cfg.BuyLamp + cfg.MinReserve + rentNeed + feeBuf
+		if preBal < need {
+			log.Printf("[BUY] Skip: low balance (bal=%.4f need=%.4f incl rent=%.4f) | %s",
+				float64(preBal)/1e9, float64(need)/1e9, float64(rentNeed)/1e9, short(mint))
+			return
+		}
 	}
 
 	tokProg := preTokPrg
@@ -1395,8 +1453,8 @@ func doBuy(ctx context.Context, sig Signal) {
 	state, bc := preState, preBC
 	// retry for freshest mints: sometimes bonding curve account isn't readable immediately
 	if preBCErr != nil || state == nil {
-		for i := 0; i < 3; i++ {
-			time.Sleep(50 * time.Millisecond)
+		for i := 0; i < 5; i++ {
+			time.Sleep(40 * time.Millisecond)
 			s2, bc2, e2 := readBC(ctx, sig.Mint)
 			if e2 == nil && s2 != nil {
 				state, bc, preBCErr = s2, bc2, nil
@@ -1416,7 +1474,7 @@ func doBuy(ctx context.Context, sig Signal) {
 		return
 	}
 
-	if state.VSR < 10_000_000_000 {
+	if state.VSR < cfg.MinVSRLam {
 		log.Printf("[BUY] Skip: low liquidity (%.2f SOL) | %s", float64(state.VSR)/1e9, short(mint))
 		setMintCooldown(mint)
 		return
@@ -1529,12 +1587,19 @@ func doBuy(ctx context.Context, sig Signal) {
 	}
 
 	// Buy retry on fast-moving curve: if program rejects (e.g. Custom:6042), retry with looser minTokOut.
-	trySlips := []uint64{cfg.Slip, 2000, 3000}
+	// Higher slips increase fill probability on fast curves, at the cost of worse fills.
+	trySlips := []uint64{cfg.Slip, 3000, 4500, 6000}
 	var (
 		txSig solana.Signature
 		err   error
+		lastPreSendLagMs int64
+		lastSendRTTMs    int64
 	)
 	for attempt, slip := range trySlips {
+		if cfg.MaxSignalLag > 0 && time.Since(signalT) > cfg.MaxSignalLag {
+			log.Printf("[BUY] Skip: signal lag %dms > %dms (pre-build) | %s", time.Since(signalT).Milliseconds(), cfg.MaxSignalLag.Milliseconds(), short(mint))
+			return
+		}
 		if slip > 9900 {
 			slip = 9900
 		}
@@ -1544,9 +1609,18 @@ func doBuy(ctx context.Context, sig Signal) {
 			log.Printf("[BUY] Build/Sign: %v", buildErr)
 			return
 		}
+		if cfg.MaxSignalLag > 0 && time.Since(signalT) > cfg.MaxSignalLag {
+			log.Printf("[BUY] Skip: signal lag %dms > %dms (pre-send) | %s", time.Since(signalT).Milliseconds(), cfg.MaxSignalLag.Milliseconds(), short(mint))
+			return
+		}
+		sendStart := time.Now()
+		preSendLagMs := sendStart.Sub(signalT).Milliseconds()
 		txSig, err = sendTx(ctx, tx)
+		lastPreSendLagMs = preSendLagMs
+		lastSendRTTMs = time.Since(sendStart).Milliseconds()
 		if err != nil && (isBuyCustomErr6042(err) || isSlippageErr(err)) && attempt < len(trySlips)-1 {
-			log.Printf("[BUY] retry %d/%d | %s | slip=%dbps | err=%v", attempt+1, len(trySlips), short(mint), slip, err)
+			log.Printf("[BUY] retry %d/%d | %s | slip=%dbps | preSendLag=%dms | err=%v",
+				attempt+1, len(trySlips), short(mint), slip, preSendLagMs, err)
 			continue
 		}
 		break
@@ -1559,8 +1633,10 @@ func doBuy(ctx context.Context, sig Signal) {
 		log.Printf("[BUY] ✗ %s | %s", errMsg, short(mint))
 		return
 	}
-	lagMs := time.Since(signalT).Milliseconds()
-	log.Printf("[BUY] TX: %s | %s | %.4f SOL | lag=%dms", txSig.String()[:12], short(mint), float64(cfg.BuyLamp)/1e9, lagMs)
+	totalLagMs := time.Since(signalT).Milliseconds()
+	log.Printf("[BUY] TX: %s | %s | %.4f SOL | preSend=%dms sendRTT=%dms total=%dms",
+		txSig.String()[:12], short(mint), float64(cfg.BuyLamp)/1e9,
+		lastPreSendLagMs, lastSendRTTMs, totalLagMs)
 	addPos(sig.Mint, tokOut, cfg.BuyLamp, sig.Wallet, tokProg)
 	statBuys.Add(1)
 

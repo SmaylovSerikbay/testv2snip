@@ -1143,10 +1143,10 @@ func checkAll(ctx context.Context) bool {
 	posMu.Lock()
 	var snaps []posSnap
 	for mint, p := range pos {
-		if !p.LastSellTry.IsZero() {
-			wait := time.Duration(2+p.SellFails*2) * time.Second
-			if wait > 15*time.Second {
-				wait = 15 * time.Second
+		if !p.LastSellTry.IsZero() && p.SellFails > 1 {
+			wait := time.Duration(p.SellFails) * time.Second
+			if wait > 10*time.Second {
+				wait = 10 * time.Second
 			}
 			if time.Since(p.LastSellTry) < wait {
 				continue
@@ -1193,9 +1193,9 @@ func checkAll(ctx context.Context) bool {
 			reason = fmt.Sprintf("QUICKTP %ds +%.0f%%", int(age.Seconds()), pnl*100)
 		case pnl <= -cfg.SL:
 			reason = fmt.Sprintf("SL %.0f%%", pnl*100)
-		case s.p.HiPnl >= 0.04 && pnl < s.p.HiPnl-0.025 && pnl > 0:
+		case s.p.HiPnl >= 0.04 && pnl < s.p.HiPnl*0.65 && pnl > 0:
 			reason = fmt.Sprintf("TRAIL peak+%.0f%% now+%.0f%%", s.p.HiPnl*100, pnl*100)
-		case s.p.HiPnl >= 0.04 && pnl < s.p.HiPnl-0.025 && pnl <= 0:
+		case s.p.HiPnl >= 0.04 && pnl < s.p.HiPnl*0.65 && pnl <= 0:
 			reason = fmt.Sprintf("SL(trail) %.0f%%", pnl*100)
 		case age >= time.Duration(cfg.TimeKillSec)*time.Second && pnl < 0 && pnl > -cfg.SL:
 			reason = fmt.Sprintf("TIMEKILL %ds pnl=%+.1f%%", int(age.Seconds()), pnl*100)
@@ -1285,7 +1285,7 @@ func doSell(ctx context.Context, p *Position, reason string, cachedState *Bondin
 
 	solOut := calcSolOut(state.VTK, state.VSR, sellAmt)
 	solNet := solOut - solOut/100
-	sellSlip := uint64(3000)
+	sellSlip := uint64(5000)
 	minSol := solNet * (10000 - sellSlip) / 10000
 	pnl := float64(solNet)/float64(p.Spent)*100 - 100
 
@@ -1333,7 +1333,7 @@ func doSell(ctx context.Context, p *Position, reason string, cachedState *Bondin
 		},
 	}
 
-	cuLimit := uint32(300_000)
+	cuLimit := uint32(400_000)
 	ixs := []solana.Instruction{
 		cuLimitIx(cuLimit),
 		cuPriceIx(cfg.PrioLamp * 1_000_000 / uint64(cuLimit)),
@@ -1366,7 +1366,7 @@ func doSell(ctx context.Context, p *Position, reason string, cachedState *Bondin
 	rpcWait()
 	noRetry := uint(0)
 	txSig, err := rpcCl.SendTransactionWithOpts(ctx, tx, rpc.TransactionOpts{
-		SkipPreflight: false,
+		SkipPreflight: true,
 		MaxRetries:    &noRetry,
 	})
 	if err != nil {
@@ -1382,12 +1382,12 @@ func doSell(ctx context.Context, p *Position, reason string, cachedState *Bondin
 
 	savedPos := *p
 	savedPnl := pnl
-	go confirmTx(ctx, txSig, "SELL", mintStr, func() {
-		addPos(savedPos.Mint, savedPos.Tokens, savedPos.Spent, savedPos.Wallet, savedPos.TokProg)
-		log.Printf("[SELL] Позиция восстановлена (TX fail): %s", short(mintStr))
-	})
+	savedMint := mintStr
 	go func() {
-		time.Sleep(5 * time.Second)
+		confirmTx(ctx, txSig, "SELL", savedMint, func() {
+			addPos(savedPos.Mint, savedPos.Tokens, savedPos.Spent, savedPos.Wallet, savedPos.TokProg)
+			log.Printf("[SELL] Позиция восстановлена (TX fail): %s", short(savedMint))
+		})
 		rpcWait()
 		st, err := rpcCl.GetSignatureStatuses(ctx, false, txSig)
 		if err == nil && len(st.Value) > 0 && st.Value[0] != nil && st.Value[0].Err == nil {

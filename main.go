@@ -67,21 +67,25 @@ func init() {
 // ═══════════════════════════════════════════════════════════════════════════════
 
 type Config struct {
-	Key          solana.PrivateKey
-	RPC          string
-	WSS          string
-	BuyLamp      uint64
-	Slip         uint64
-	PrioLamp     uint64
-	TP           float64
-	SL           float64
-	TimeKillSec  int
-	TimeKillMin  float64
-	MaxTargets   int
-	MaxPositions int
-	ScrapeIvl    time.Duration
-	MonitorMs    int
-	Live         bool
+	Key            solana.PrivateKey
+	RPC            string
+	WSS            string
+	BuyLamp        uint64
+	Slip           uint64  // buy slippage bps
+	SellSlip       uint64  // sell slippage bps
+	PrioLamp       uint64  // priority fee for BUY (lamports)
+	PrioLampSell   uint64  // priority fee for SELL (lamports)
+	TP             float64
+	SL             float64
+	TimeKillSec    int
+	TimeKillMin    float64
+	MaxTargets     int
+	MaxPositions   int
+	ScrapeIvl      time.Duration
+	MonitorMs      int
+	Live           bool
+	MinReserve     uint64  // min SOL balance to keep (lamports)
+	MaxSessionLoss float64 // stop trading if session PnL <= -X%
 }
 
 type Signal struct {
@@ -116,6 +120,22 @@ type TradeEvent struct {
 	IsBuy     bool
 	User      solana.PublicKey
 	Timestamp int64
+}
+
+type walletStats struct {
+	mintBuys     map[string]int
+	totalBuySOL  uint64
+	totalSellSOL uint64
+	trades       int
+}
+
+func getWS(freq map[string]*walletStats, wallet string) *walletStats {
+	ws, ok := freq[wallet]
+	if !ok {
+		ws = &walletStats{mintBuys: map[string]int{}}
+		freq[wallet] = ws
+	}
+	return ws
 }
 
 type genericIx struct {
@@ -180,6 +200,8 @@ var (
 	statLosses atomic.Int64
 	statPnlMu  sync.Mutex
 	statPnlSum float64
+
+	circuitOpen atomic.Bool // session PnL circuit breaker
 )
 
 func rpcWait() { <-rpcBucket }
@@ -239,8 +261,12 @@ func main() {
 	}
 	log.Printf("[INIT] Ставка %.4f SOL | TP +%.0f%% SL -%.0f%% | TimeKill %ds<%+.0f%%",
 		float64(cfg.BuyLamp)/1e9, cfg.TP*100, cfg.SL*100, cfg.TimeKillSec, cfg.TimeKillMin*100)
+	log.Printf("[INIT] BuySlip %dbps SellSlip %dbps | PrioBuy %.4f PrioSell %.4f SOL",
+		cfg.Slip, cfg.SellSlip, float64(cfg.PrioLamp)/1e9, float64(cfg.PrioLampSell)/1e9)
 	log.Printf("[INIT] MaxTargets %d | MaxPos %d | Scrape %v | Monitor %dms",
 		cfg.MaxTargets, cfg.MaxPositions, cfg.ScrapeIvl, cfg.MonitorMs)
+	log.Printf("[INIT] MinReserve %.4f SOL | MaxSessionLoss -%.0f%%",
+		float64(cfg.MinReserve)/1e9, cfg.MaxSessionLoss)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -309,17 +335,21 @@ func main() {
 
 func loadCfg() Config {
 	c := Config{
-		BuyLamp:      5_000_000,
-		Slip:         2000,
-		PrioLamp:     100_000,
-		TP:           0.40,
-		SL:           0.20,
-		TimeKillSec:  45,
-		TimeKillMin:  0.05,
-		MaxTargets:   20,
-		MaxPositions: 5,
-		ScrapeIvl:    3 * time.Minute,
-		MonitorMs:    1000,
+		BuyLamp:        7_000_000,   // 0.007 SOL
+		Slip:           2000,        // 20% buy slippage
+		SellSlip:       4000,        // 40% sell slippage
+		PrioLamp:       2_000_000,   // 0.002 SOL buy priority
+		PrioLampSell:   1_500_000,   // 0.0015 SOL sell priority
+		TP:             0.40,
+		SL:             0.20,
+		TimeKillSec:    60,
+		TimeKillMin:    0.05,
+		MaxTargets:     50,
+		MaxPositions:   2,
+		ScrapeIvl:      3 * time.Minute,
+		MonitorMs:      1000,
+		MinReserve:     15_000_000,  // 0.015 SOL
+		MaxSessionLoss: 30.0,        // -30%
 	}
 	if v := os.Getenv("HELIUS_API_KEY"); v != "" {
 		c.RPC = "https://mainnet.helius-rpc.com/?api-key=" + v
@@ -343,6 +373,10 @@ func loadCfg() Config {
 	}
 	c.Slip = evU("SLIPPAGE_BPS", c.Slip)
 	c.PrioLamp = evU("PRIORITY_FEE_LAMPORTS", c.PrioLamp)
+	c.PrioLampSell = evU("PRIORITY_FEE_SELL_LAMPORTS", c.PrioLampSell)
+	c.SellSlip = evU("SELL_SLIPPAGE_BPS", c.SellSlip)
+	c.MinReserve = evU("MIN_BALANCE_RESERVE", c.MinReserve)
+	c.MaxSessionLoss = evF("MAX_SESSION_LOSS_PCT", c.MaxSessionLoss)
 	c.TP = evF("TAKE_PROFIT_PCT", c.TP*100) / 100
 	c.SL = evF("STOP_LOSS_PCT", c.SL*100) / 100
 	c.TimeKillSec = int(evU("TIMEKILL_SEC", uint64(c.TimeKillSec)))
@@ -466,7 +500,7 @@ func scrape(ctx context.Context) {
 	if len(cfg.Key) == 64 {
 		myKey = cfg.Key.PublicKey().String()
 	}
-	freq := map[string]int{}
+	freq := map[string]*walletStats{}
 
 	scrapeRPCLive(ctx, freq, myKey)
 	scrapeDexEndpoint(ctx, freq, myKey,
@@ -477,14 +511,31 @@ func scrape(ctx context.Context) {
 	now := time.Now()
 	tgtMu.Lock()
 	added := 0
-	for w, cnt := range freq {
-		if cnt < 3 {
+	for w, ws := range freq {
+		maxMintBuys := 0
+		for _, cnt := range ws.mintBuys {
+			if cnt > maxMintBuys {
+				maxMintBuys = cnt
+			}
+		}
+		profitOK := false
+		if ws.totalBuySOL > 0 && ws.trades >= 3 {
+			profit := float64(ws.totalSellSOL)/float64(ws.totalBuySOL) - 1.0
+			if profit > 0.50 {
+				profitOK = true
+			}
+		}
+		if maxMintBuys < 3 && !profitOK {
 			continue
 		}
 		if _, ok := targets[w]; !ok && len(targets) < cfg.MaxTargets {
 			targets[w] = now
 			added++
-			log.Printf("[SCRAPE] +Цель: %s (%d покупок)", short(w), cnt)
+			reason := fmt.Sprintf("%d same-mint buys", maxMintBuys)
+			if profitOK {
+				reason = fmt.Sprintf("profit>50%% (%d trades)", ws.trades)
+			}
+			log.Printf("[SCRAPE] +Цель: %s (%s)", short(w), reason)
 		} else if ok {
 			targets[w] = now
 		}
@@ -506,7 +557,7 @@ func scrape(ctx context.Context) {
 		time.Since(start).Round(time.Millisecond), len(freq), added, stale, total)
 }
 
-func scrapeRPCLive(ctx context.Context, freq map[string]int, myKey string) {
+func scrapeRPCLive(ctx context.Context, freq map[string]*walletStats, myKey string) {
 	for _, addr := range []solana.PublicKey{PumpEventAuth, PumpFee} {
 		rpcWait()
 		lim := 50
@@ -531,14 +582,22 @@ func scrapeRPCLive(ctx context.Context, freq map[string]int, myKey string) {
 				break
 			}
 			ok++
-			ev := parseTxEvent(ctx, s.Signature)
-			if ev == nil || !ev.IsBuy {
+			te := parseTxEvent(ctx, s.Signature)
+			if te == nil {
 				continue
 			}
-			buys++
-			w := ev.User.String()
-			if w != myKey {
-				freq[w]++
+			w := te.User.String()
+			if w == myKey {
+				continue
+			}
+			ws := getWS(freq, w)
+			ws.trades++
+			if te.IsBuy {
+				buys++
+				ws.mintBuys[te.Mint.String()]++
+				ws.totalBuySOL += te.Sol
+			} else {
+				ws.totalSellSOL += te.Sol
 			}
 		}
 		log.Printf("[SCRAPE] RPC %s: total=%d ok=%d err=%d buys=%d",
@@ -549,7 +608,7 @@ func scrapeRPCLive(ctx context.Context, freq map[string]int, myKey string) {
 	}
 }
 
-func scrapeDexEndpoint(ctx context.Context, freq map[string]int, myKey, url string, maxCheck int, tag string) {
+func scrapeDexEndpoint(ctx context.Context, freq map[string]*walletStats, myKey, url string, maxCheck int, tag string) {
 	body, err := httpGet(url)
 	if err != nil {
 		log.Printf("[SCRAPE] Dex/%s: %v", tag, err)
@@ -587,18 +646,23 @@ func scrapeDexEndpoint(ctx context.Context, freq map[string]int, myKey, url stri
 			if s.Err != nil || parsed >= 5 {
 				continue
 			}
-			ev := parseTxEvent(ctx, s.Signature)
-			if ev == nil {
+			te := parseTxEvent(ctx, s.Signature)
+			if te == nil {
 				continue
 			}
 			parsed++
-			if !ev.IsBuy {
+			w := te.User.String()
+			if w == myKey {
 				continue
 			}
-			totalBuyers++
-			w := ev.User.String()
-			if w != myKey {
-				freq[w]++
+			ws := getWS(freq, w)
+			ws.trades++
+			if te.IsBuy {
+				totalBuyers++
+				ws.mintBuys[te.Mint.String()]++
+				ws.totalBuySOL += te.Sol
+			} else {
+				ws.totalSellSOL += te.Sol
 			}
 		}
 	}
@@ -855,47 +919,66 @@ func setMintCooldown(mint string) {
 }
 
 func doBuy(ctx context.Context, sig Signal) {
+	signalT := time.Now()
 	if ctx.Err() != nil {
 		return
 	}
 	mint := sig.Mint.String()
 
-	if mintOnCooldown(mint) {
+	if circuitOpen.Load() {
+		log.Printf("[BUY] Skip: circuit breaker active | %s", short(mint))
 		return
 	}
 
-	// ── DEDUP: atomic claim на минт (блокирует повторные горутины) ──
+	if mintOnCooldown(mint) {
+		log.Printf("[BUY] Skip: cooldown | %s", short(mint))
+		return
+	}
+
 	buyingMu.Lock()
 	if buying[mint] {
 		buyingMu.Unlock()
+		log.Printf("[BUY] Skip: already buying | %s", short(mint))
 		return
 	}
 	buying[mint] = true
 	buyingMu.Unlock()
 	defer func() { buyingMu.Lock(); delete(buying, mint); buyingMu.Unlock() }()
 
-	// ── Быстрые проверки без RPC ──
 	posMu.RLock()
 	_, dup := pos[mint]
 	cnt := len(pos)
 	posMu.RUnlock()
 	if dup {
+		log.Printf("[BUY] Skip: already in position | %s", short(mint))
 		return
 	}
 	if cnt >= cfg.MaxPositions {
+		log.Printf("[BUY] Skip: max positions (%d/%d) | %s", cnt, cfg.MaxPositions, short(mint))
 		return
 	}
 	if len(cfg.Key) != 64 {
+		log.Printf("[BUY] Skip: no private key | %s", short(mint))
 		return
 	}
 
 	tgtCDMu.Lock()
 	if t, ok := tgtCDMap[sig.Wallet]; ok && time.Since(t) < 2*time.Minute {
 		tgtCDMu.Unlock()
+		log.Printf("[BUY] Skip: wallet cooldown | %s from %s", short(mint), short(sig.Wallet))
 		return
 	}
 	tgtCDMap[sig.Wallet] = time.Now()
 	tgtCDMu.Unlock()
+
+	statPnlMu.Lock()
+	sessionPnl := statPnlSum
+	statPnlMu.Unlock()
+	if sessionPnl <= -cfg.MaxSessionLoss {
+		circuitOpen.Store(true)
+		log.Printf("[BUY] Skip: session PnL breaker (%.1f%% <= -%.0f%%) — торговля остановлена", sessionPnl, cfg.MaxSessionLoss)
+		return
+	}
 
 	log.Printf("[BUY] Сигнал: %s от %s", short(mint), short(sig.Wallet))
 
@@ -928,8 +1011,9 @@ func doBuy(ctx context.Context, sig Signal) {
 	}()
 	pwg.Wait()
 
-	if preBalOK && preBal < cfg.BuyLamp+3_000_000 {
-		log.Printf("[BUY] Баланс слишком мал: %.4f SOL — пропуск", float64(preBal)/1e9)
+	if preBalOK && preBal < cfg.BuyLamp+cfg.MinReserve {
+		log.Printf("[BUY] Skip: balance reserve (%.4f SOL < %.4f needed) | %s",
+			float64(preBal)/1e9, float64(cfg.BuyLamp+cfg.MinReserve)/1e9, short(mint))
 		return
 	}
 
@@ -940,16 +1024,26 @@ func doBuy(ctx context.Context, sig Signal) {
 
 	state, bc := preState, preBC
 	if preBCErr != nil || state == nil || state.Done {
+		if preBCErr != nil {
+			log.Printf("[BUY] Skip: bonding curve error (%v) | %s", preBCErr, short(mint))
+		} else if state != nil && state.Done {
+			log.Printf("[BUY] Skip: bonding curve done (graduated) | %s", short(mint))
+		} else {
+			log.Printf("[BUY] Skip: bonding curve nil | %s", short(mint))
+		}
 		setMintCooldown(mint)
 		return
 	}
 
 	if state.VSR < 10_000_000_000 {
+		log.Printf("[BUY] Skip: low liquidity (%.2f SOL) | %s", float64(state.VSR)/1e9, short(mint))
 		setMintCooldown(mint)
 		return
 	}
 
 	if state.RTK > 0 && state.Supply > 0 && float64(state.RTK)/float64(state.Supply) < 0.20 {
+		log.Printf("[BUY] Skip: low remaining tokens (%.0f%%) | %s",
+			float64(state.RTK)/float64(state.Supply)*100, short(mint))
 		setMintCooldown(mint)
 		return
 	}
@@ -1025,7 +1119,8 @@ func doBuy(ctx context.Context, sig Signal) {
 	}
 
 	if !cfg.Live {
-		log.Printf("[BUY][PAPER] %s | %.4f SOL → %d tok", short(mint), float64(cfg.BuyLamp)/1e9, tokOut)
+		lagMs := time.Since(signalT).Milliseconds()
+		log.Printf("[BUY][PAPER] %s | %.4f SOL → %d tok | lag=%dms", short(mint), float64(cfg.BuyLamp)/1e9, tokOut, lagMs)
 		addPos(sig.Mint, tokOut, cfg.BuyLamp, sig.Wallet, tokProg)
 		statBuys.Add(1)
 		return
@@ -1051,7 +1146,8 @@ func doBuy(ctx context.Context, sig Signal) {
 		log.Printf("[BUY] ✗ %s | %s", errMsg, short(mint))
 		return
 	}
-	log.Printf("[BUY] TX: %s | %s | %.4f SOL", txSig.String()[:12], short(mint), float64(cfg.BuyLamp)/1e9)
+	lagMs := time.Since(signalT).Milliseconds()
+	log.Printf("[BUY] TX: %s | %s | %.4f SOL | lag=%dms", txSig.String()[:12], short(mint), float64(cfg.BuyLamp)/1e9, lagMs)
 	addPos(sig.Mint, tokOut, cfg.BuyLamp, sig.Wallet, tokProg)
 	statBuys.Add(1)
 
@@ -1059,7 +1155,6 @@ func doBuy(ctx context.Context, sig Signal) {
 		confirmTx(ctx, txSig, "BUY", mint, func() {
 			removePos(mint)
 			log.Printf("[BUY] Удалена фантомная позиция: %s", short(mint))
-			return
 		})
 		// После подтверждения — обновить p.Tokens реальным балансом ATA
 		user := cfg.Key.PublicKey()
@@ -1331,8 +1426,7 @@ func doSell(ctx context.Context, p *Position, reason string, cachedState *Bondin
 
 	solOut := calcSolOut(state.VTK, state.VSR, sellAmt)
 	solNet := solOut - solOut/100
-	sellSlip := uint64(5000)
-	minSol := solNet * (10000 - sellSlip) / 10000
+	minSol := solNet * (10000 - cfg.SellSlip) / 10000
 	pnl := float64(solNet)/float64(p.Spent)*100 - 100
 
 	creatorVault, _, _ := solana.FindProgramAddress(
@@ -1382,7 +1476,7 @@ func doSell(ctx context.Context, p *Position, reason string, cachedState *Bondin
 	cuLimit := uint32(400_000)
 	ixs := []solana.Instruction{
 		cuLimitIx(cuLimit),
-		cuPriceIx(cfg.PrioLamp * 1_000_000 / uint64(cuLimit)),
+		cuPriceIx(cfg.PrioLampSell * 1_000_000 / uint64(cuLimit)),
 		&genericIx{pid: PumpProgram, dat: data, accs: sellAccs},
 		closeIx,
 	}
@@ -1667,7 +1761,12 @@ func recordPnl(pnlPct float64) {
 	}
 	statPnlMu.Lock()
 	statPnlSum += pnlPct
+	pnl := statPnlSum
 	statPnlMu.Unlock()
+	if pnl <= -cfg.MaxSessionLoss && !circuitOpen.Load() {
+		circuitOpen.Store(true)
+		log.Printf("[CIRCUIT] Session PnL %.1f%% <= -%.0f%% — торговля остановлена!", pnl, cfg.MaxSessionLoss)
+	}
 }
 
 func printStats() {

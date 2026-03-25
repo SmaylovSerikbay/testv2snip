@@ -105,6 +105,11 @@ type Config struct {
 	MinWhaleBuyLam uint64        // min whale buy size to follow (lamports)
 	MinVSRLam      uint64        // min virtual SOL reserve (lamports)
 	MintCD         time.Duration // skip re-buy same mint for this long after attempt/skip
+	// После убыточного закрытия — не входить в этот mint N сек (0 = выкл.)
+	MintLossCD time.Duration
+	// Трейлинг сессии: если реализованный PnL сессии когда-то был ≥ Min (%% от старта), при откате от пика на Giveback п.п. — стоп новых BUY (как CIRCUIT).
+	SessionTrailMinPeak  float64 // %% от баланса при старте, 0 = выкл.
+	SessionTrailGiveback float64 // п.п. ниже пика сессии
 	// BC retries when bonding curve account not yet readable (fresh mints)
 	BCRetryMax   int
 	BCRetrySleep time.Duration
@@ -113,6 +118,12 @@ type Config struct {
 	BadEntryPct float64
 	// BREAKEVEN: выход в ноль/минус только если пик HiPnl >= этого порога (доля, 0.30 = +30%)
 	BreakevenMinPeak float64
+	// Мин. пик HiPnl (доля), с которого включаются TRAIL и PEAK_PULLBACK (раньше было жёстко +4%%)
+	TrailMinPeak float64
+	// Откат от пика позиции в долях (0.05 = 5 п.п.) — фиксация при медленном скатывании с графика; 0 = выкл.
+	PeakPullbackPct float64
+	// TRAIL: взять прибыль если pnl < пик×множитель (0.65 = оставить ≥65%% от пика по уровню pnl)
+	TrailRelMult float64
 	// COPY_WALLETS — опционально: доп. адреса; пусто = только авто-скрейп (ничего искать вручную не нужно)
 	CopyWallets []string
 	// SCRAPE_AUTO_TARGETS=0 — только COPY_WALLETS; 1 (дефолт) — бот сам набирает цели по WS
@@ -210,8 +221,13 @@ var (
 	buying   = map[string]bool{}
 
 	// Cooldown: skip mints recently attempted (success or fail)
-	cdMu  sync.Mutex
-	cdMap = map[string]time.Time{} // mint → last attempt
+	cdMu      sync.Mutex
+	cdMap     = map[string]time.Time{} // mint → last attempt
+	lossCdMap = map[string]time.Time{} // mint → last убыточное закрытие (для MINT_LOSS_COOLDOWN)
+
+	// Макс. sessionPnlPct() с момента старта — для SESSION_TRAIL_*
+	sessionPeakPctMu sync.Mutex
+	sessionPeakPct   float64
 
 	// Buy lifecycle: separate context + waitgroup for in-flight buys
 	buyCtx    context.Context
@@ -453,6 +469,13 @@ func main() {
 		log.Printf("[INIT] Ставка %.4f SOL | TP +%.0f%% QUICKTP≤15s ≥+%.0f%% | EARLYSL выкл. | SL -%.0f%% | TimeKill %ds<%+.0f%%",
 			float64(cfg.BuyLamp)/1e9, cfg.TP*100, cfg.QuickTPPct*100, cfg.SL*100, cfg.TimeKillSec, cfg.TimeKillMin*100)
 	}
+	if cfg.PeakPullbackPct > 0 {
+		log.Printf("[INIT] PEAK_PULLBACK: при пике ≥+%.1f%% — SELL если откат от пика ≥%.1f п.п. (медленное скатывание); TRAIL множ.=%.0f%% от пика",
+			cfg.TrailMinPeak*100, cfg.PeakPullbackPct*100, cfg.TrailRelMult*100)
+	} else {
+		log.Printf("[INIT] PEAK_PULLBACK выкл.; TRAIL только относительный (пик≥+%.1f%%, текущий pnl < %.0f%% от пика)",
+			cfg.TrailMinPeak*100, cfg.TrailRelMult*100)
+	}
 	log.Printf("[INIT] BuySlip %dbps SellSlip %dbps | PrioBuy %.4f PrioSell %.4f SOL",
 		cfg.Slip, cfg.SellSlip, float64(cfg.PrioLamp)/1e9, float64(cfg.PrioLampSell)/1e9)
 	if cfg.MonitorFastYoungSec > 0 {
@@ -473,6 +496,18 @@ func main() {
 		cfg.MaxTokInfoLag.Milliseconds(), cfg.MaxSignalLag.Milliseconds())
 	log.Printf("[INIT] CopyFilters: whale>=%.2f SOL | minVSR>=%.1f SOL | mintCooldown=%v",
 		float64(cfg.MinWhaleBuyLam)/1e9, float64(cfg.MinVSRLam)/1e9, cfg.MintCD)
+	if cfg.MintLossCD > 0 {
+		log.Printf("[INIT] После убытка по mint — пауза повторного входа %v (MINT_LOSS_COOLDOWN_SEC; 0=выкл.)",
+			cfg.MintLossCD.Round(time.Second))
+	} else {
+		log.Printf("[INIT] MINT_LOSS_COOLDOWN выкл. — можно сразу снова покупать тот же mint после минуса")
+	}
+	if cfg.SessionTrailGiveback > 0 && cfg.SessionTrailMinPeak > 0 {
+		log.Printf("[INIT] Session trail: при пике сессии ≥+%.2f%% — стоп BUY если откат от пика ≥%.2f п.п.",
+			cfg.SessionTrailMinPeak, cfg.SessionTrailGiveback)
+	} else {
+		log.Printf("[INIT] Session trail выкл. (SESSION_TRAIL_MIN_PEAK_PCT / GIVEBACK_PCT)")
+	}
 	if cfg.ScrapeSameMintMin > 0 {
 		log.Printf("[INIT] Scrape: same-mint min=%d (эвристика N баёв в один mint; 0 в .env = только profit/крупный бай)", cfg.ScrapeSameMintMin)
 	} else {
@@ -568,42 +603,48 @@ func main() {
 
 func loadCfg() Config {
 	c := Config{
-		BuyLamp:             7_000_000, // 0.007 SOL
-		Slip:                2000,      // 20% buy slippage
-		SellSlip:            4000,      // 40% sell slippage
-		PrioLamp:            2_000_000, // 0.002 SOL buy priority
-		PrioLampSell:        1_500_000, // 0.0015 SOL sell priority
-		TP:                  0.40,
-		QuickTPPct:          0.22, // +22% за первые 15с — иначе ждём основной TP
-		EarlySLWindow:       5 * time.Second,
-		EarlySLPct:          0.08, // −8% в первые 5с — на pump часто шум; см. EARLYSL_* в .env
-		SL:                  0.25,
-		BreakevenMinPeak:    0.30,
-		ScrapeAutoTargets:   true,
-		TimeKillSec:         60,
-		TimeKillMin:         0.05,
-		MaxTargets:          50,
-		MaxPositions:        2,
-		ScrapeIvl:           3 * time.Minute,
-		MonitorMs:           1000,
-		MonitorFastYoungSec: 25,
-		FlashSLWindow:       4 * time.Second,
-		FlashSLPct:          0.12,       // −12% в первые 4с — до EARLYSL/SL
-		MinReserve:          15_000_000, // 0.015 SOL
-		MaxSessionLoss:      30.0,       // -30%
-		WalletCD:            5 * time.Second,
-		MaxTokInfoLag:       500 * time.Millisecond,
-		MaxSignalLag:        250 * time.Millisecond,
-		JitoHTTPURL:         "https://mainnet.block-engine.jito.wtf/api/v1/transactions",
-		JitoHTTPTimeout:     400 * time.Millisecond,
-		MinWhaleBuyLam:      200_000_000,    // 0.2 SOL
-		MinVSRLam:           20_000_000_000, // 20 SOL liquidity floor
-		MintCD:              90 * time.Second,
-		BCRetryMax:          12,
-		BCRetrySleep:        100 * time.Millisecond,
-		BCSigLagBuf:         100 * time.Millisecond,
-		BadEntryPct:         20,
-		ScrapeSameMintMin:   5, // вариант B: было жёстко 3
+		BuyLamp:              7_000_000, // 0.007 SOL
+		Slip:                 2000,      // 20% buy slippage
+		SellSlip:             4000,      // 40% sell slippage
+		PrioLamp:             2_000_000, // 0.002 SOL buy priority
+		PrioLampSell:         1_500_000, // 0.0015 SOL sell priority
+		TP:                   0.40,
+		QuickTPPct:           0.22, // +22% за первые 15с — иначе ждём основной TP
+		EarlySLWindow:        5 * time.Second,
+		EarlySLPct:           0.08, // −8% в первые 5с — на pump часто шум; см. EARLYSL_* в .env
+		SL:                   0.25,
+		BreakevenMinPeak:     0.30,
+		TrailMinPeak:         0.03, // +3%% пика — уже следим за откатом (не ждать только +4%%)
+		PeakPullbackPct:      0.05, // −5 п.п. от пика → SELL (анти «висел в плюсе и уехал в минус»)
+		TrailRelMult:         0.65,
+		ScrapeAutoTargets:    true,
+		TimeKillSec:          60,
+		TimeKillMin:          0.05,
+		MaxTargets:           50,
+		MaxPositions:         2,
+		ScrapeIvl:            3 * time.Minute,
+		MonitorMs:            1000,
+		MonitorFastYoungSec:  25,
+		FlashSLWindow:        4 * time.Second,
+		FlashSLPct:           0.12,       // −12% в первые 4с — до EARLYSL/SL
+		MinReserve:           15_000_000, // 0.015 SOL
+		MaxSessionLoss:       30.0,       // -30%
+		WalletCD:             5 * time.Second,
+		MaxTokInfoLag:        500 * time.Millisecond,
+		MaxSignalLag:         250 * time.Millisecond,
+		JitoHTTPURL:          "https://mainnet.block-engine.jito.wtf/api/v1/transactions",
+		JitoHTTPTimeout:      400 * time.Millisecond,
+		MinWhaleBuyLam:       200_000_000,    // 0.2 SOL
+		MinVSRLam:            20_000_000_000, // 20 SOL liquidity floor
+		MintCD:               90 * time.Second,
+		MintLossCD:           600 * time.Second, // 10 мин после минуса по mint — не повторять вход как с 6T7m
+		SessionTrailMinPeak:  0,                 // включи в .env: SESSION_TRAIL_MIN_PEAK_PCT / GIVEBACK
+		SessionTrailGiveback: 0,
+		BCRetryMax:           12,
+		BCRetrySleep:         100 * time.Millisecond,
+		BCSigLagBuf:          100 * time.Millisecond,
+		BadEntryPct:          20,
+		ScrapeSameMintMin:    5, // вариант B: было жёстко 3
 	}
 	// EXCLUSIVE HELIUS: никаких иных RPC/WSS (старые эндпойнты полностью отключены)
 	if v := os.Getenv("HELIUS_API_KEY"); v != "" {
@@ -656,6 +697,16 @@ func loadCfg() Config {
 	}
 	c.EarlySLPct = evF("EARLYSL_MIN_PCT", c.EarlySLPct*100) / 100
 	c.BreakevenMinPeak = evF("BREAKEVEN_MIN_PEAK_PCT", c.BreakevenMinPeak*100) / 100
+	c.TrailMinPeak = evF("TRAIL_MIN_PEAK_PCT", c.TrailMinPeak*100) / 100
+	if v := strings.TrimSpace(os.Getenv("PEAK_PULLBACK_PCT")); v == "0" {
+		c.PeakPullbackPct = 0
+	} else {
+		c.PeakPullbackPct = evF("PEAK_PULLBACK_PCT", c.PeakPullbackPct*100) / 100
+	}
+	c.TrailRelMult = evF("TRAIL_REL_MULT_PCT", c.TrailRelMult*100) / 100
+	if c.TrailRelMult <= 0 || c.TrailRelMult >= 0.999 {
+		c.TrailRelMult = 0.65
+	}
 	c.ScrapeAutoTargets = ev("SCRAPE_AUTO_TARGETS", "1") != "0"
 	if v := strings.TrimSpace(os.Getenv("COPY_WALLETS")); v != "" {
 		for _, part := range strings.Split(v, ",") {
@@ -697,6 +748,15 @@ func loadCfg() Config {
 	if s := evU("MINT_COOLDOWN_SEC", 0); s > 0 {
 		c.MintCD = time.Duration(s) * time.Second
 	}
+	if v := strings.TrimSpace(os.Getenv("MINT_LOSS_COOLDOWN_SEC")); v == "0" {
+		c.MintLossCD = 0
+	} else if v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n >= 0 {
+			c.MintLossCD = time.Duration(n) * time.Second
+		}
+	}
+	c.SessionTrailMinPeak = evF("SESSION_TRAIL_MIN_PEAK_PCT", c.SessionTrailMinPeak)
+	c.SessionTrailGiveback = evF("SESSION_TRAIL_GIVEBACK_PCT", c.SessionTrailGiveback)
 	if m := evU("SCRAPE_INTERVAL_MIN", 0); m > 0 {
 		c.ScrapeIvl = time.Duration(m) * time.Minute
 	}
@@ -1464,13 +1524,20 @@ func runExecutor(ctx context.Context) {
 	}
 }
 
-func mintOnCooldown(mint string) bool {
+// mintBuyCooldownWhy — пусто если BUY разрешён; иначе текст для лога.
+func mintBuyCooldownWhy(mint string) string {
 	cdMu.Lock()
 	defer cdMu.Unlock()
 	if t, ok := cdMap[mint]; ok && time.Since(t) < cfg.MintCD {
-		return true
+		return "mint cooldown"
 	}
-	return false
+	if cfg.MintLossCD > 0 {
+		if t, ok := lossCdMap[mint]; ok && time.Since(t) < cfg.MintLossCD {
+			left := cfg.MintLossCD - time.Since(t)
+			return fmt.Sprintf("mint cooldown after loss (%s left)", left.Round(time.Second))
+		}
+	}
+	return ""
 }
 
 func setMintCooldown(mint string) {
@@ -1500,8 +1567,8 @@ func doBuy(ctx context.Context, sig Signal) {
 		return
 	}
 
-	if mintOnCooldown(mint) {
-		log.Printf("[BUY] Skip: cooldown | %s", short(mint))
+	if why := mintBuyCooldownWhy(mint); why != "" {
+		log.Printf("[BUY] Skip: %s | %s", why, short(mint))
 		return
 	}
 
@@ -2007,9 +2074,11 @@ func checkAll(ctx context.Context) (hasProfit bool, needFastYoung bool) {
 			reason = fmt.Sprintf("SL %.0f%%", pnl*100)
 		case cfg.BreakevenMinPeak > 0 && s.p.HiPnl >= cfg.BreakevenMinPeak && pnl <= 0:
 			reason = fmt.Sprintf("BREAKEVEN peak+%.0f%%→%.0f%%", s.p.HiPnl*100, pnl*100)
-		case s.p.HiPnl >= 0.04 && pnl < s.p.HiPnl*0.65 && pnl > 0:
+		case cfg.PeakPullbackPct > 0 && s.p.HiPnl >= cfg.TrailMinPeak && (s.p.HiPnl-pnl) >= cfg.PeakPullbackPct:
+			reason = fmt.Sprintf("PEAKPB peak+%.1f%% now%+.1f%% (откат %.1fп.п.)", s.p.HiPnl*100, pnl*100, (s.p.HiPnl-pnl)*100)
+		case s.p.HiPnl >= cfg.TrailMinPeak && pnl < s.p.HiPnl*cfg.TrailRelMult && pnl > 0:
 			reason = fmt.Sprintf("TRAIL peak+%.0f%% now+%.0f%%", s.p.HiPnl*100, pnl*100)
-		case s.p.HiPnl >= 0.04 && pnl < s.p.HiPnl*0.65 && pnl <= 0:
+		case s.p.HiPnl >= cfg.TrailMinPeak && pnl < s.p.HiPnl*cfg.TrailRelMult && pnl <= 0:
 			reason = fmt.Sprintf("SL(trail) %.0f%%", pnl*100)
 		case age >= time.Duration(cfg.TimeKillSec)*time.Second && pnl < cfg.TimeKillMin && pnl > -cfg.SL:
 			reason = fmt.Sprintf("TIMEKILL %ds pnl=%+.1f%%(<%+.1f%%)", int(age.Seconds()), pnl*100, cfg.TimeKillMin*100)
@@ -2159,7 +2228,7 @@ func doSell(ctx context.Context, p *Position, reason string, cachedState *Bondin
 		log.Printf("[SELL][PAPER] %s | %s | PnL %+.1f%% | %.6f SOL",
 			reason, short(mintStr), pnl, float64(solNet)/1e9)
 		statSells.Add(1)
-		recordPnl(p.Spent, solNet)
+		recordPnl(p.Spent, solNet, mintStr)
 		return true
 	}
 
@@ -2229,7 +2298,7 @@ func doSell(ctx context.Context, p *Position, reason string, cachedState *Bondin
 				bal := getTokenBalance(ctx, ata)
 				if bal == 0 {
 					log.Printf("[SELL] TX не подтверждена, но токены проданы: %s", short(savedMint))
-					recordPnl(savedSpent, savedSolNet)
+					recordPnl(savedSpent, savedSolNet, savedMint)
 					return
 				}
 				addPos(savedPos.Mint, bal, savedPos.Spent, savedPos.Wallet, savedPos.TokProg)
@@ -2247,7 +2316,7 @@ func doSell(ctx context.Context, p *Position, reason string, cachedState *Bondin
 			st, err := rpcClient().GetSignatureStatuses(ctx, false, txSig)
 			rpcNote(err)
 			if err == nil && len(st.Value) > 0 && st.Value[0] != nil && st.Value[0].Err == nil {
-				recordPnl(savedSpent, savedSolNet)
+				recordPnl(savedSpent, savedSolNet, savedMint)
 			}
 		}()
 		return true
@@ -2478,7 +2547,8 @@ func sessionPnlPct() float64 {
 }
 
 // recordPnl учитывает оценку выхода: solNet (lamports) минус spent на входе.
-func recordPnl(spent uint64, solNet uint64) {
+// mintOpt — base58 mint; при убытке ставит loss-cooldown на этот mint (если включён).
+func recordPnl(spent uint64, solNet uint64, mintOpt string) {
 	if spent == 0 {
 		return
 	}
@@ -2495,6 +2565,29 @@ func recordPnl(spent uint64, solNet uint64) {
 	lam := statPnlLamports
 	ref := sessionRefLamports
 	statPnlMu.Unlock()
+
+	if mintOpt != "" && delta < 0 && cfg.MintLossCD > 0 {
+		cdMu.Lock()
+		lossCdMap[mintOpt] = time.Now()
+		cdMu.Unlock()
+		log.Printf("[PNL] %s — повторный BUY этого mint заблокирован на %v (закрытие в минус)",
+			short(mintOpt), cfg.MintLossCD.Round(time.Second))
+	}
+
+	sp := sessionPnlPct()
+	sessionPeakPctMu.Lock()
+	if sp > sessionPeakPct {
+		sessionPeakPct = sp
+	}
+	peak := sessionPeakPct
+	sessionPeakPctMu.Unlock()
+	if ref > 0 && cfg.SessionTrailGiveback > 0 && cfg.SessionTrailMinPeak > 0 && peak >= cfg.SessionTrailMinPeak {
+		if sp <= peak-cfg.SessionTrailGiveback && !circuitOpen.Load() {
+			circuitOpen.Store(true)
+			log.Printf("[CIRCUIT] Session trail: пик +%.2f%%, сейчас +%.2f%% (откат ≥%.2f п.п.) — новые BUY остановлены",
+				peak, sp, cfg.SessionTrailGiveback)
+		}
+	}
 
 	if ref == 0 || cfg.MaxSessionLoss <= 0 {
 		return

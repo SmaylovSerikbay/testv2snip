@@ -92,6 +92,7 @@ type Config struct {
 	MaxSessionLoss float64 // stop trading if session PnL <= -X%
 	WalletCD       time.Duration
 	MaxTokInfoLag  time.Duration // if token info fetch exceeds this, skip buy
+	MaxSignalLag   time.Duration // if total lag from signal to send exceeds this, skip buy
 }
 
 type Signal struct {
@@ -110,6 +111,7 @@ type Position struct {
 	LastSellTry time.Time
 	SellFails   int
 	BadEntry    bool
+	Confirmed   bool
 }
 
 type BondingCurve struct {
@@ -318,6 +320,14 @@ func isSlippageErr(err error) bool {
 	return strings.Contains(s, "0xbc4") || strings.Contains(s, "slippage")
 }
 
+func isBuyCustomErr6042(err error) bool {
+	if err == nil {
+		return false
+	}
+	// seen as: InstructionError ... Custom:6042
+	return strings.Contains(err.Error(), "Custom:6042") || strings.Contains(err.Error(), "custom:6042")
+}
+
 type scrapeEv struct {
 	ev       *TradeEvent
 	recvTime time.Time
@@ -473,6 +483,7 @@ func loadCfg() Config {
 		MaxSessionLoss: 30.0,        // -30%
 		WalletCD:       5 * time.Second,
 		MaxTokInfoLag:  500 * time.Millisecond,
+		MaxSignalLag:   350 * time.Millisecond,
 		JitoHTTPURL:    "https://mainnet.block-engine.jito.wtf/api/v1/transactions",
 	}
 	// EXCLUSIVE HELIUS: никаких иных RPC/WSS (старые эндпойнты полностью отключены)
@@ -522,6 +533,9 @@ func loadCfg() Config {
 	}
 	if ms := evU("MAX_TOKENINFO_LAG_MS", 0); ms > 0 {
 		c.MaxTokInfoLag = time.Duration(ms) * time.Millisecond
+	}
+	if ms := evU("MAX_SIGNAL_LAG_MS", 0); ms > 0 {
+		c.MaxSignalLag = time.Duration(ms) * time.Millisecond
 	}
 	if m := evU("SCRAPE_INTERVAL_MIN", 0); m > 0 {
 		c.ScrapeIvl = time.Duration(m) * time.Minute
@@ -1360,6 +1374,10 @@ func doBuy(ctx context.Context, sig Signal) {
 		log.Printf("[BUY] Skip: tokeninfo lag %dms > %dms | %s", tokInfoMs, cfg.MaxTokInfoLag.Milliseconds(), short(mint))
 		return
 	}
+	if cfg.MaxSignalLag > 0 && time.Since(signalT) > cfg.MaxSignalLag {
+		log.Printf("[BUY] Skip: signal lag %dms > %dms | %s", time.Since(signalT).Milliseconds(), cfg.MaxSignalLag.Milliseconds(), short(mint))
+		return
+	}
 
 	if preBalOK && preBal < cfg.BuyLamp+cfg.MinReserve {
 		log.Printf("[BUY] Skip: balance reserve (%.4f SOL < %.4f needed) | %s",
@@ -1414,8 +1432,6 @@ func doBuy(ctx context.Context, sig Signal) {
 	if tokOut == 0 {
 		return
 	}
-	minTokOut := tokOut * (10000 - cfg.Slip) / 10000
-
 	user := cfg.Key.PublicKey()
 	assocBC := findATA(bc, sig.Mint, tokProg)
 	assocUser := findATA(user, sig.Mint, tokProg)
@@ -1429,57 +1445,65 @@ func doBuy(ctx context.Context, sig Signal) {
 	bcV2, _, _ := solana.FindProgramAddress(
 		[][]byte{[]byte("bonding-curve-v2"), sig.Mint.Bytes()}, PumpProgram)
 
-	// buy_exact_sol_in: (sol_amount u64, min_tokens_out u64)
-	data := make([]byte, 24)
-	copy(data[:8], buyDisc[:])
-	binary.LittleEndian.PutUint64(data[8:], cfg.BuyLamp)
-	binary.LittleEndian.PutUint64(data[16:], minTokOut)
+	buildBuyData := func(minTok uint64) []byte {
+		// buy_exact_sol_in: (sol_amount u64, min_tokens_out u64)
+		data := make([]byte, 24)
+		copy(data[:8], buyDisc[:])
+		binary.LittleEndian.PutUint64(data[8:], cfg.BuyLamp)
+		binary.LittleEndian.PutUint64(data[16:], minTok)
+		return data
+	}
 
 	cuLimit := uint32(250_000)
-	ixs := []solana.Instruction{cuLimitIx(cuLimit)}
+	ixsBase := []solana.Instruction{cuLimitIx(cuLimit)}
 	if tip := jitoTipIx(user); tip != nil {
-		ixs = append(ixs, tip)
+		ixsBase = append(ixsBase, tip)
 	}
-	ixs = append(ixs,
-		cuPriceIx(cfg.PrioLamp*1_000_000/uint64(cuLimit)),
-		ataIx(user, user, sig.Mint, tokProg),
-		&genericIx{pid: PumpProgram, dat: data, accs: []*solana.AccountMeta{
-			{PublicKey: PumpGlobal},                             // 0
-			{PublicKey: PumpFee, IsWritable: true},              // 1
-			{PublicKey: sig.Mint},                               // 2
-			{PublicKey: bc, IsWritable: true},                   // 3
-			{PublicKey: assocBC, IsWritable: true},              // 4
-			{PublicKey: assocUser, IsWritable: true},            // 5
-			{PublicKey: user, IsSigner: true, IsWritable: true}, // 6
-			{PublicKey: solana.SystemProgramID},                 // 7
-			{PublicKey: tokProg},                                // 8
-			{PublicKey: creatorVault, IsWritable: true},         // 9
-			{PublicKey: PumpEventAuth},                          // 10
-			{PublicKey: PumpProgram},                            // 11
-			{PublicKey: globalVolAcc},                           // 12
-			{PublicKey: userVolAcc, IsWritable: true},           // 13
-			{PublicKey: FeeConfig},                              // 14
-			{PublicKey: FeeProgram},                             // 15
-			{PublicKey: bcV2},                                   // 16 bonding_curve_v2
-		}},
-	)
+	buildIxs := func(data []byte) []solana.Instruction {
+		ixs := append([]solana.Instruction{}, ixsBase...)
+		ixs = append(ixs,
+			cuPriceIx(cfg.PrioLamp*1_000_000/uint64(cuLimit)),
+			ataIx(user, user, sig.Mint, tokProg),
+			&genericIx{pid: PumpProgram, dat: data, accs: []*solana.AccountMeta{
+				{PublicKey: PumpGlobal},                             // 0
+				{PublicKey: PumpFee, IsWritable: true},              // 1
+				{PublicKey: sig.Mint},                               // 2
+				{PublicKey: bc, IsWritable: true},                   // 3
+				{PublicKey: assocBC, IsWritable: true},              // 4
+				{PublicKey: assocUser, IsWritable: true},            // 5
+				{PublicKey: user, IsSigner: true, IsWritable: true}, // 6
+				{PublicKey: solana.SystemProgramID},                 // 7
+				{PublicKey: tokProg},                                // 8
+				{PublicKey: creatorVault, IsWritable: true},         // 9
+				{PublicKey: PumpEventAuth},                          // 10
+				{PublicKey: PumpProgram},                            // 11
+				{PublicKey: globalVolAcc},                           // 12
+				{PublicKey: userVolAcc, IsWritable: true},           // 13
+				{PublicKey: FeeConfig},                              // 14
+				{PublicKey: FeeProgram},                             // 15
+				{PublicKey: bcV2},                                   // 16 bonding_curve_v2
+			}},
+		)
+		return ixs
+	}
 
-	bh := cachedBH(ctx)
-	tx, err := solana.NewTransaction(ixs, bh, solana.TransactionPayer(user))
-	if err != nil {
-		log.Printf("[BUY] Build: %v", err)
-		return
-	}
-	_, err = tx.Sign(func(key solana.PublicKey) *solana.PrivateKey {
-		if key == user {
-			k := cfg.Key
-			return &k
+	signTx := func(ixs []solana.Instruction) (*solana.Transaction, error) {
+		bh := cachedBH(ctx)
+		tx, err := solana.NewTransaction(ixs, bh, solana.TransactionPayer(user))
+		if err != nil {
+			return nil, err
 		}
-		return nil
-	})
-	if err != nil {
-		log.Printf("[BUY] Sign: %v", err)
-		return
+		_, err = tx.Sign(func(key solana.PublicKey) *solana.PrivateKey {
+			if key == user {
+				k := cfg.Key
+				return &k
+			}
+			return nil
+		})
+		if err != nil {
+			return nil, err
+		}
+		return tx, nil
 	}
 
 	if !cfg.Live {
@@ -1496,7 +1520,35 @@ func doBuy(ctx context.Context, sig Signal) {
 		return
 	}
 
-	txSig, err := sendTx(ctx, tx)
+	// final lag shield right before sending (covers build/sign/send time too)
+	if cfg.MaxSignalLag > 0 && time.Since(signalT) > cfg.MaxSignalLag {
+		log.Printf("[BUY] Skip: signal lag %dms > %dms (pre-send) | %s", time.Since(signalT).Milliseconds(), cfg.MaxSignalLag.Milliseconds(), short(mint))
+		return
+	}
+
+	// Buy retry on fast-moving curve: if program rejects (e.g. Custom:6042), retry with looser minTokOut.
+	trySlips := []uint64{cfg.Slip, 2000, 3000}
+	var (
+		txSig solana.Signature
+		err   error
+	)
+	for attempt, slip := range trySlips {
+		if slip > 9900 {
+			slip = 9900
+		}
+		minTok := tokOut * (10000 - slip) / 10000
+		tx, buildErr := signTx(buildIxs(buildBuyData(minTok)))
+		if buildErr != nil {
+			log.Printf("[BUY] Build/Sign: %v", buildErr)
+			return
+		}
+		txSig, err = sendTx(ctx, tx)
+		if err != nil && (isBuyCustomErr6042(err) || isSlippageErr(err)) && attempt < len(trySlips)-1 {
+			log.Printf("[BUY] retry %d/%d | %s | slip=%dbps | err=%v", attempt+1, len(trySlips), short(mint), slip, err)
+			continue
+		}
+		break
+	}
 	if err != nil {
 		errMsg := fmt.Sprintf("%v", err)
 		if len(errMsg) > 200 {
@@ -1524,6 +1576,7 @@ func doBuy(ctx context.Context, sig Signal) {
 			if p, ok := pos[mint]; ok {
 				old := p.Tokens
 				p.Tokens = real
+				p.Confirmed = true
 				if old != real {
 					diff := float64(real)/float64(old)*100 - 100
 					log.Printf("[BUY] Баланс скорр.: %s | %d → %d tok (%.0f%%)",
@@ -1541,7 +1594,7 @@ func doBuy(ctx context.Context, sig Signal) {
 
 func addPos(mint solana.PublicKey, tok, spent uint64, wallet string, tokProg solana.PublicKey) {
 	posMu.Lock()
-	pos[mint.String()] = &Position{Mint: mint, Tokens: tok, Spent: spent, Entry: time.Now(), Wallet: wallet, TokProg: tokProg}
+	pos[mint.String()] = &Position{Mint: mint, Tokens: tok, Spent: spent, Entry: time.Now(), Wallet: wallet, TokProg: tokProg, Confirmed: !cfg.Live}
 	posMu.Unlock()
 	notifyWSReconn() // добавим accountSubscribe на bonding curve без реконнекта
 }
@@ -1654,6 +1707,11 @@ func checkAll(ctx context.Context) bool {
 
 	var jobs []sellJob
 	for _, s := range snaps {
+		// Не пытаемся продавать до подтверждения BUY и получения реального баланса ATA.
+		// Иначе возможна гонка: SELL до BUY-confirm => "минус в SOL без видимого токена".
+		if cfg.Live && (s.p == nil || !s.p.Confirmed) {
+			continue
+		}
 		state, bc, ok := cachedBCState(s.p.Mint)
 		if !ok {
 			var err error

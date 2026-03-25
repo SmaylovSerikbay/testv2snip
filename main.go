@@ -634,12 +634,14 @@ func runWSListener(ctx context.Context) {
 			return
 		}
 		if err := wsLoop(ctx); err != nil {
-			log.Printf("[WS] Ошибка: %v", err)
+			if !strings.Contains(err.Error(), "use of closed") {
+				log.Printf("[WS] Ошибка: %v", err)
+			}
 		}
 		select {
 		case <-ctx.Done():
 			return
-		case <-time.After(2 * time.Second):
+		case <-time.After(500 * time.Millisecond):
 		}
 	}
 }
@@ -651,38 +653,56 @@ func wsLoop(ctx context.Context) error {
 	}
 	defer conn.Close()
 
-	conn.SetReadDeadline(time.Now().Add(90 * time.Second))
+	conn.SetReadDeadline(time.Now().Add(120 * time.Second))
 	conn.SetPongHandler(func(string) error {
-		conn.SetReadDeadline(time.Now().Add(90 * time.Second))
+		conn.SetReadDeadline(time.Now().Add(120 * time.Second))
 		return nil
 	})
 
+	var mu sync.Mutex
 	subToWallet := map[int]string{}
 	reqToWallet := map[int]string{}
+	subbed := map[string]bool{}
+	nextID := 0
 	var writeMu sync.Mutex
 
-	tgtMu.RLock()
-	id := 0
-	for addr := range targets {
-		id++
-		reqToWallet[id] = addr
-		_ = conn.WriteJSON(map[string]any{
-			"jsonrpc": "2.0", "id": id,
-			"method": "logsSubscribe",
-			"params": []any{
-				map[string]any{"mentions": []string{addr}},
-				map[string]any{"commitment": "confirmed"},
-			},
-		})
+	addNewSubs := func() int {
+		tgtMu.RLock()
+		defer tgtMu.RUnlock()
+		added := 0
+		for addr := range targets {
+			if subbed[addr] {
+				continue
+			}
+			nextID++
+			reqToWallet[nextID] = addr
+			subbed[addr] = true
+			added++
+			writeMu.Lock()
+			_ = conn.WriteJSON(map[string]any{
+				"jsonrpc": "2.0", "id": nextID,
+				"method": "logsSubscribe",
+				"params": []any{
+					map[string]any{"mentions": []string{addr}},
+					map[string]any{"commitment": "confirmed"},
+				},
+			})
+			writeMu.Unlock()
+		}
+		return added
 	}
-	count := len(targets)
-	tgtMu.RUnlock()
+
+	mu.Lock()
+	addNewSubs()
+	count := len(subbed)
+	mu.Unlock()
 	log.Printf("[WS] Подключён, подписки: %d", count)
 
-	// Ping + reconnect trigger
 	go func() {
-		ping := time.NewTicker(30 * time.Second)
+		ping := time.NewTicker(15 * time.Second)
+		fullReconn := time.NewTicker(5 * time.Minute)
 		defer ping.Stop()
+		defer fullReconn.Stop()
 		for {
 			select {
 			case <-ctx.Done():
@@ -693,7 +713,14 @@ func wsLoop(ctx context.Context) error {
 				_ = conn.WriteControl(websocket.PingMessage, nil, time.Now().Add(5*time.Second))
 				writeMu.Unlock()
 			case <-wsReconnCh:
-				log.Println("[WS] Targets изменились — реконнект")
+				mu.Lock()
+				added := addNewSubs()
+				mu.Unlock()
+				if added > 0 {
+					log.Printf("[WS] +%d подписок (без реконнекта), всего %d", added, len(subbed))
+				}
+			case <-fullReconn.C:
+				log.Println("[WS] Плановый реконнект (5мин)")
 				conn.Close()
 				return
 			}
@@ -710,27 +737,36 @@ func wsLoop(ctx context.Context) error {
 			continue
 		}
 
-		// Subscription confirmation
 		if m.ID != nil && m.Result != nil {
 			var subID int
 			if json.Unmarshal(m.Result, &subID) == nil && subID > 0 {
+				mu.Lock()
 				if w, ok := reqToWallet[*m.ID]; ok {
 					subToWallet[subID] = w
 				}
+				mu.Unlock()
 			}
 			continue
 		}
 
-		// Log notification
 		if m.Method != "logsNotification" || m.Params == nil {
 			continue
 		}
+
+		mu.Lock()
 		wallet := subToWallet[m.Params.Sub]
+		mu.Unlock()
 		if wallet == "" {
 			continue
 		}
 
-		// Update lastSeen
+		tgtMu.RLock()
+		_, active := targets[wallet]
+		tgtMu.RUnlock()
+		if !active {
+			continue
+		}
+
 		tgtMu.Lock()
 		targets[wallet] = time.Now()
 		tgtMu.Unlock()
@@ -746,7 +782,6 @@ func wsLoop(ctx context.Context) error {
 			continue
 		}
 
-		// HOT PATH — парсим inline, не блокируя reader
 		go parseBuySignal(wallet, lr.Value.Logs)
 	}
 }
@@ -1193,6 +1228,8 @@ func checkAll(ctx context.Context) bool {
 			reason = fmt.Sprintf("QUICKTP %ds +%.0f%%", int(age.Seconds()), pnl*100)
 		case pnl <= -cfg.SL:
 			reason = fmt.Sprintf("SL %.0f%%", pnl*100)
+		case s.p.HiPnl >= 0.05 && pnl <= 0:
+			reason = fmt.Sprintf("BREAKEVEN peak+%.0f%%→%.0f%%", s.p.HiPnl*100, pnl*100)
 		case s.p.HiPnl >= 0.04 && pnl < s.p.HiPnl*0.65 && pnl > 0:
 			reason = fmt.Sprintf("TRAIL peak+%.0f%% now+%.0f%%", s.p.HiPnl*100, pnl*100)
 		case s.p.HiPnl >= 0.04 && pnl < s.p.HiPnl*0.65 && pnl <= 0:
@@ -1278,7 +1315,14 @@ func doSell(ctx context.Context, p *Position, reason string, cachedState *Bondin
 	assocBC := findATA(bc, p.Mint, tokProg)
 	assocUser := findATA(user, p.Mint, tokProg)
 
+	assocUserForBal := findATA(user, p.Mint, tokProg)
+	realBal := getTokenBalance(ctx, assocUserForBal)
 	sellAmt := p.Tokens
+	if realBal > 0 {
+		sellAmt = realBal
+	} else if realBal == 0 && time.Since(p.Entry) < 8*time.Second {
+		return false
+	}
 	if sellAmt == 0 {
 		return false
 	}

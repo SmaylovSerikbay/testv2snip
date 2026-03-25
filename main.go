@@ -1151,7 +1151,7 @@ func checkAll(ctx context.Context) bool {
 			reason = fmt.Sprintf("SL(trail) %.0f%%", pnl*100)
 		case age >= time.Duration(cfg.TimeKillSec)*time.Second && pnl < cfg.TimeKillMin && pnl > -cfg.SL:
 			reason = fmt.Sprintf("TIMEKILL %ds pnl=%+.1f%%", int(age.Seconds()), pnl*100)
-		case age >= 60*time.Second && pnl < 0.05:
+		case age >= 60*time.Second && pnl < 0 && pnl > -cfg.SL:
 			reason = fmt.Sprintf("HARDKILL %ds pnl=%+.1f%%", int(age.Seconds()), pnl*100)
 		}
 		if reason == "" {

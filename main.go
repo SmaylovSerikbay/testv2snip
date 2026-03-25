@@ -82,6 +82,8 @@ type Config struct {
 	JitoHTTPTimeout time.Duration
 	TP             float64
 	QuickTPPct     float64 // ранний выход QUICKTP: в первые 15с при pnl >= этого порога (доля, напр. 0.22 = +22%)
+	EarlySLWindow  time.Duration // 0 = выкл.; иначе в первые N сек выход если pnl <= -EarlySLPct (анти-просадка)
+	EarlySLPct     float64       // доля, напр. 0.15 = −15%
 	SL             float64
 	TimeKillSec    int
 	TimeKillMin    float64
@@ -428,8 +430,13 @@ func main() {
 	} else {
 		log.Printf("[INIT] Ключ не задан — режим наблюдения | %s", mode)
 	}
-	log.Printf("[INIT] Ставка %.4f SOL | TP +%.0f%% QUICKTP≤15s ≥+%.0f%% | SL -%.0f%% | TimeKill %ds<%+.0f%%",
-		float64(cfg.BuyLamp)/1e9, cfg.TP*100, cfg.QuickTPPct*100, cfg.SL*100, cfg.TimeKillSec, cfg.TimeKillMin*100)
+	if cfg.EarlySLWindow > 0 {
+		log.Printf("[INIT] Ставка %.4f SOL | TP +%.0f%% QUICKTP≤15s ≥+%.0f%% | EARLYSL первые %ds ≤-%.0f%% | SL -%.0f%% | TimeKill %ds<%+.0f%%",
+			float64(cfg.BuyLamp)/1e9, cfg.TP*100, cfg.QuickTPPct*100, int(cfg.EarlySLWindow.Seconds()), cfg.EarlySLPct*100, cfg.SL*100, cfg.TimeKillSec, cfg.TimeKillMin*100)
+	} else {
+		log.Printf("[INIT] Ставка %.4f SOL | TP +%.0f%% QUICKTP≤15s ≥+%.0f%% | EARLYSL выкл. | SL -%.0f%% | TimeKill %ds<%+.0f%%",
+			float64(cfg.BuyLamp)/1e9, cfg.TP*100, cfg.QuickTPPct*100, cfg.SL*100, cfg.TimeKillSec, cfg.TimeKillMin*100)
+	}
 	log.Printf("[INIT] BuySlip %dbps SellSlip %dbps | PrioBuy %.4f PrioSell %.4f SOL",
 		cfg.Slip, cfg.SellSlip, float64(cfg.PrioLamp)/1e9, float64(cfg.PrioLampSell)/1e9)
 	log.Printf("[INIT] MaxTargets %d | MaxPos %d | Scrape %v | Monitor %dms",
@@ -519,6 +526,8 @@ func loadCfg() Config {
 		PrioLampSell:   1_500_000,   // 0.0015 SOL sell priority
 		TP:             0.40,
 		QuickTPPct:     0.22, // +22% за первые 15с — иначе ждём основной TP
+		EarlySLWindow:  5 * time.Second,
+		EarlySLPct:     0.08, // −8% в первые 5с — на pump часто шум; см. EARLYSL_* в .env
 		SL:             0.20,
 		TimeKillSec:    60,
 		TimeKillMin:    0.05,
@@ -583,6 +592,14 @@ func loadCfg() Config {
 	c.TP = evF("TAKE_PROFIT_PCT", c.TP*100) / 100
 	c.QuickTPPct = evF("QUICKTP_MIN_PCT", c.QuickTPPct*100) / 100
 	c.SL = evF("STOP_LOSS_PCT", c.SL*100) / 100
+	if v := os.Getenv("EARLYSL_SEC"); v != "" {
+		if v == "0" {
+			c.EarlySLWindow = 0
+		} else if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			c.EarlySLWindow = time.Duration(n) * time.Second
+		}
+	}
+	c.EarlySLPct = evF("EARLYSL_MIN_PCT", c.EarlySLPct*100) / 100
 	c.TimeKillSec = int(evU("TIMEKILL_SEC", uint64(c.TimeKillSec)))
 	c.TimeKillMin = evF("TIMEKILL_MIN_PCT", c.TimeKillMin*100) / 100
 	c.MaxTargets = int(evU("MAX_TARGETS", uint64(c.MaxTargets)))
@@ -1870,7 +1887,7 @@ func checkAll(ctx context.Context) bool {
 		switch {
 		case pnl >= cfg.TP:
 			reason = fmt.Sprintf("TP +%.0f%%", pnl*100)
-		case age <= 5*time.Second && pnl <= -0.08:
+		case cfg.EarlySLWindow > 0 && age <= cfg.EarlySLWindow && pnl <= -cfg.EarlySLPct:
 			reason = fmt.Sprintf("EARLYSL %ds pnl=%+.1f%%", int(age.Seconds()), pnl*100)
 		case age <= 15*time.Second && pnl >= cfg.QuickTPPct:
 			reason = fmt.Sprintf("QUICKTP %ds +%.0f%%", int(age.Seconds()), pnl*100)

@@ -67,45 +67,51 @@ func init() {
 // ═══════════════════════════════════════════════════════════════════════════════
 
 type Config struct {
-	Key            solana.PrivateKey
-	RPC            string
-	WSS            string
-	BuyLamp        uint64
-	Slip           uint64  // buy slippage bps
-	SellSlip       uint64  // sell slippage bps
-	PrioLamp       uint64  // priority fee for BUY (lamports)
-	PrioLampSell   uint64  // priority fee for SELL (lamports)
-	JitoTipLamp    uint64  // optional: lamports tip via SystemProgram transfer
-	JitoTipAcc     solana.PublicKey
-	JitoHTTP       bool
-	JitoHTTPURL    string
+	Key             solana.PrivateKey
+	RPC             string
+	WSS             string
+	BuyLamp         uint64
+	Slip            uint64 // buy slippage bps
+	SellSlip        uint64 // sell slippage bps
+	PrioLamp        uint64 // priority fee for BUY (lamports)
+	PrioLampSell    uint64 // priority fee for SELL (lamports)
+	JitoTipLamp     uint64 // optional: lamports tip via SystemProgram transfer
+	JitoTipAcc      solana.PublicKey
+	JitoHTTP        bool
+	JitoHTTPURL     string
 	JitoHTTPTimeout time.Duration
-	TP             float64
-	QuickTPPct     float64 // ранний выход QUICKTP: в первые 15с при pnl >= этого порога (доля, напр. 0.22 = +22%)
-	EarlySLWindow  time.Duration // 0 = выкл.; иначе в первые N сек выход если pnl <= -EarlySLPct (анти-просадка)
-	EarlySLPct     float64       // доля, напр. 0.15 = −15%
-	SL             float64
-	TimeKillSec    int
-	TimeKillMin    float64
-	MaxTargets     int
-	MaxPositions   int
-	ScrapeIvl      time.Duration
-	MonitorMs      int
-	Live           bool
-	MinReserve     uint64  // min SOL balance to keep (lamports)
-	MaxSessionLoss float64 // stop trading if session PnL <= -X%
-	WalletCD       time.Duration
-	MaxTokInfoLag  time.Duration // if token info fetch exceeds this, skip buy
-	MaxSignalLag   time.Duration // if total lag from signal to send exceeds this, skip buy
-	MinWhaleBuyLam uint64        // min whale buy size to follow (lamports)
-	MinVSRLam      uint64        // min virtual SOL reserve (lamports)
-	MintCD         time.Duration // skip re-buy same mint for this long after attempt/skip
+	TP              float64
+	QuickTPPct      float64       // ранний выход QUICKTP: в первые 15с при pnl >= этого порога (доля, напр. 0.22 = +22%)
+	EarlySLWindow   time.Duration // 0 = выкл.; иначе в первые N сек выход если pnl <= -EarlySLPct (анти-просадка)
+	EarlySLPct      float64       // доля, напр. 0.15 = −15%
+	SL              float64
+	TimeKillSec     int
+	TimeKillMin     float64
+	MaxTargets      int
+	MaxPositions    int
+	ScrapeIvl       time.Duration
+	MonitorMs       int
+	Live            bool
+	MinReserve      uint64  // min SOL balance to keep (lamports)
+	MaxSessionLoss  float64 // stop trading if session PnL <= -X%
+	WalletCD        time.Duration
+	MaxTokInfoLag   time.Duration // if token info fetch exceeds this, skip buy
+	MaxSignalLag    time.Duration // if total lag from signal to send exceeds this, skip buy
+	MinWhaleBuyLam  uint64        // min whale buy size to follow (lamports)
+	MinVSRLam       uint64        // min virtual SOL reserve (lamports)
+	MintCD          time.Duration // skip re-buy same mint for this long after attempt/skip
 	// BC retries when bonding curve account not yet readable (fresh mints)
 	BCRetryMax   int
 	BCRetrySleep time.Duration
 	BCSigLagBuf  time.Duration // stop retries when signal lag exceeds MaxSignalLag minus this
 	// After BUY confirm: if token balance vs expected is worse than -this %, mark BadEntry
 	BadEntryPct float64
+	// BREAKEVEN: выход в ноль/минус только если пик HiPnl >= этого порога (доля, 0.30 = +30%)
+	BreakevenMinPeak float64
+	// COPY_WALLETS из .env — фиксированные цели (smart money), всегда в targets
+	CopyWallets []string
+	// SCRAPE_AUTO_TARGETS=0 — не добавлять цели из WS-эвристики, только COPY_WALLETS (+уже существующие)
+	ScrapeAutoTargets bool
 }
 
 type Signal struct {
@@ -197,7 +203,7 @@ var (
 	buying   = map[string]bool{}
 
 	// Cooldown: skip mints recently attempted (success or fail)
-	cdMu       sync.Mutex
+	cdMu  sync.Mutex
 	cdMap = map[string]time.Time{} // mint → last attempt
 
 	// Buy lifecycle: separate context + waitgroup for in-flight buys
@@ -235,7 +241,7 @@ var (
 	wsRestartCh = make(chan struct{}, 1)
 
 	// Scraper WS-only pipeline
-	scrapeEvCh  = make(chan scrapeEv, 4096)
+	scrapeEvCh = make(chan scrapeEv, 4096)
 )
 
 func rpcWait() { <-rpcBucket }
@@ -452,6 +458,20 @@ func main() {
 		float64(cfg.MinWhaleBuyLam)/1e9, float64(cfg.MinVSRLam)/1e9, cfg.MintCD)
 	log.Printf("[INIT] BC retries: max=%d sleep=%v lagBuf=%v | badEntry if скорр. < -%.0f%%",
 		cfg.BCRetryMax, cfg.BCRetrySleep, cfg.BCSigLagBuf, cfg.BadEntryPct)
+	if cfg.BreakevenMinPeak > 0 {
+		log.Printf("[INIT] BREAKEVEN только после пика ≥+%.0f%% (иначе ветка отключена)", cfg.BreakevenMinPeak*100)
+	} else {
+		log.Printf("[INIT] BREAKEVEN выкл. (BREAKEVEN_MIN_PEAK_PCT=0)")
+	}
+	if len(cfg.CopyWallets) > 0 {
+		log.Printf("[INIT] COPY_WALLETS: %d фикс. целей | SCRAPE_AUTO_TARGETS=%v",
+			len(cfg.CopyWallets), cfg.ScrapeAutoTargets)
+	} else {
+		log.Printf("[INIT] COPY_WALLETS не заданы | SCRAPE_AUTO_TARGETS=%v", cfg.ScrapeAutoTargets)
+	}
+	if !cfg.ScrapeAutoTargets && len(cfg.CopyWallets) == 0 {
+		log.Printf("[INIT] ⚠ SCRAPE_AUTO_TARGETS=0 и пустой COPY_WALLETS — новые цели не добавятся")
+	}
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -523,36 +543,38 @@ func main() {
 
 func loadCfg() Config {
 	c := Config{
-		BuyLamp:        7_000_000,   // 0.007 SOL
-		Slip:           2000,        // 20% buy slippage
-		SellSlip:       4000,        // 40% sell slippage
-		PrioLamp:       2_000_000,   // 0.002 SOL buy priority
-		PrioLampSell:   1_500_000,   // 0.0015 SOL sell priority
-		TP:             0.40,
-		QuickTPPct:     0.22, // +22% за первые 15с — иначе ждём основной TP
-		EarlySLWindow:  5 * time.Second,
-		EarlySLPct:     0.08, // −8% в первые 5с — на pump часто шум; см. EARLYSL_* в .env
-		SL:             0.20,
-		TimeKillSec:    60,
-		TimeKillMin:    0.05,
-		MaxTargets:     50,
-		MaxPositions:   2,
-		ScrapeIvl:      3 * time.Minute,
-		MonitorMs:      1000,
-		MinReserve:     15_000_000,  // 0.015 SOL
-		MaxSessionLoss: 30.0,        // -30%
-		WalletCD:       5 * time.Second,
-		MaxTokInfoLag:  500 * time.Millisecond,
-		MaxSignalLag:   250 * time.Millisecond,
-		JitoHTTPURL:    "https://mainnet.block-engine.jito.wtf/api/v1/transactions",
-		JitoHTTPTimeout: 400 * time.Millisecond,
-		MinWhaleBuyLam: 200_000_000,    // 0.2 SOL
-		MinVSRLam:      20_000_000_000, // 20 SOL liquidity floor
-		MintCD:         90 * time.Second,
-		BCRetryMax:     12,
-		BCRetrySleep:   100 * time.Millisecond,
-		BCSigLagBuf:    100 * time.Millisecond,
-		BadEntryPct:    20,
+		BuyLamp:           7_000_000, // 0.007 SOL
+		Slip:              2000,      // 20% buy slippage
+		SellSlip:          4000,      // 40% sell slippage
+		PrioLamp:          2_000_000, // 0.002 SOL buy priority
+		PrioLampSell:      1_500_000, // 0.0015 SOL sell priority
+		TP:                0.40,
+		QuickTPPct:        0.22, // +22% за первые 15с — иначе ждём основной TP
+		EarlySLWindow:     5 * time.Second,
+		EarlySLPct:        0.08, // −8% в первые 5с — на pump часто шум; см. EARLYSL_* в .env
+		SL:                0.25,
+		BreakevenMinPeak:  0.30,
+		ScrapeAutoTargets: true,
+		TimeKillSec:       60,
+		TimeKillMin:       0.05,
+		MaxTargets:        50,
+		MaxPositions:      2,
+		ScrapeIvl:         3 * time.Minute,
+		MonitorMs:         1000,
+		MinReserve:        15_000_000, // 0.015 SOL
+		MaxSessionLoss:    30.0,       // -30%
+		WalletCD:          5 * time.Second,
+		MaxTokInfoLag:     500 * time.Millisecond,
+		MaxSignalLag:      250 * time.Millisecond,
+		JitoHTTPURL:       "https://mainnet.block-engine.jito.wtf/api/v1/transactions",
+		JitoHTTPTimeout:   400 * time.Millisecond,
+		MinWhaleBuyLam:    200_000_000,    // 0.2 SOL
+		MinVSRLam:         20_000_000_000, // 20 SOL liquidity floor
+		MintCD:            90 * time.Second,
+		BCRetryMax:        12,
+		BCRetrySleep:      100 * time.Millisecond,
+		BCSigLagBuf:       100 * time.Millisecond,
+		BadEntryPct:       20,
 	}
 	// EXCLUSIVE HELIUS: никаких иных RPC/WSS (старые эндпойнты полностью отключены)
 	if v := os.Getenv("HELIUS_API_KEY"); v != "" {
@@ -604,6 +626,21 @@ func loadCfg() Config {
 		}
 	}
 	c.EarlySLPct = evF("EARLYSL_MIN_PCT", c.EarlySLPct*100) / 100
+	c.BreakevenMinPeak = evF("BREAKEVEN_MIN_PEAK_PCT", c.BreakevenMinPeak*100) / 100
+	c.ScrapeAutoTargets = ev("SCRAPE_AUTO_TARGETS", "1") != "0"
+	if v := strings.TrimSpace(os.Getenv("COPY_WALLETS")); v != "" {
+		for _, part := range strings.Split(v, ",") {
+			part = strings.TrimSpace(part)
+			if part == "" {
+				continue
+			}
+			if _, err := solana.PublicKeyFromBase58(part); err != nil {
+				log.Printf("[CFG] COPY_WALLETS: пропуск невалидного адреса %q", part)
+				continue
+			}
+			c.CopyWallets = append(c.CopyWallets, part)
+		}
+	}
 	c.TimeKillSec = int(evU("TIMEKILL_SEC", uint64(c.TimeKillSec)))
 	c.TimeKillMin = evF("TIMEKILL_MIN_PCT", c.TimeKillMin*100) / 100
 	c.MaxTargets = int(evU("MAX_TARGETS", uint64(c.MaxTargets)))
@@ -802,35 +839,50 @@ func scrape(ctx context.Context) {
 	now := time.Now()
 	tgtMu.Lock()
 	added := 0
-	for w, ws := range freq {
-		maxMintBuys := 0
-		for _, cnt := range ws.mintBuys {
-			if cnt > maxMintBuys {
-				maxMintBuys = cnt
-			}
-		}
-		profitOK := false
-		if ws.totalBuySOL > 0 && ws.trades >= 3 {
-			profit := float64(ws.totalSellSOL)/float64(ws.totalBuySOL) - 1.0
-			if profit > 0.30 { // ослабляем порог, чтобы набрать больше целей
-				profitOK = true
-			}
-		}
-		if maxMintBuys < 3 && !profitOK && !ws.win24h2x {
+	for _, w := range cfg.CopyWallets {
+		w = strings.TrimSpace(w)
+		if w == "" {
 			continue
 		}
 		if _, ok := targets[w]; !ok && len(targets) < cfg.MaxTargets {
 			targets[w] = now
 			added++
-			reason := fmt.Sprintf("%d same-mint buys", maxMintBuys)
-			if ws.win24h2x {
-				reason = "2x/24h"
-			} else if profitOK {
-				reason = fmt.Sprintf("profit>30%% (%d trades)", ws.trades)
-			}
-			log.Printf("[SCRAPE] +Цель: %s (%s)", short(w), reason)
+			log.Printf("[SCRAPE] +Цель: %s (COPY_WALLETS)", short(w))
 		} else if ok {
 			targets[w] = now
+		}
+	}
+	if cfg.ScrapeAutoTargets {
+		for w, ws := range freq {
+			maxMintBuys := 0
+			for _, cnt := range ws.mintBuys {
+				if cnt > maxMintBuys {
+					maxMintBuys = cnt
+				}
+			}
+			profitOK := false
+			if ws.totalBuySOL > 0 && ws.trades >= 3 {
+				profit := float64(ws.totalSellSOL)/float64(ws.totalBuySOL) - 1.0
+				if profit > 0.30 { // ослабляем порог, чтобы набрать больше целей
+					profitOK = true
+				}
+			}
+			if maxMintBuys < 3 && !profitOK && !ws.win24h2x {
+				continue
+			}
+			if _, ok := targets[w]; !ok && len(targets) < cfg.MaxTargets {
+				targets[w] = now
+				added++
+				reason := fmt.Sprintf("%d same-mint buys", maxMintBuys)
+				if ws.win24h2x {
+					reason = "2x/24h"
+				} else if profitOK {
+					reason = fmt.Sprintf("profit>30%% (%d trades)", ws.trades)
+				}
+				log.Printf("[SCRAPE] +Цель: %s (%s)", short(w), reason)
+			} else if ok {
+				targets[w] = now
+			}
 		}
 	}
 	stale := 0
@@ -1055,10 +1107,10 @@ func wsLoop(ctx context.Context) error {
 	subToWallet := map[int]string{}
 	reqToWallet := map[int]string{}
 	subbed := map[string]bool{}
-	subKind := map[int]wsSubKind{}  // subscription id -> kind
-	subToMint := map[int]string{}   // accountSubscribe subID -> mint
-	reqToMint := map[int]string{}   // request id -> mint
-	subbedBC := map[string]bool{}   // mint -> subscribed
+	subKind := map[int]wsSubKind{} // subscription id -> kind
+	subToMint := map[int]string{}  // accountSubscribe subID -> mint
+	reqToMint := map[int]string{}  // request id -> mint
+	subbedBC := map[string]bool{}  // mint -> subscribed
 	nextID := 0
 	var writeMu sync.Mutex
 
@@ -1088,7 +1140,7 @@ func wsLoop(ctx context.Context) error {
 		return added
 	}
 
-		// One global logsSubscribe to pump program.
+	// One global logsSubscribe to pump program.
 	addPumpSubOnce := func() {
 		for _, k := range subKind {
 			if k == wsSubPumpLogs {
@@ -1658,8 +1710,8 @@ func doBuy(ctx context.Context, sig Signal) {
 	// Higher slips increase fill probability on fast curves, at the cost of worse fills.
 	trySlips := []uint64{cfg.Slip, 3000, 4500, 6000}
 	var (
-		txSig solana.Signature
-		err   error
+		txSig            solana.Signature
+		err              error
 		lastPreSendLagMs int64
 		lastSendRTTMs    int64
 	)
@@ -1896,7 +1948,7 @@ func checkAll(ctx context.Context) bool {
 			reason = fmt.Sprintf("BADEXIT %ds pnl=%+.1f%%", int(age.Seconds()), pnl*100)
 		case pnl <= -cfg.SL:
 			reason = fmt.Sprintf("SL %.0f%%", pnl*100)
-		case s.p.HiPnl >= 0.05 && pnl <= 0:
+		case cfg.BreakevenMinPeak > 0 && s.p.HiPnl >= cfg.BreakevenMinPeak && pnl <= 0:
 			reason = fmt.Sprintf("BREAKEVEN peak+%.0f%%→%.0f%%", s.p.HiPnl*100, pnl*100)
 		case s.p.HiPnl >= 0.04 && pnl < s.p.HiPnl*0.65 && pnl > 0:
 			reason = fmt.Sprintf("TRAIL peak+%.0f%% now+%.0f%%", s.p.HiPnl*100, pnl*100)
@@ -2108,39 +2160,39 @@ func doSell(ctx context.Context, p *Position, reason string, cachedState *Bondin
 		log.Printf("[SELL] %s | TX %s | %s | PnL %+.1f%% | slip=%dbps", reason, txSig.String()[:12], short(mintStr), pnl, slip)
 		statSells.Add(1)
 
-	savedPos := *p
-	savedSpent := p.Spent
-	savedSolNet := solNet
-	savedMint := mintStr
-	savedTokProg := tokProg
-	go func() {
-		confirmTx(ctx, txSig, "SELL", savedMint, func() {
-			ata := findATA(cfg.Key.PublicKey(), savedPos.Mint, savedTokProg)
+		savedPos := *p
+		savedSpent := p.Spent
+		savedSolNet := solNet
+		savedMint := mintStr
+		savedTokProg := tokProg
+		go func() {
+			confirmTx(ctx, txSig, "SELL", savedMint, func() {
+				ata := findATA(cfg.Key.PublicKey(), savedPos.Mint, savedTokProg)
+				rpcWait()
+				bal := getTokenBalance(ctx, ata)
+				if bal == 0 {
+					log.Printf("[SELL] TX не подтверждена, но токены проданы: %s", short(savedMint))
+					recordPnl(savedSpent, savedSolNet)
+					return
+				}
+				addPos(savedPos.Mint, bal, savedPos.Spent, savedPos.Wallet, savedPos.TokProg)
+				posMu.Lock()
+				if p, ok := pos[savedMint]; ok {
+					p.Entry = savedPos.Entry
+					p.HiPnl = savedPos.HiPnl
+					p.SellFails = savedPos.SellFails + 1
+					p.LastSellTry = time.Now()
+				}
+				posMu.Unlock()
+				log.Printf("[SELL] Позиция восстановлена: %s (fails=%d, bal=%d)", short(savedMint), savedPos.SellFails+1, bal)
+			})
 			rpcWait()
-			bal := getTokenBalance(ctx, ata)
-			if bal == 0 {
-				log.Printf("[SELL] TX не подтверждена, но токены проданы: %s", short(savedMint))
+			st, err := rpcClient().GetSignatureStatuses(ctx, false, txSig)
+			rpcNote(err)
+			if err == nil && len(st.Value) > 0 && st.Value[0] != nil && st.Value[0].Err == nil {
 				recordPnl(savedSpent, savedSolNet)
-				return
 			}
-			addPos(savedPos.Mint, bal, savedPos.Spent, savedPos.Wallet, savedPos.TokProg)
-			posMu.Lock()
-			if p, ok := pos[savedMint]; ok {
-				p.Entry = savedPos.Entry
-				p.HiPnl = savedPos.HiPnl
-				p.SellFails = savedPos.SellFails + 1
-				p.LastSellTry = time.Now()
-			}
-			posMu.Unlock()
-			log.Printf("[SELL] Позиция восстановлена: %s (fails=%d, bal=%d)", short(savedMint), savedPos.SellFails+1, bal)
-		})
-		rpcWait()
-		st, err := rpcClient().GetSignatureStatuses(ctx, false, txSig)
-		rpcNote(err)
-		if err == nil && len(st.Value) > 0 && st.Value[0] != nil && st.Value[0].Err == nil {
-			recordPnl(savedSpent, savedSolNet)
-		}
-	}()
+		}()
 		return true
 	}
 	return false
@@ -2151,9 +2203,13 @@ func doSell(ctx context.Context, p *Position, reason string, cachedState *Bondin
 // ═══════════════════════════════════════════════════════════════════════════════
 
 func readBC(ctx context.Context, mint solana.PublicKey) (*BondingCurve, solana.PublicKey, error) {
+	// PDA bonding-curve уже считается так же, как в программе pump; «not found» = аккаунт ещё не на RPC.
 	bc, _, _ := solana.FindProgramAddress([][]byte{[]byte("bonding-curve"), mint.Bytes()}, PumpProgram)
 	rpcWait()
-	info, err := rpcClient().GetAccountInfoWithOpts(ctx, bc, &rpc.GetAccountInfoOpts{Encoding: solana.EncodingBase64})
+	info, err := rpcClient().GetAccountInfoWithOpts(ctx, bc, &rpc.GetAccountInfoOpts{
+		Encoding:   solana.EncodingBase64,
+		Commitment: rpc.CommitmentConfirmed,
+	})
 	rpcNote(err)
 	if err != nil {
 		return nil, bc, err

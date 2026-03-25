@@ -99,6 +99,7 @@ type Position struct {
 	TokProg     solana.PublicKey
 	LastSellTry time.Time
 	SellFails   int
+	BadEntry    bool
 }
 
 type BondingCurve struct {
@@ -477,7 +478,7 @@ func scrape(ctx context.Context) {
 	tgtMu.Lock()
 	added := 0
 	for w, cnt := range freq {
-		if cnt < 2 {
+		if cnt < 3 {
 			continue
 		}
 		if _, ok := targets[w]; !ok && len(targets) < cfg.MaxTargets {
@@ -700,9 +701,7 @@ func wsLoop(ctx context.Context) error {
 
 	go func() {
 		ping := time.NewTicker(15 * time.Second)
-		fullReconn := time.NewTicker(5 * time.Minute)
 		defer ping.Stop()
-		defer fullReconn.Stop()
 		for {
 			select {
 			case <-ctx.Done():
@@ -719,10 +718,6 @@ func wsLoop(ctx context.Context) error {
 				if added > 0 {
 					log.Printf("[WS] +%d подписок (без реконнекта), всего %d", added, len(subbed))
 				}
-			case <-fullReconn.C:
-				log.Println("[WS] Плановый реконнект (5мин)")
-				conn.Close()
-				return
 			}
 		}
 	}()
@@ -811,7 +806,7 @@ func parseBuySignal(wallet string, logs []string) {
 	if ev == nil || ev.User.String() != wallet {
 		return
 	}
-	if ev.Sol < 10_000_000 {
+	if ev.Sol < 30_000_000 {
 		return
 	}
 
@@ -949,7 +944,7 @@ func doBuy(ctx context.Context, sig Signal) {
 		return
 	}
 
-	if state.VSR < 5_000_000_000 {
+	if state.VSR < 10_000_000_000 {
 		setMintCooldown(mint)
 		return
 	}
@@ -1076,8 +1071,13 @@ func doBuy(ctx context.Context, sig Signal) {
 				old := p.Tokens
 				p.Tokens = real
 				if old != real {
+					diff := float64(real)/float64(old)*100 - 100
 					log.Printf("[BUY] Баланс скорр.: %s | %d → %d tok (%.0f%%)",
-						short(mint), old, real, float64(real)/float64(old)*100-100)
+						short(mint), old, real, diff)
+					if diff < -8 {
+						p.BadEntry = true
+						log.Printf("[BUY] ⚠ Плохой вход (%.0f%%), быстрый выход через 10с", diff)
+					}
 				}
 			}
 			posMu.Unlock()
@@ -1226,6 +1226,8 @@ func checkAll(ctx context.Context) bool {
 			reason = fmt.Sprintf("TP +%.0f%%", pnl*100)
 		case age <= 15*time.Second && pnl >= 0.05:
 			reason = fmt.Sprintf("QUICKTP %ds +%.0f%%", int(age.Seconds()), pnl*100)
+		case s.p.BadEntry && age >= 10*time.Second && pnl < 0:
+			reason = fmt.Sprintf("BADEXIT %ds pnl=%+.1f%%", int(age.Seconds()), pnl*100)
 		case pnl <= -cfg.SL:
 			reason = fmt.Sprintf("SL %.0f%%", pnl*100)
 		case s.p.HiPnl >= 0.05 && pnl <= 0:
@@ -1236,7 +1238,7 @@ func checkAll(ctx context.Context) bool {
 			reason = fmt.Sprintf("SL(trail) %.0f%%", pnl*100)
 		case age >= time.Duration(cfg.TimeKillSec)*time.Second && pnl < 0 && pnl > -cfg.SL:
 			reason = fmt.Sprintf("TIMEKILL %ds pnl=%+.1f%%", int(age.Seconds()), pnl*100)
-		case age >= 90*time.Second && pnl < 0.02 && pnl > -cfg.SL:
+		case age >= 60*time.Second && pnl < 0.02 && pnl > -cfg.SL:
 			reason = fmt.Sprintf("HARDKILL %ds pnl=%+.1f%%", int(age.Seconds()), pnl*100)
 		}
 		if reason == "" {

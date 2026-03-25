@@ -81,6 +81,7 @@ type Config struct {
 	JitoHTTPURL    string
 	JitoHTTPTimeout time.Duration
 	TP             float64
+	QuickTPPct     float64 // ранний выход QUICKTP: в первые 15с при pnl >= этого порога (доля, напр. 0.22 = +22%)
 	SL             float64
 	TimeKillSec    int
 	TimeKillMin    float64
@@ -265,14 +266,26 @@ func requestWSRestart() {
 	}
 }
 
-func sendTx(ctx context.Context, tx *solana.Transaction) (solana.Signature, error) {
+// rpcFallback: если true и Jito не ответил — отправить через Helius RPC (важно для SELL, иначе позиция «зависает»).
+func sendTx(ctx context.Context, tx *solana.Transaction, rpcFallback bool) (solana.Signature, error) {
 	if cfg.JitoHTTP && cfg.JitoHTTPURL != "" {
-		if sig, err := sendTxViaJitoHTTP(ctx, cfg.JitoHTTPURL, tx); err == nil {
+		sig, err := sendTxViaJitoHTTP(ctx, cfg.JitoHTTPURL, tx)
+		if err == nil {
 			return sig, nil
-		} else {
-			// В бою лучше НЕ покупать поздно через fallback RPC: это и даёт -10% на входе.
-			return solana.Signature{}, err
 		}
+		if rpcFallback {
+			log.Printf("[TX] Jito failed → RPC fallback | %v", err)
+			rpcWait()
+			noRetry := uint(0)
+			sig2, err2 := rpcClient().SendTransactionWithOpts(ctx, tx, rpc.TransactionOpts{
+				SkipPreflight: true,
+				MaxRetries:    &noRetry,
+			})
+			rpcNote(err2)
+			return sig2, err2
+		}
+		// BUY: не уходим в RPC — поздний вход хуже отмены
+		return solana.Signature{}, err
 	}
 	rpcWait()
 	noRetry := uint(0)
@@ -415,8 +428,8 @@ func main() {
 	} else {
 		log.Printf("[INIT] Ключ не задан — режим наблюдения | %s", mode)
 	}
-	log.Printf("[INIT] Ставка %.4f SOL | TP +%.0f%% SL -%.0f%% | TimeKill %ds<%+.0f%%",
-		float64(cfg.BuyLamp)/1e9, cfg.TP*100, cfg.SL*100, cfg.TimeKillSec, cfg.TimeKillMin*100)
+	log.Printf("[INIT] Ставка %.4f SOL | TP +%.0f%% QUICKTP≤15s ≥+%.0f%% | SL -%.0f%% | TimeKill %ds<%+.0f%%",
+		float64(cfg.BuyLamp)/1e9, cfg.TP*100, cfg.QuickTPPct*100, cfg.SL*100, cfg.TimeKillSec, cfg.TimeKillMin*100)
 	log.Printf("[INIT] BuySlip %dbps SellSlip %dbps | PrioBuy %.4f PrioSell %.4f SOL",
 		cfg.Slip, cfg.SellSlip, float64(cfg.PrioLamp)/1e9, float64(cfg.PrioLampSell)/1e9)
 	log.Printf("[INIT] MaxTargets %d | MaxPos %d | Scrape %v | Monitor %dms",
@@ -505,6 +518,7 @@ func loadCfg() Config {
 		PrioLamp:       2_000_000,   // 0.002 SOL buy priority
 		PrioLampSell:   1_500_000,   // 0.0015 SOL sell priority
 		TP:             0.40,
+		QuickTPPct:     0.22, // +22% за первые 15с — иначе ждём основной TP
 		SL:             0.20,
 		TimeKillSec:    60,
 		TimeKillMin:    0.05,
@@ -523,9 +537,9 @@ func loadCfg() Config {
 		MinVSRLam:      20_000_000_000, // 20 SOL liquidity floor
 		MintCD:         90 * time.Second,
 		BCRetryMax:     12,
-		BCRetrySleep:   50 * time.Millisecond,
+		BCRetrySleep:   100 * time.Millisecond,
 		BCSigLagBuf:    100 * time.Millisecond,
-		BadEntryPct:    5,
+		BadEntryPct:    20,
 	}
 	// EXCLUSIVE HELIUS: никаких иных RPC/WSS (старые эндпойнты полностью отключены)
 	if v := os.Getenv("HELIUS_API_KEY"); v != "" {
@@ -567,6 +581,7 @@ func loadCfg() Config {
 		}
 	}
 	c.TP = evF("TAKE_PROFIT_PCT", c.TP*100) / 100
+	c.QuickTPPct = evF("QUICKTP_MIN_PCT", c.QuickTPPct*100) / 100
 	c.SL = evF("STOP_LOSS_PCT", c.SL*100) / 100
 	c.TimeKillSec = int(evU("TIMEKILL_SEC", uint64(c.TimeKillSec)))
 	c.TimeKillMin = evF("TIMEKILL_MIN_PCT", c.TimeKillMin*100) / 100
@@ -1650,7 +1665,7 @@ func doBuy(ctx context.Context, sig Signal) {
 		}
 		sendStart := time.Now()
 		preSendLagMs := sendStart.Sub(signalT).Milliseconds()
-		txSig, err = sendTx(ctx, tx)
+		txSig, err = sendTx(ctx, tx, false)
 		lastPreSendLagMs = preSendLagMs
 		lastSendRTTMs = time.Since(sendStart).Milliseconds()
 		if err != nil && (isBuyCustomErr6042(err) || isSlippageErr(err)) && attempt < len(trySlips)-1 {
@@ -1857,7 +1872,7 @@ func checkAll(ctx context.Context) bool {
 			reason = fmt.Sprintf("TP +%.0f%%", pnl*100)
 		case age <= 5*time.Second && pnl <= -0.08:
 			reason = fmt.Sprintf("EARLYSL %ds pnl=%+.1f%%", int(age.Seconds()), pnl*100)
-		case age <= 15*time.Second && pnl >= 0.05:
+		case age <= 15*time.Second && pnl >= cfg.QuickTPPct:
 			reason = fmt.Sprintf("QUICKTP %ds +%.0f%%", int(age.Seconds()), pnl*100)
 		case s.p.BadEntry && age >= 10*time.Second && pnl < 0:
 			reason = fmt.Sprintf("BADEXIT %ds pnl=%+.1f%%", int(age.Seconds()), pnl*100)
@@ -2057,7 +2072,7 @@ func doSell(ctx context.Context, p *Position, reason string, cachedState *Bondin
 			return nil
 		})
 
-		txSig, err := sendTx(ctx, tx)
+		txSig, err := sendTx(ctx, tx, true)
 
 		if err != nil {
 			if isSlippageErr(err) && attempt < len(trySlips)-1 {

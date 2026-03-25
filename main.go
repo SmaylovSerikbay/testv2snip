@@ -108,9 +108,9 @@ type Config struct {
 	BadEntryPct float64
 	// BREAKEVEN: выход в ноль/минус только если пик HiPnl >= этого порога (доля, 0.30 = +30%)
 	BreakevenMinPeak float64
-	// COPY_WALLETS из .env — фиксированные цели (smart money), всегда в targets
+	// COPY_WALLETS — опционально: доп. адреса; пусто = только авто-скрейп (ничего искать вручную не нужно)
 	CopyWallets []string
-	// SCRAPE_AUTO_TARGETS=0 — не добавлять цели из WS-эвристики, только COPY_WALLETS (+уже существующие)
+	// SCRAPE_AUTO_TARGETS=0 — только COPY_WALLETS; 1 (дефолт) — бот сам набирает цели по WS
 	ScrapeAutoTargets bool
 }
 
@@ -463,14 +463,17 @@ func main() {
 	} else {
 		log.Printf("[INIT] BREAKEVEN выкл. (BREAKEVEN_MIN_PEAK_PCT=0)")
 	}
-	if len(cfg.CopyWallets) > 0 {
-		log.Printf("[INIT] COPY_WALLETS: %d фикс. целей | SCRAPE_AUTO_TARGETS=%v",
-			len(cfg.CopyWallets), cfg.ScrapeAutoTargets)
+	if cfg.ScrapeAutoTargets {
+		if len(cfg.CopyWallets) > 0 {
+			log.Printf("[INIT] Цели: авто WS-скрейп + %d доп. из COPY_WALLETS", len(cfg.CopyWallets))
+		} else {
+			log.Printf("[INIT] Цели: только авто-поиск по WS (скрейп), ручной список не нужен — COPY_WALLETS пуст")
+		}
 	} else {
-		log.Printf("[INIT] COPY_WALLETS не заданы | SCRAPE_AUTO_TARGETS=%v", cfg.ScrapeAutoTargets)
-	}
-	if !cfg.ScrapeAutoTargets && len(cfg.CopyWallets) == 0 {
-		log.Printf("[INIT] ⚠ SCRAPE_AUTO_TARGETS=0 и пустой COPY_WALLETS — новые цели не добавятся")
+		log.Printf("[INIT] Цели: только COPY_WALLETS (%d шт.), авто-скрейп выключен", len(cfg.CopyWallets))
+		if len(cfg.CopyWallets) == 0 {
+			log.Printf("[INIT] ⚠ SCRAPE_AUTO_TARGETS=0 и пустой COPY_WALLETS — добавь адреса или вручную включи SCRAPE_AUTO_TARGETS=1")
+		}
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())

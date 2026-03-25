@@ -97,6 +97,12 @@ type Config struct {
 	MinWhaleBuyLam uint64        // min whale buy size to follow (lamports)
 	MinVSRLam      uint64        // min virtual SOL reserve (lamports)
 	MintCD         time.Duration // skip re-buy same mint for this long after attempt/skip
+	// BC retries when bonding curve account not yet readable (fresh mints)
+	BCRetryMax   int
+	BCRetrySleep time.Duration
+	BCSigLagBuf  time.Duration // stop retries when signal lag exceeds MaxSignalLag minus this
+	// After BUY confirm: if token balance vs expected is worse than -this %, mark BadEntry
+	BadEntryPct float64
 }
 
 type Signal struct {
@@ -421,6 +427,8 @@ func main() {
 		cfg.MaxTokInfoLag.Milliseconds(), cfg.MaxSignalLag.Milliseconds())
 	log.Printf("[INIT] CopyFilters: whale>=%.2f SOL | minVSR>=%.1f SOL | mintCooldown=%v",
 		float64(cfg.MinWhaleBuyLam)/1e9, float64(cfg.MinVSRLam)/1e9, cfg.MintCD)
+	log.Printf("[INIT] BC retries: max=%d sleep=%v lagBuf=%v | badEntry if скорр. < -%.0f%%",
+		cfg.BCRetryMax, cfg.BCRetrySleep, cfg.BCSigLagBuf, cfg.BadEntryPct)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -514,6 +522,10 @@ func loadCfg() Config {
 		MinWhaleBuyLam: 200_000_000,    // 0.2 SOL
 		MinVSRLam:      20_000_000_000, // 20 SOL liquidity floor
 		MintCD:         90 * time.Second,
+		BCRetryMax:     12,
+		BCRetrySleep:   50 * time.Millisecond,
+		BCSigLagBuf:    100 * time.Millisecond,
+		BadEntryPct:    5,
 	}
 	// EXCLUSIVE HELIUS: никаких иных RPC/WSS (старые эндпойнты полностью отключены)
 	if v := os.Getenv("HELIUS_API_KEY"); v != "" {
@@ -582,6 +594,20 @@ func loadCfg() Config {
 		c.ScrapeIvl = time.Duration(m) * time.Minute
 	}
 	c.MonitorMs = int(evU("MONITOR_MS", uint64(c.MonitorMs)))
+	if n := evU("BC_RETRY_MAX", 0); n > 0 {
+		c.BCRetryMax = int(n)
+	}
+	if ms := evU("BC_RETRY_SLEEP_MS", 0); ms > 0 {
+		c.BCRetrySleep = time.Duration(ms) * time.Millisecond
+	}
+	if ms := evU("BC_SIGNAL_LAG_BUFFER_MS", 0); ms > 0 {
+		c.BCSigLagBuf = time.Duration(ms) * time.Millisecond
+	}
+	if v := os.Getenv("BAD_ENTRY_PCT"); v != "" {
+		if f, err := strconv.ParseFloat(v, 64); err == nil && f > 0 {
+			c.BadEntryPct = f
+		}
+	}
 	return c
 }
 
@@ -1459,11 +1485,11 @@ func doBuy(ctx context.Context, sig Signal) {
 	state, bc := preState, preBC
 	// retry for freshest mints: sometimes bonding curve account isn't readable immediately
 	if preBCErr != nil || state == nil {
-		for i := 0; i < 8; i++ {
-			if cfg.MaxSignalLag > 0 && time.Since(signalT) > cfg.MaxSignalLag-80*time.Millisecond {
+		for i := 0; i < cfg.BCRetryMax; i++ {
+			if cfg.MaxSignalLag > 0 && time.Since(signalT) > cfg.MaxSignalLag-cfg.BCSigLagBuf {
 				break
 			}
-			time.Sleep(30 * time.Millisecond)
+			time.Sleep(cfg.BCRetrySleep)
 			s2, bc2, e2 := readBC(ctx, sig.Mint)
 			if e2 == nil && s2 != nil {
 				state, bc, preBCErr = s2, bc2, nil
@@ -1668,9 +1694,9 @@ func doBuy(ctx context.Context, sig Signal) {
 					diff := float64(real)/float64(old)*100 - 100
 					log.Printf("[BUY] Баланс скорр.: %s | %d → %d tok (%.0f%%)",
 						short(mint), old, real, diff)
-					if diff < -5 {
+					if diff < -cfg.BadEntryPct {
 						p.BadEntry = true
-						log.Printf("[BUY] ⚠ Плохой вход (%.0f%%), быстрый выход через 10с", diff)
+						log.Printf("[BUY] ⚠ Плохой вход (%.0f%%) порог -%.0f%%, быстрый выход через 10с", diff, cfg.BadEntryPct)
 					}
 				}
 			}

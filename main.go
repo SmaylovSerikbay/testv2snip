@@ -235,6 +235,15 @@ func requestWSRestart() {
 	}
 }
 
+func isSlippageErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	// common: "custom program error: 0xbc4"
+	s := strings.ToLower(err.Error())
+	return strings.Contains(s, "0xbc4") || strings.Contains(s, "slippage")
+}
+
 // ═══════════════════════════════════════════════════════════════════════════════
 //  MAIN
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -246,12 +255,13 @@ func main() {
 	rpcCl = rpc.New(cfg.RPC)
 
 	// Token bucket: 10 burst, refill at ~8/s
-	rpcBucket = make(chan struct{}, 10)
-	for i := 0; i < 10; i++ {
+	// увеличено: меньше очередей => меньше lag в hot-path (BUY/SELL)
+	rpcBucket = make(chan struct{}, 30)
+	for i := 0; i < 30; i++ {
 		rpcBucket <- struct{}{}
 	}
 	go func() {
-		t := time.NewTicker(125 * time.Millisecond)
+		t := time.NewTicker(50 * time.Millisecond) // ~20 req/s sustained
 		for range t.C {
 			select {
 			case rpcBucket <- struct{}{}:
@@ -1232,7 +1242,7 @@ func doBuy(ctx context.Context, sig Signal) {
 	rpcWait()
 	noRetry := uint(0)
 	txSig, err := rpcClient().SendTransactionWithOpts(ctx, tx, rpc.TransactionOpts{
-		SkipPreflight: false,
+		SkipPreflight: true,
 		MaxRetries:    &noRetry,
 	})
 	rpcNote(err)
@@ -1525,7 +1535,6 @@ func doSell(ctx context.Context, p *Position, reason string, cachedState *Bondin
 
 	solOut := calcSolOut(state.VTK, state.VSR, sellAmt)
 	solNet := solOut - solOut/100
-	minSol := solNet * (10000 - cfg.SellSlip) / 10000
 	pnl := float64(solNet)/float64(p.Spent)*100 - 100
 
 	creatorVault, _, _ := solana.FindProgramAddress(
@@ -1536,7 +1545,6 @@ func doSell(ctx context.Context, p *Position, reason string, cachedState *Bondin
 	data := make([]byte, 24)
 	copy(data[:8], sellDisc[:])
 	binary.LittleEndian.PutUint64(data[8:], sellAmt)
-	binary.LittleEndian.PutUint64(data[16:], minSol)
 
 	sellAccs := []*solana.AccountMeta{
 		{PublicKey: PumpGlobal},                             // 0
@@ -1573,14 +1581,10 @@ func doSell(ctx context.Context, p *Position, reason string, cachedState *Bondin
 	}
 
 	cuLimit := uint32(400_000)
-	ixs := []solana.Instruction{
-		cuLimitIx(cuLimit),
-		cuPriceIx(cfg.PrioLampSell * 1_000_000 / uint64(cuLimit)),
-		&genericIx{pid: PumpProgram, dat: data, accs: sellAccs},
-		closeIx,
-	}
 
 	if !cfg.Live {
+		minSol := solNet * (10000 - cfg.SellSlip) / 10000
+		binary.LittleEndian.PutUint64(data[16:], minSol)
 		log.Printf("[SELL][PAPER] %s | %s | PnL %+.1f%% | %.6f SOL",
 			reason, short(mintStr), pnl, float64(solNet)/1e9)
 		statSells.Add(1)
@@ -1588,42 +1592,60 @@ func doSell(ctx context.Context, p *Position, reason string, cachedState *Bondin
 		return true
 	}
 
-	rpcWait()
-	freshBH, bhErr := rpcClient().GetLatestBlockhash(ctx, rpc.CommitmentFinalized)
-	rpcNote(bhErr)
-	if bhErr != nil {
-		return false
-	}
-	tx, err := solana.NewTransaction(ixs, freshBH.Value.Blockhash, solana.TransactionPayer(user))
-	if err != nil {
-		log.Printf("[SELL] Build: %v | %s", err, short(mintStr))
-		return false
-	}
-	tx.Sign(func(key solana.PublicKey) *solana.PrivateKey {
-		if key == user {
-			k := cfg.Key
-			return &k
+	// анти-0xbc4: быстрые ретраи с увеличением slippage (если цена резко двигается)
+	// базовый cfg.SellSlip (например 4000), затем 6000, 8000, 9500.
+	trySlips := []uint64{cfg.SellSlip, 6000, 8000, 9500}
+	for attempt, slip := range trySlips {
+		if slip > 9900 {
+			slip = 9900
 		}
-		return nil
-	})
+		minSol := solNet * (10000 - slip) / 10000
+		binary.LittleEndian.PutUint64(data[16:], minSol)
 
-	rpcWait()
-	sellRetry := uint(2)
-	txSig, err := rpcClient().SendTransactionWithOpts(ctx, tx, rpc.TransactionOpts{
-		SkipPreflight: false,
-		MaxRetries:    &sellRetry,
-	})
-	rpcNote(err)
-	if err != nil {
-		errMsg := fmt.Sprintf("%v", err)
-		if len(errMsg) > 200 {
-			errMsg = errMsg[:200] + "…"
+		ixs := []solana.Instruction{
+			cuLimitIx(cuLimit),
+			cuPriceIx(cfg.PrioLampSell * 1_000_000 / uint64(cuLimit)),
+			&genericIx{pid: PumpProgram, dat: data, accs: sellAccs},
+			closeIx,
 		}
-		log.Printf("[SELL] ✗ %s | %s", errMsg, short(mintStr))
-		return false
-	}
-	log.Printf("[SELL] %s | TX %s | %s | PnL %+.1f%%", reason, txSig.String()[:12], short(mintStr), pnl)
-	statSells.Add(1)
+
+		bh := cachedBH(ctx) // быстрее, чем GetLatestBlockhash на каждом sell
+		tx, err := solana.NewTransaction(ixs, bh, solana.TransactionPayer(user))
+		if err != nil {
+			log.Printf("[SELL] Build: %v | %s", err, short(mintStr))
+			return false
+		}
+		tx.Sign(func(key solana.PublicKey) *solana.PrivateKey {
+			if key == user {
+				k := cfg.Key
+				return &k
+			}
+			return nil
+		})
+
+		rpcWait()
+		sellRetry := uint(0)
+		txSig, err := rpcClient().SendTransactionWithOpts(ctx, tx, rpc.TransactionOpts{
+			SkipPreflight: true,
+			MaxRetries:    &sellRetry,
+		})
+		rpcNote(err)
+
+		if err != nil {
+			if isSlippageErr(err) && attempt < len(trySlips)-1 {
+				log.Printf("[SELL] 0xbc4/slip retry %d/%d | %s | slip=%dbps", attempt+1, len(trySlips), short(mintStr), slip)
+				continue
+			}
+			errMsg := fmt.Sprintf("%v", err)
+			if len(errMsg) > 200 {
+				errMsg = errMsg[:200] + "…"
+			}
+			log.Printf("[SELL] ✗ %s | %s", errMsg, short(mintStr))
+			return false
+		}
+
+		log.Printf("[SELL] %s | TX %s | %s | PnL %+.1f%% | slip=%dbps", reason, txSig.String()[:12], short(mintStr), pnl, slip)
+		statSells.Add(1)
 
 	savedPos := *p
 	savedPnl := pnl
@@ -1657,7 +1679,9 @@ func doSell(ctx context.Context, p *Position, reason string, cachedState *Bondin
 			recordPnl(savedPnl)
 		}
 	}()
-	return true
+		return true
+	}
+	return false
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════

@@ -86,6 +86,7 @@ type Config struct {
 	Live           bool
 	MinReserve     uint64  // min SOL balance to keep (lamports)
 	MaxSessionLoss float64 // stop trading if session PnL <= -X%
+	WalletCD       time.Duration
 }
 
 type Signal struct {
@@ -127,6 +128,7 @@ type walletStats struct {
 	totalBuySOL  uint64
 	totalSellSOL uint64
 	trades       int
+	win24h2x     bool
 }
 
 func getWS(freq map[string]*walletStats, wallet string) *walletStats {
@@ -155,6 +157,7 @@ func (g *genericIx) Data() ([]byte, error)           { return g.dat, nil }
 var (
 	cfg   Config
 	rpcCl *rpc.Client
+	rpcMu sync.RWMutex
 
 	// Token-bucket rate limiter: allows bursts, ~8 req/s sustained
 	rpcBucket chan struct{}
@@ -202,9 +205,35 @@ var (
 	statPnlSum float64
 
 	circuitOpen atomic.Bool // session PnL circuit breaker
+
+	rpcCalls atomic.Int64
+	rpcErrs  atomic.Int64
+
+	wsRestartCh = make(chan struct{}, 1)
 )
 
 func rpcWait() { <-rpcBucket }
+
+func rpcClient() *rpc.Client {
+	rpcMu.RLock()
+	c := rpcCl
+	rpcMu.RUnlock()
+	return c
+}
+
+func rpcNote(err error) {
+	rpcCalls.Add(1)
+	if err != nil {
+		rpcErrs.Add(1)
+	}
+}
+
+func requestWSRestart() {
+	select {
+	case wsRestartCh <- struct{}{}:
+	default:
+	}
+}
 
 // ═══════════════════════════════════════════════════════════════════════════════
 //  MAIN
@@ -234,8 +263,9 @@ func main() {
 	// Read fee_recipient from on-chain Global account
 	{
 		rpcWait()
-		gInfo, gErr := rpcCl.GetAccountInfoWithOpts(context.Background(), PumpGlobal,
+		gInfo, gErr := rpcClient().GetAccountInfoWithOpts(context.Background(), PumpGlobal,
 			&rpc.GetAccountInfoOpts{Encoding: solana.EncodingBase64})
+		rpcNote(gErr)
 		if gErr == nil && gInfo != nil && gInfo.Value != nil {
 			gd := gInfo.Value.Data.GetBinary()
 			if len(gd) >= 73 {
@@ -274,7 +304,8 @@ func main() {
 
 	if hasKey {
 		rpcWait()
-		b, err := rpcCl.GetBalance(ctx, cfg.Key.PublicKey(), rpc.CommitmentConfirmed)
+		b, err := rpcClient().GetBalance(ctx, cfg.Key.PublicKey(), rpc.CommitmentConfirmed)
+		rpcNote(err)
 		if err == nil {
 			log.Printf("[INIT] Баланс: %.6f SOL", float64(b.Value)/1e9)
 		}
@@ -284,6 +315,7 @@ func main() {
 	launch := func(f func(context.Context)) { wg.Add(1); go func() { defer wg.Done(); f(ctx) }() }
 
 	launch(runBlockhashLoop)
+	launch(runRPCHealth)
 	launch(runScraper)
 	launch(runWSListener)
 	launch(runExecutor)
@@ -350,6 +382,7 @@ func loadCfg() Config {
 		MonitorMs:      1000,
 		MinReserve:     15_000_000,  // 0.015 SOL
 		MaxSessionLoss: 30.0,        // -30%
+		WalletCD:       5 * time.Second,
 	}
 	if v := os.Getenv("HELIUS_API_KEY"); v != "" {
 		c.RPC = "https://mainnet.helius-rpc.com/?api-key=" + v
@@ -383,6 +416,9 @@ func loadCfg() Config {
 	c.TimeKillMin = evF("TIMEKILL_MIN_PCT", c.TimeKillMin*100) / 100
 	c.MaxTargets = int(evU("MAX_TARGETS", uint64(c.MaxTargets)))
 	c.MaxPositions = int(evU("MAX_POSITIONS", uint64(c.MaxPositions)))
+	if s := evU("WALLET_COOLDOWN_SEC", 0); s > 0 {
+		c.WalletCD = time.Duration(s) * time.Second
+	}
 	if m := evU("SCRAPE_INTERVAL_MIN", 0); m > 0 {
 		c.ScrapeIvl = time.Duration(m) * time.Minute
 	}
@@ -418,7 +454,8 @@ func evF(k string, d float64) float64 {
 func runBlockhashLoop(ctx context.Context) {
 	refresh := func() {
 		rpcWait()
-		r, err := rpcCl.GetLatestBlockhash(ctx, rpc.CommitmentFinalized)
+		r, err := rpcClient().GetLatestBlockhash(ctx, rpc.CommitmentFinalized)
+		rpcNote(err)
 		if err != nil {
 			return
 		}
@@ -440,6 +477,43 @@ func runBlockhashLoop(ctx context.Context) {
 	}
 }
 
+func runRPCHealth(ctx context.Context) {
+	t := time.NewTicker(30 * time.Second)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+			calls := rpcCalls.Swap(0)
+			errs := rpcErrs.Swap(0)
+			if calls < 20 {
+				continue
+			}
+			rate := float64(errs) / float64(calls)
+			if rate <= 0.10 {
+				continue
+			}
+			backup := os.Getenv("BACKUP_RPC_URL")
+			backupWSS := os.Getenv("BACKUP_WSS_URL")
+			if backup == "" {
+				continue
+			}
+			rpcMu.Lock()
+			if cfg.RPC != backup {
+				log.Printf("[RPC] High error rate %.0f%% (%d/%d) — switch RPC → backup", rate*100, errs, calls)
+				cfg.RPC = backup
+				if backupWSS != "" {
+					cfg.WSS = backupWSS
+				}
+				rpcCl = rpc.New(cfg.RPC)
+				requestWSRestart()
+			}
+			rpcMu.Unlock()
+		}
+	}
+}
+
 func cachedBH(ctx context.Context) solana.Hash {
 	bhMu.RLock()
 	h := bhHash
@@ -449,7 +523,8 @@ func cachedBH(ctx context.Context) solana.Hash {
 		return h
 	}
 	rpcWait()
-	r, err := rpcCl.GetLatestBlockhash(ctx, rpc.CommitmentFinalized)
+	r, err := rpcClient().GetLatestBlockhash(ctx, rpc.CommitmentFinalized)
+	rpcNote(err)
 	if err != nil {
 		return h
 	}
@@ -521,19 +596,21 @@ func scrape(ctx context.Context) {
 		profitOK := false
 		if ws.totalBuySOL > 0 && ws.trades >= 3 {
 			profit := float64(ws.totalSellSOL)/float64(ws.totalBuySOL) - 1.0
-			if profit > 0.50 {
+			if profit > 0.30 { // ослабляем порог, чтобы набрать больше целей
 				profitOK = true
 			}
 		}
-		if maxMintBuys < 3 && !profitOK {
+		if maxMintBuys < 3 && !profitOK && !ws.win24h2x {
 			continue
 		}
 		if _, ok := targets[w]; !ok && len(targets) < cfg.MaxTargets {
 			targets[w] = now
 			added++
 			reason := fmt.Sprintf("%d same-mint buys", maxMintBuys)
-			if profitOK {
-				reason = fmt.Sprintf("profit>50%% (%d trades)", ws.trades)
+			if ws.win24h2x {
+				reason = "2x/24h"
+			} else if profitOK {
+				reason = fmt.Sprintf("profit>30%% (%d trades)", ws.trades)
 			}
 			log.Printf("[SCRAPE] +Цель: %s (%s)", short(w), reason)
 		} else if ok {
@@ -558,11 +635,13 @@ func scrape(ctx context.Context) {
 }
 
 func scrapeRPCLive(ctx context.Context, freq map[string]*walletStats, myKey string) {
+	cutoff := time.Now().Add(-24 * time.Hour).Unix()
 	for _, addr := range []solana.PublicKey{PumpEventAuth, PumpFee} {
 		rpcWait()
 		lim := 50
-		sigs, err := rpcCl.GetSignaturesForAddressWithOpts(ctx, addr,
+		sigs, err := rpcClient().GetSignaturesForAddressWithOpts(ctx, addr,
 			&rpc.GetSignaturesForAddressOpts{Limit: &lim})
+		rpcNote(err)
 		if err != nil {
 			log.Printf("[SCRAPE] RPC %s: err=%v", short(addr.String()), err)
 			continue
@@ -592,6 +671,13 @@ func scrapeRPCLive(ctx context.Context, freq map[string]*walletStats, myKey stri
 			}
 			ws := getWS(freq, w)
 			ws.trades++
+			if te.Timestamp >= cutoff && te.IsBuy && te.Sol > 0 {
+				// эвристика "2x за 24ч": встречали buy >= 0.5 SOL (обычно это уже серьёзный памп)
+				// точного PnL по кошельку здесь не считаем, но цель — расширить набор активных адресов.
+				if te.Sol >= 500_000_000 {
+					ws.win24h2x = true
+				}
+			}
 			if te.IsBuy {
 				buys++
 				ws.mintBuys[te.Mint.String()]++
@@ -609,6 +695,7 @@ func scrapeRPCLive(ctx context.Context, freq map[string]*walletStats, myKey stri
 }
 
 func scrapeDexEndpoint(ctx context.Context, freq map[string]*walletStats, myKey, url string, maxCheck int, tag string) {
+	cutoff := time.Now().Add(-24 * time.Hour).Unix()
 	body, err := httpGet(url)
 	if err != nil {
 		log.Printf("[SCRAPE] Dex/%s: %v", tag, err)
@@ -635,7 +722,8 @@ func scrapeDexEndpoint(ctx context.Context, freq map[string]*walletStats, myKey,
 
 		rpcWait()
 		lim := 20
-		sigs, err := rpcCl.GetSignaturesForAddressWithOpts(ctx, bc, &rpc.GetSignaturesForAddressOpts{Limit: &lim})
+		sigs, err := rpcClient().GetSignaturesForAddressWithOpts(ctx, bc, &rpc.GetSignaturesForAddressOpts{Limit: &lim})
+		rpcNote(err)
 		if err != nil || len(sigs) == 0 {
 			continue
 		}
@@ -657,6 +745,11 @@ func scrapeDexEndpoint(ctx context.Context, freq map[string]*walletStats, myKey,
 			}
 			ws := getWS(freq, w)
 			ws.trades++
+			if te.Timestamp >= cutoff && te.IsBuy && te.Sol > 0 {
+				if te.Sol >= 500_000_000 {
+					ws.win24h2x = true
+				}
+			}
 			if te.IsBuy {
 				totalBuyers++
 				ws.mintBuys[te.Mint.String()]++
@@ -769,6 +862,9 @@ func wsLoop(ctx context.Context) error {
 		for {
 			select {
 			case <-ctx.Done():
+				conn.Close()
+				return
+			case <-wsRestartCh:
 				conn.Close()
 				return
 			case <-ping.C:
@@ -963,7 +1059,7 @@ func doBuy(ctx context.Context, sig Signal) {
 	}
 
 	tgtCDMu.Lock()
-	if t, ok := tgtCDMap[sig.Wallet]; ok && time.Since(t) < 2*time.Minute {
+	if t, ok := tgtCDMap[sig.Wallet]; ok && time.Since(t) < cfg.WalletCD {
 		tgtCDMu.Unlock()
 		log.Printf("[BUY] Skip: wallet cooldown | %s from %s", short(mint), short(sig.Wallet))
 		return
@@ -995,7 +1091,8 @@ func doBuy(ctx context.Context, sig Signal) {
 	go func() {
 		defer pwg.Done()
 		rpcWait()
-		b, err := rpcCl.GetBalance(ctx, cfg.Key.PublicKey(), rpc.CommitmentConfirmed)
+		b, err := rpcClient().GetBalance(ctx, cfg.Key.PublicKey(), rpc.CommitmentConfirmed)
+		rpcNote(err)
 		if err == nil {
 			preBal = b.Value
 			preBalOK = true
@@ -1134,10 +1231,11 @@ func doBuy(ctx context.Context, sig Signal) {
 
 	rpcWait()
 	noRetry := uint(0)
-	txSig, err := rpcCl.SendTransactionWithOpts(ctx, tx, rpc.TransactionOpts{
+	txSig, err := rpcClient().SendTransactionWithOpts(ctx, tx, rpc.TransactionOpts{
 		SkipPreflight: false,
 		MaxRetries:    &noRetry,
 	})
+	rpcNote(err)
 	if err != nil {
 		errMsg := fmt.Sprintf("%v", err)
 		if len(errMsg) > 200 {
@@ -1197,7 +1295,8 @@ func confirmTx(ctx context.Context, txSig solana.Signature, tag, mintStr string,
 
 	for attempt := 0; attempt < 20; attempt++ {
 		rpcWait()
-		statuses, err := rpcCl.GetSignatureStatuses(ctx, false, txSig)
+		statuses, err := rpcClient().GetSignatureStatuses(ctx, false, txSig)
+		rpcNote(err)
 		if err != nil || len(statuses.Value) == 0 || statuses.Value[0] == nil {
 			time.Sleep(2 * time.Second)
 			continue
@@ -1331,8 +1430,8 @@ func checkAll(ctx context.Context) bool {
 			reason = fmt.Sprintf("TRAIL peak+%.0f%% now+%.0f%%", s.p.HiPnl*100, pnl*100)
 		case s.p.HiPnl >= 0.04 && pnl < s.p.HiPnl*0.65 && pnl <= 0:
 			reason = fmt.Sprintf("SL(trail) %.0f%%", pnl*100)
-		case age >= time.Duration(cfg.TimeKillSec)*time.Second && pnl < 0 && pnl > -cfg.SL:
-			reason = fmt.Sprintf("TIMEKILL %ds pnl=%+.1f%%", int(age.Seconds()), pnl*100)
+		case age >= time.Duration(cfg.TimeKillSec)*time.Second && pnl < cfg.TimeKillMin && pnl > -cfg.SL:
+			reason = fmt.Sprintf("TIMEKILL %ds pnl=%+.1f%%(<%+.1f%%)", int(age.Seconds()), pnl*100, cfg.TimeKillMin*100)
 		case age >= 60*time.Second && pnl < 0.02 && pnl > -cfg.SL:
 			reason = fmt.Sprintf("HARDKILL %ds pnl=%+.1f%%", int(age.Seconds()), pnl*100)
 		}
@@ -1490,7 +1589,8 @@ func doSell(ctx context.Context, p *Position, reason string, cachedState *Bondin
 	}
 
 	rpcWait()
-	freshBH, bhErr := rpcCl.GetLatestBlockhash(ctx, rpc.CommitmentFinalized)
+	freshBH, bhErr := rpcClient().GetLatestBlockhash(ctx, rpc.CommitmentFinalized)
+	rpcNote(bhErr)
 	if bhErr != nil {
 		return false
 	}
@@ -1509,10 +1609,11 @@ func doSell(ctx context.Context, p *Position, reason string, cachedState *Bondin
 
 	rpcWait()
 	sellRetry := uint(2)
-	txSig, err := rpcCl.SendTransactionWithOpts(ctx, tx, rpc.TransactionOpts{
+	txSig, err := rpcClient().SendTransactionWithOpts(ctx, tx, rpc.TransactionOpts{
 		SkipPreflight: false,
 		MaxRetries:    &sellRetry,
 	})
+	rpcNote(err)
 	if err != nil {
 		errMsg := fmt.Sprintf("%v", err)
 		if len(errMsg) > 200 {
@@ -1550,7 +1651,8 @@ func doSell(ctx context.Context, p *Position, reason string, cachedState *Bondin
 			log.Printf("[SELL] Позиция восстановлена: %s (fails=%d, bal=%d)", short(savedMint), savedPos.SellFails+1, bal)
 		})
 		rpcWait()
-		st, err := rpcCl.GetSignatureStatuses(ctx, false, txSig)
+		st, err := rpcClient().GetSignatureStatuses(ctx, false, txSig)
+		rpcNote(err)
 		if err == nil && len(st.Value) > 0 && st.Value[0] != nil && st.Value[0].Err == nil {
 			recordPnl(savedPnl)
 		}
@@ -1565,7 +1667,8 @@ func doSell(ctx context.Context, p *Position, reason string, cachedState *Bondin
 func readBC(ctx context.Context, mint solana.PublicKey) (*BondingCurve, solana.PublicKey, error) {
 	bc, _, _ := solana.FindProgramAddress([][]byte{[]byte("bonding-curve"), mint.Bytes()}, PumpProgram)
 	rpcWait()
-	info, err := rpcCl.GetAccountInfoWithOpts(ctx, bc, &rpc.GetAccountInfoOpts{Encoding: solana.EncodingBase64})
+	info, err := rpcClient().GetAccountInfoWithOpts(ctx, bc, &rpc.GetAccountInfoOpts{Encoding: solana.EncodingBase64})
+	rpcNote(err)
 	if err != nil {
 		return nil, bc, err
 	}
@@ -1596,7 +1699,8 @@ func readBC(ctx context.Context, mint solana.PublicKey) (*BondingCurve, solana.P
 func parseTxEvent(ctx context.Context, sig solana.Signature) *TradeEvent {
 	rpcWait()
 	v := uint64(0)
-	out, err := rpcCl.GetTransaction(ctx, sig, &rpc.GetTransactionOpts{MaxSupportedTransactionVersion: &v})
+	out, err := rpcClient().GetTransaction(ctx, sig, &rpc.GetTransactionOpts{MaxSupportedTransactionVersion: &v})
+	rpcNote(err)
 	if err != nil || out == nil || out.Meta == nil {
 		return nil
 	}
@@ -1657,10 +1761,11 @@ func calcSolOut(vtk, vsr, tok uint64) uint64 {
 
 func getTokenBalance(ctx context.Context, ata solana.PublicKey) uint64 {
 	rpcWait()
-	info, err := rpcCl.GetAccountInfoWithOpts(ctx, ata, &rpc.GetAccountInfoOpts{
+	info, err := rpcClient().GetAccountInfoWithOpts(ctx, ata, &rpc.GetAccountInfoOpts{
 		Encoding:   solana.EncodingBase64,
 		Commitment: rpc.CommitmentConfirmed,
 	})
+	rpcNote(err)
 	if err != nil || info == nil || info.Value == nil {
 		return 0
 	}
@@ -1673,10 +1778,11 @@ func getTokenBalance(ctx context.Context, ata solana.PublicKey) uint64 {
 
 func getMintTokenProgram(ctx context.Context, mint solana.PublicKey) solana.PublicKey {
 	rpcWait()
-	info, err := rpcCl.GetAccountInfoWithOpts(ctx, mint, &rpc.GetAccountInfoOpts{
+	info, err := rpcClient().GetAccountInfoWithOpts(ctx, mint, &rpc.GetAccountInfoOpts{
 		Encoding:   solana.EncodingBase64,
 		Commitment: rpc.CommitmentConfirmed,
 	})
+	rpcNote(err)
 	if err != nil || info == nil || info.Value == nil {
 		return solana.TokenProgramID
 	}
@@ -1786,7 +1892,8 @@ func printStats() {
 	balStr := ""
 	if len(cfg.Key) == 64 {
 		rpcWait()
-		b, err := rpcCl.GetBalance(context.Background(), cfg.Key.PublicKey(), rpc.CommitmentConfirmed)
+		b, err := rpcClient().GetBalance(context.Background(), cfg.Key.PublicKey(), rpc.CommitmentConfirmed)
+		rpcNote(err)
 		if err == nil {
 			balStr = fmt.Sprintf(" | Bal=%.4f SOL", float64(b.Value)/1e9)
 		}

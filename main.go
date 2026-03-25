@@ -75,6 +75,8 @@ type Config struct {
 	SellSlip       uint64  // sell slippage bps
 	PrioLamp       uint64  // priority fee for BUY (lamports)
 	PrioLampSell   uint64  // priority fee for SELL (lamports)
+	JitoTipLamp    uint64  // optional: lamports tip via SystemProgram transfer
+	JitoTipAcc     solana.PublicKey
 	TP             float64
 	SL             float64
 	TimeKillSec    int
@@ -87,6 +89,7 @@ type Config struct {
 	MinReserve     uint64  // min SOL balance to keep (lamports)
 	MaxSessionLoss float64 // stop trading if session PnL <= -X%
 	WalletCD       time.Duration
+	MaxTokInfoLag  time.Duration // if token info fetch exceeds this, skip buy
 }
 
 type Signal struct {
@@ -393,6 +396,7 @@ func loadCfg() Config {
 		MinReserve:     15_000_000,  // 0.015 SOL
 		MaxSessionLoss: 30.0,        // -30%
 		WalletCD:       5 * time.Second,
+		MaxTokInfoLag:  150 * time.Millisecond,
 	}
 	if v := os.Getenv("HELIUS_API_KEY"); v != "" {
 		c.RPC = "https://mainnet.helius-rpc.com/?api-key=" + v
@@ -420,6 +424,12 @@ func loadCfg() Config {
 	c.SellSlip = evU("SELL_SLIPPAGE_BPS", c.SellSlip)
 	c.MinReserve = evU("MIN_BALANCE_RESERVE", c.MinReserve)
 	c.MaxSessionLoss = evF("MAX_SESSION_LOSS_PCT", c.MaxSessionLoss)
+	c.JitoTipLamp = evU("JITO_TIP_LAMPORTS", c.JitoTipLamp)
+	if a := os.Getenv("JITO_TIP_ACCOUNT"); a != "" {
+		if pk, err := solana.PublicKeyFromBase58(a); err == nil {
+			c.JitoTipAcc = pk
+		}
+	}
 	c.TP = evF("TAKE_PROFIT_PCT", c.TP*100) / 100
 	c.SL = evF("STOP_LOSS_PCT", c.SL*100) / 100
 	c.TimeKillSec = int(evU("TIMEKILL_SEC", uint64(c.TimeKillSec)))
@@ -428,6 +438,9 @@ func loadCfg() Config {
 	c.MaxPositions = int(evU("MAX_POSITIONS", uint64(c.MaxPositions)))
 	if s := evU("WALLET_COOLDOWN_SEC", 0); s > 0 {
 		c.WalletCD = time.Duration(s) * time.Second
+	}
+	if ms := evU("MAX_TOKENINFO_LAG_MS", 0); ms > 0 {
+		c.MaxTokInfoLag = time.Duration(ms) * time.Millisecond
 	}
 	if m := evU("SCRAPE_INTERVAL_MIN", 0); m > 0 {
 		c.ScrapeIvl = time.Duration(m) * time.Minute
@@ -502,6 +515,13 @@ func runRPCHealth(ctx context.Context) {
 			}
 			rate := float64(errs) / float64(calls)
 			if rate <= 0.10 {
+				continue
+			}
+			// если используем Helius — не сваливаемся на бэкап (часто бэкап хуже и даёт те самые 800-900ms)
+			rpcMu.RLock()
+			onHelius := strings.Contains(cfg.RPC, "helius-rpc.com")
+			rpcMu.RUnlock()
+			if onHelius {
 				continue
 			}
 			backup := os.Getenv("BACKUP_RPC_URL")
@@ -1092,6 +1112,7 @@ func doBuy(ctx context.Context, sig Signal) {
 		preBal    uint64
 		preBalOK  bool
 		preTokPrg solana.PublicKey
+		tokInfoMs int64
 		preState  *BondingCurve
 		preBC     solana.PublicKey
 		preBCErr  error
@@ -1110,13 +1131,19 @@ func doBuy(ctx context.Context, sig Signal) {
 	}()
 	go func() {
 		defer pwg.Done()
+		t0 := time.Now()
 		preTokPrg = getMintTokenProgram(ctx, sig.Mint)
+		tokInfoMs = time.Since(t0).Milliseconds()
 	}()
 	go func() {
 		defer pwg.Done()
 		preState, preBC, preBCErr = readBC(ctx, sig.Mint)
 	}()
 	pwg.Wait()
+	if cfg.MaxTokInfoLag > 0 && time.Duration(tokInfoMs)*time.Millisecond > cfg.MaxTokInfoLag {
+		log.Printf("[BUY] Skip: tokeninfo lag %dms > %dms | %s", tokInfoMs, cfg.MaxTokInfoLag.Milliseconds(), short(mint))
+		return
+	}
 
 	if preBalOK && preBal < cfg.BuyLamp+cfg.MinReserve {
 		log.Printf("[BUY] Skip: balance reserve (%.4f SOL < %.4f needed) | %s",
@@ -1182,9 +1209,12 @@ func doBuy(ctx context.Context, sig Signal) {
 	binary.LittleEndian.PutUint64(data[16:], minTokOut)
 
 	cuLimit := uint32(250_000)
-	ixs := []solana.Instruction{
-		cuLimitIx(cuLimit),
-		cuPriceIx(cfg.PrioLamp * 1_000_000 / uint64(cuLimit)),
+	ixs := []solana.Instruction{cuLimitIx(cuLimit)}
+	if tip := jitoTipIx(user); tip != nil {
+		ixs = append(ixs, tip)
+	}
+	ixs = append(ixs,
+		cuPriceIx(cfg.PrioLamp*1_000_000/uint64(cuLimit)),
 		ataIx(user, user, sig.Mint, tokProg),
 		&genericIx{pid: PumpProgram, dat: data, accs: []*solana.AccountMeta{
 			{PublicKey: PumpGlobal},                             // 0
@@ -1205,7 +1235,7 @@ func doBuy(ctx context.Context, sig Signal) {
 			{PublicKey: FeeProgram},                             // 15
 			{PublicKey: bcV2},                                   // 16 bonding_curve_v2
 		}},
-	}
+	)
 
 	bh := cachedBH(ctx)
 	tx, err := solana.NewTransaction(ixs, bh, solana.TransactionPayer(user))
@@ -1604,10 +1634,15 @@ func doSell(ctx context.Context, p *Position, reason string, cachedState *Bondin
 
 		ixs := []solana.Instruction{
 			cuLimitIx(cuLimit),
-			cuPriceIx(cfg.PrioLampSell * 1_000_000 / uint64(cuLimit)),
+		}
+		if tip := jitoTipIx(user); tip != nil {
+			ixs = append(ixs, tip)
+		}
+		ixs = append(ixs,
+			cuPriceIx(cfg.PrioLampSell*1_000_000/uint64(cuLimit)),
 			&genericIx{pid: PumpProgram, dat: data, accs: sellAccs},
 			closeIx,
-		}
+		)
 
 		bh := cachedBH(ctx) // быстрее, чем GetLatestBlockhash на каждом sell
 		tx, err := solana.NewTransaction(ixs, bh, solana.TransactionPayer(user))
@@ -1837,6 +1872,24 @@ func cuPriceIx(micro uint64) solana.Instruction {
 	d[0] = 3
 	binary.LittleEndian.PutUint64(d[1:], micro)
 	return &genericIx{pid: CUBudget, dat: d}
+}
+
+func jitoTipIx(payer solana.PublicKey) solana.Instruction {
+	if cfg.JitoTipLamp == 0 || cfg.JitoTipAcc.IsZero() {
+		return nil
+	}
+	// SystemProgram::Transfer (index 2), lamports u64 LE
+	d := make([]byte, 12)
+	binary.LittleEndian.PutUint32(d[0:], 2)
+	binary.LittleEndian.PutUint64(d[4:], cfg.JitoTipLamp)
+	return &genericIx{
+		pid: solana.SystemProgramID,
+		accs: []*solana.AccountMeta{
+			{PublicKey: payer, IsSigner: true, IsWritable: true},
+			{PublicKey: cfg.JitoTipAcc, IsWritable: true},
+		},
+		dat: d,
+	}
 }
 
 func ataIx(payer, wallet, mint, tokProg solana.PublicKey) solana.Instruction {

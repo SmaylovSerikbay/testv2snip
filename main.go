@@ -96,6 +96,7 @@ type Config struct {
 	MaxSignalLag   time.Duration // if total lag from signal to send exceeds this, skip buy
 	MinWhaleBuyLam uint64        // min whale buy size to follow (lamports)
 	MinVSRLam      uint64        // min virtual SOL reserve (lamports)
+	MintCD         time.Duration // skip re-buy same mint for this long after attempt/skip
 }
 
 type Signal struct {
@@ -188,8 +189,7 @@ var (
 
 	// Cooldown: skip mints recently attempted (success or fail)
 	cdMu       sync.Mutex
-	cdMap      = map[string]time.Time{} // mint → last attempt
-	cdDuration = 3 * time.Minute
+	cdMap = map[string]time.Time{} // mint → last attempt
 
 	// Buy lifecycle: separate context + waitgroup for in-flight buys
 	buyCtx    context.Context
@@ -419,6 +419,8 @@ func main() {
 		float64(cfg.MinReserve)/1e9, cfg.MaxSessionLoss)
 	log.Printf("[INIT] LagShields: tokeninfo<=%dms signal<=%dms",
 		cfg.MaxTokInfoLag.Milliseconds(), cfg.MaxSignalLag.Milliseconds())
+	log.Printf("[INIT] CopyFilters: whale>=%.2f SOL | minVSR>=%.1f SOL | mintCooldown=%v",
+		float64(cfg.MinWhaleBuyLam)/1e9, float64(cfg.MinVSRLam)/1e9, cfg.MintCD)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -509,8 +511,9 @@ func loadCfg() Config {
 		MaxSignalLag:   250 * time.Millisecond,
 		JitoHTTPURL:    "https://mainnet.block-engine.jito.wtf/api/v1/transactions",
 		JitoHTTPTimeout: 400 * time.Millisecond,
-		MinWhaleBuyLam: 200_000_000,      // 0.2 SOL
-		MinVSRLam:      20_000_000_000,   // 20 SOL liquidity floor
+		MinWhaleBuyLam: 200_000_000,    // 0.2 SOL
+		MinVSRLam:      20_000_000_000, // 20 SOL liquidity floor
+		MintCD:         90 * time.Second,
 	}
 	// EXCLUSIVE HELIUS: никаких иных RPC/WSS (старые эндпойнты полностью отключены)
 	if v := os.Getenv("HELIUS_API_KEY"); v != "" {
@@ -572,6 +575,9 @@ func loadCfg() Config {
 		}
 	}
 	c.MinVSRLam = evU("MIN_VSR_LAMPORTS", c.MinVSRLam)
+	if s := evU("MINT_COOLDOWN_SEC", 0); s > 0 {
+		c.MintCD = time.Duration(s) * time.Second
+	}
 	if m := evU("SCRAPE_INTERVAL_MIN", 0); m > 0 {
 		c.ScrapeIvl = time.Duration(m) * time.Minute
 	}
@@ -1297,7 +1303,7 @@ func runExecutor(ctx context.Context) {
 func mintOnCooldown(mint string) bool {
 	cdMu.Lock()
 	defer cdMu.Unlock()
-	if t, ok := cdMap[mint]; ok && time.Since(t) < cdDuration {
+	if t, ok := cdMap[mint]; ok && time.Since(t) < cfg.MintCD {
 		return true
 	}
 	return false
@@ -1453,8 +1459,11 @@ func doBuy(ctx context.Context, sig Signal) {
 	state, bc := preState, preBC
 	// retry for freshest mints: sometimes bonding curve account isn't readable immediately
 	if preBCErr != nil || state == nil {
-		for i := 0; i < 5; i++ {
-			time.Sleep(40 * time.Millisecond)
+		for i := 0; i < 8; i++ {
+			if cfg.MaxSignalLag > 0 && time.Since(signalT) > cfg.MaxSignalLag-80*time.Millisecond {
+				break
+			}
+			time.Sleep(30 * time.Millisecond)
 			s2, bc2, e2 := readBC(ctx, sig.Mint)
 			if e2 == nil && s2 != nil {
 				state, bc, preBCErr = s2, bc2, nil

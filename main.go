@@ -1091,17 +1091,26 @@ func runMonitor(ctx context.Context) {
 	}
 }
 
+type sellJob struct {
+	mint       string
+	p          *Position
+	reason     string
+	state      *BondingCurve
+	bc         solana.PublicKey
+	pnl        float64
+	profitable bool
+}
+
 func checkAll(ctx context.Context) bool {
 	hasProfit := false
-	posMu.Lock()
-	defer posMu.Unlock()
+	var jobs []sellJob
 
+	posMu.Lock()
 	for mint, p := range pos {
-		// Cooldown между попытками продажи: 5с + 5с за каждый фейл (макс 30с)
 		if !p.LastSellTry.IsZero() {
-			wait := time.Duration(5+p.SellFails*5) * time.Second
-			if wait > 30*time.Second {
-				wait = 30 * time.Second
+			wait := time.Duration(2+p.SellFails*2) * time.Second
+			if wait > 15*time.Second {
+				wait = 15 * time.Second
 			}
 			if time.Since(p.LastSellTry) < wait {
 				continue
@@ -1149,9 +1158,9 @@ func checkAll(ctx context.Context) bool {
 			reason = fmt.Sprintf("TRAIL peak+%.0f%% now+%.0f%%", p.HiPnl*100, pnl*100)
 		case p.HiPnl >= 0.03 && pnl < p.HiPnl-0.02 && pnl <= 0:
 			reason = fmt.Sprintf("SL(trail) %.0f%%", pnl*100)
-		case age >= time.Duration(cfg.TimeKillSec)*time.Second && pnl < cfg.TimeKillMin && pnl > -cfg.SL:
+		case age >= time.Duration(cfg.TimeKillSec)*time.Second && pnl < 0 && pnl > -cfg.SL:
 			reason = fmt.Sprintf("TIMEKILL %ds pnl=%+.1f%%", int(age.Seconds()), pnl*100)
-		case age >= 60*time.Second && pnl < 0 && pnl > -cfg.SL:
+		case age >= 90*time.Second && pnl < 0.02 && pnl > -cfg.SL:
 			reason = fmt.Sprintf("HARDKILL %ds pnl=%+.1f%%", int(age.Seconds()), pnl*100)
 		}
 		if reason == "" {
@@ -1159,20 +1168,26 @@ func checkAll(ctx context.Context) bool {
 		}
 
 		p.LastSellTry = time.Now()
-		profitable := pnl > 0
-		ok := doSell(ctx, p, reason, state, bc)
+		jobs = append(jobs, sellJob{mint, p, reason, state, bc, pnl, pnl > 0})
+	}
+	posMu.Unlock()
+
+	for _, j := range jobs {
+		ok := doSell(ctx, j.p, j.reason, j.state, j.bc)
 		if ok {
-			delete(pos, mint)
-			trackTargetResult(p.Wallet, profitable)
+			removePos(j.mint)
+			trackTargetResult(j.p.Wallet, j.profitable)
 		} else {
-			p.SellFails++
-			if pnl <= -cfg.SL {
-				state2, bc2, err2 := readBC(ctx, p.Mint)
+			posMu.Lock()
+			j.p.SellFails++
+			posMu.Unlock()
+			if j.pnl <= -cfg.SL {
+				state2, bc2, err2 := readBC(ctx, j.p.Mint)
 				if err2 == nil {
-					log.Printf("[MON] Emergency retry sell: %s", short(mint))
-					if doSell(ctx, p, "EMERGENCY", state2, bc2) {
-						delete(pos, mint)
-						trackTargetResult(p.Wallet, false)
+					log.Printf("[MON] Emergency retry: %s", short(j.mint))
+					if doSell(ctx, j.p, "EMERGENCY", state2, bc2) {
+						removePos(j.mint)
+						trackTargetResult(j.p.Wallet, false)
 					}
 				}
 			}

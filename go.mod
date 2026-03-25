@@ -1,6 +1,6 @@
 module pump_sim
 
-go 1.18
+go 1.24
 
 require (
 	github.com/gagliardetto/solana-go v1.12.0

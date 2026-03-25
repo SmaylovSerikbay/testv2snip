@@ -1098,9 +1098,9 @@ func removePos(mint string) {
 }
 
 func confirmTx(ctx context.Context, txSig solana.Signature, tag, mintStr string, onFail func()) {
-	time.Sleep(4 * time.Second)
+	time.Sleep(3 * time.Second)
 
-	for attempt := 0; attempt < 12; attempt++ {
+	for attempt := 0; attempt < 20; attempt++ {
 		rpcWait()
 		statuses, err := rpcCl.GetSignatureStatuses(ctx, false, txSig)
 		if err != nil || len(statuses.Value) == 0 || statuses.Value[0] == nil {
@@ -1122,7 +1122,7 @@ func confirmTx(ctx context.Context, txSig solana.Signature, tag, mintStr string,
 		}
 		time.Sleep(2 * time.Second)
 	}
-	log.Printf("[%s] ⚠ Не подтверждена за 28с: %s | %s", tag, txSig.String()[:12], short(mintStr))
+	log.Printf("[%s] ⚠ Не подтверждена за 43с: %s | %s", tag, txSig.String()[:12], short(mintStr))
 	if onFail != nil {
 		onFail()
 	}
@@ -1393,8 +1393,12 @@ func doSell(ctx context.Context, p *Position, reason string, cachedState *Bondin
 		return true
 	}
 
-	bh := cachedBH(ctx)
-	tx, err := solana.NewTransaction(ixs, bh, solana.TransactionPayer(user))
+	rpcWait()
+	freshBH, bhErr := rpcCl.GetLatestBlockhash(ctx, rpc.CommitmentFinalized)
+	if bhErr != nil {
+		return false
+	}
+	tx, err := solana.NewTransaction(ixs, freshBH.Value.Blockhash, solana.TransactionPayer(user))
 	if err != nil {
 		log.Printf("[SELL] Build: %v | %s", err, short(mintStr))
 		return false
@@ -1408,10 +1412,10 @@ func doSell(ctx context.Context, p *Position, reason string, cachedState *Bondin
 	})
 
 	rpcWait()
-	noRetry := uint(0)
+	sellRetry := uint(2)
 	txSig, err := rpcCl.SendTransactionWithOpts(ctx, tx, rpc.TransactionOpts{
-		SkipPreflight: true,
-		MaxRetries:    &noRetry,
+		SkipPreflight: false,
+		MaxRetries:    &sellRetry,
 	})
 	if err != nil {
 		errMsg := fmt.Sprintf("%v", err)
@@ -1427,10 +1431,27 @@ func doSell(ctx context.Context, p *Position, reason string, cachedState *Bondin
 	savedPos := *p
 	savedPnl := pnl
 	savedMint := mintStr
+	savedTokProg := tokProg
 	go func() {
 		confirmTx(ctx, txSig, "SELL", savedMint, func() {
-			addPos(savedPos.Mint, savedPos.Tokens, savedPos.Spent, savedPos.Wallet, savedPos.TokProg)
-			log.Printf("[SELL] Позиция восстановлена (TX fail): %s", short(savedMint))
+			ata := findATA(cfg.Key.PublicKey(), savedPos.Mint, savedTokProg)
+			rpcWait()
+			bal := getTokenBalance(ctx, ata)
+			if bal == 0 {
+				log.Printf("[SELL] TX не подтверждена, но токены проданы: %s", short(savedMint))
+				recordPnl(savedPnl)
+				return
+			}
+			addPos(savedPos.Mint, bal, savedPos.Spent, savedPos.Wallet, savedPos.TokProg)
+			posMu.Lock()
+			if p, ok := pos[savedMint]; ok {
+				p.Entry = savedPos.Entry
+				p.HiPnl = savedPos.HiPnl
+				p.SellFails = savedPos.SellFails + 1
+				p.LastSellTry = time.Now()
+			}
+			posMu.Unlock()
+			log.Printf("[SELL] Позиция восстановлена: %s (fails=%d, bal=%d)", short(savedMint), savedPos.SellFails+1, bal)
 		})
 		rpcWait()
 		st, err := rpcCl.GetSignatureStatuses(ctx, false, txSig)

@@ -1374,7 +1374,7 @@ func doBuy(ctx context.Context, sig Signal) {
 
 	state, bc := preState, preBC
 	// retry for freshest mints: sometimes bonding curve account isn't readable immediately
-	if (preBCErr != nil || state == nil) && preBCErr != nil && strings.Contains(strings.ToLower(preBCErr.Error()), "not found") {
+	if preBCErr != nil || state == nil {
 		for i := 0; i < 3; i++ {
 			time.Sleep(50 * time.Millisecond)
 			s2, bc2, e2 := readBC(ctx, sig.Mint)
@@ -1402,7 +1402,7 @@ func doBuy(ctx context.Context, sig Signal) {
 		return
 	}
 
-	if state.RTK > 0 && state.Supply > 0 && float64(state.RTK)/float64(state.Supply) < 0.10 {
+	if state.RTK > 0 && state.Supply > 0 && float64(state.RTK)/float64(state.Supply) < 0.05 {
 		log.Printf("[BUY] Skip: low remaining tokens (%.0f%%) | %s",
 			float64(state.RTK)/float64(state.Supply)*100, short(mint))
 		setMintCooldown(mint)
@@ -1528,7 +1528,7 @@ func doBuy(ctx context.Context, sig Signal) {
 					diff := float64(real)/float64(old)*100 - 100
 					log.Printf("[BUY] Баланс скорр.: %s | %d → %d tok (%.0f%%)",
 						short(mint), old, real, diff)
-					if diff < -8 {
+					if diff < -5 {
 						p.BadEntry = true
 						log.Printf("[BUY] ⚠ Плохой вход (%.0f%%), быстрый выход через 10с", diff)
 					}
@@ -1684,6 +1684,8 @@ func checkAll(ctx context.Context) bool {
 		switch {
 		case pnl >= cfg.TP:
 			reason = fmt.Sprintf("TP +%.0f%%", pnl*100)
+		case age <= 5*time.Second && pnl <= -0.08:
+			reason = fmt.Sprintf("EARLYSL %ds pnl=%+.1f%%", int(age.Seconds()), pnl*100)
 		case age <= 15*time.Second && pnl >= 0.05:
 			reason = fmt.Sprintf("QUICKTP %ds +%.0f%%", int(age.Seconds()), pnl*100)
 		case s.p.BadEntry && age >= 10*time.Second && pnl < 0:

@@ -213,6 +213,9 @@ var (
 	rpcErrs  atomic.Int64
 
 	wsRestartCh = make(chan struct{}, 1)
+
+	// Scraper WS → batch getTransaction pipeline
+	scrapeSigCh = make(chan scrapeSig, 2048)
 )
 
 func rpcWait() { <-rpcBucket }
@@ -245,6 +248,11 @@ func isSlippageErr(err error) bool {
 	// common: "custom program error: 0xbc4"
 	s := strings.ToLower(err.Error())
 	return strings.Contains(s, "0xbc4") || strings.Contains(s, "slippage")
+}
+
+type scrapeSig struct {
+	sig      string
+	recvTime time.Time
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -398,12 +406,12 @@ func loadCfg() Config {
 		WalletCD:       5 * time.Second,
 		MaxTokInfoLag:  150 * time.Millisecond,
 	}
+	// EXCLUSIVE HELIUS: никаких иных RPC/WSS (старые эндпойнты полностью отключены)
 	if v := os.Getenv("HELIUS_API_KEY"); v != "" {
 		c.RPC = "https://mainnet.helius-rpc.com/?api-key=" + v
 		c.WSS = "wss://mainnet.helius-rpc.com/?api-key=" + v
 	} else {
-		c.RPC = ev("RPC_URL", "https://api.mainnet-beta.solana.com")
-		c.WSS = ev("WSS_URL", "wss://api.mainnet-beta.solana.com")
+		log.Fatalf("[CFG] HELIUS_API_KEY обязателен (exclusive Helius mode)")
 	}
 	if pk := os.Getenv("SOLANA_PRIVATE_KEY"); pk != "" {
 		k, err := solana.PrivateKeyFromBase58(pk)
@@ -524,22 +532,8 @@ func runRPCHealth(ctx context.Context) {
 			if onHelius {
 				continue
 			}
-			backup := os.Getenv("BACKUP_RPC_URL")
-			backupWSS := os.Getenv("BACKUP_WSS_URL")
-			if backup == "" {
-				continue
-			}
-			rpcMu.Lock()
-			if cfg.RPC != backup {
-				log.Printf("[RPC] High error rate %.0f%% (%d/%d) — switch RPC → backup", rate*100, errs, calls)
-				cfg.RPC = backup
-				if backupWSS != "" {
-					cfg.WSS = backupWSS
-				}
-				rpcCl = rpc.New(cfg.RPC)
-				requestWSRestart()
-			}
-			rpcMu.Unlock()
+			// Exclusive Helius mode: не переключаем RPC вообще, только логируем.
+			log.Printf("[RPC] High error rate %.0f%% (%d/%d) — остаёмся на Helius (exclusive)", rate*100, errs, calls)
 		}
 	}
 }
@@ -607,11 +601,12 @@ func scrape(ctx context.Context) {
 	}
 	freq := map[string]*walletStats{}
 
-	scrapeRPCLive(ctx, freq, myKey)
+	// HIGH-PERF: WS → batch getTransaction (raw HTTP). Убрали последовательный polling GetTransaction.
+	scrapeFromWSBatch(ctx, freq, myKey, 30)
 	scrapeDexEndpoint(ctx, freq, myKey,
-		"https://api.dexscreener.com/token-profiles/latest/v1", 15, "profiles")
+		"https://api.dexscreener.com/token-profiles/latest/v1", 10, "profiles")
 	scrapeDexEndpoint(ctx, freq, myKey,
-		"https://api.dexscreener.com/token-boosts/latest/v1", 10, "boosts")
+		"https://api.dexscreener.com/token-boosts/latest/v1", 8, "boosts")
 
 	now := time.Now()
 	tgtMu.Lock()
@@ -664,68 +659,170 @@ func scrape(ctx context.Context) {
 		time.Since(start).Round(time.Millisecond), len(freq), added, stale, total)
 }
 
-func scrapeRPCLive(ctx context.Context, freq map[string]*walletStats, myKey string) {
-	cutoff := time.Now().Add(-24 * time.Hour).Unix()
-	for _, addr := range []solana.PublicKey{PumpEventAuth, PumpFee} {
-		rpcWait()
-		lim := 50
-		sigs, err := rpcClient().GetSignaturesForAddressWithOpts(ctx, addr,
-			&rpc.GetSignaturesForAddressOpts{Limit: &lim})
-		rpcNote(err)
-		if err != nil {
-			log.Printf("[SCRAPE] RPC %s: err=%v", short(addr.String()), err)
-			continue
-		}
-		if len(sigs) == 0 {
-			log.Printf("[SCRAPE] RPC %s: 0 сигнатур", short(addr.String()))
-			continue
-		}
+// scrapeRPCLive removed: sequential GetTransaction polling disabled (replaced by WS→batch).
 
-		ok, errs, buys := 0, 0, 0
-		for _, s := range sigs {
-			if s.Err != nil {
-				errs++
-				continue
-			}
-			if ok >= 15 {
-				break
-			}
-			ok++
-			te := parseTxEvent(ctx, s.Signature)
-			if te == nil {
-				continue
-			}
-			w := te.User.String()
-			if w == myKey {
-				continue
-			}
-			ws := getWS(freq, w)
-			ws.trades++
-			if te.Timestamp >= cutoff && te.IsBuy && te.Sol > 0 {
-				// эвристика "2x за 24ч": встречали buy >= 0.5 SOL (обычно это уже серьёзный памп)
-				// точного PnL по кошельку здесь не считаем, но цель — расширить набор активных адресов.
-				if te.Sol >= 500_000_000 {
-					ws.win24h2x = true
-				}
-			}
-			if te.IsBuy {
-				buys++
-				ws.mintBuys[te.Mint.String()]++
-				ws.totalBuySOL += te.Sol
-			} else {
-				ws.totalSellSOL += te.Sol
-			}
-		}
-		log.Printf("[SCRAPE] RPC %s: total=%d ok=%d err=%d buys=%d",
-			short(addr.String()), len(sigs), ok, errs, buys)
-		if buys > 0 {
+func scrapeFromWSBatch(ctx context.Context, freq map[string]*walletStats, myKey string, maxTx int) {
+	var sigs []scrapeSig
+	seen := map[string]bool{}
+drain:
+	for len(sigs) < maxTx {
+		select {
+		case <-ctx.Done():
 			return
+		case it := <-scrapeSigCh:
+			if it.sig == "" || seen[it.sig] {
+				continue
+			}
+			seen[it.sig] = true
+			sigs = append(sigs, it)
+		default:
+			break drain
 		}
+	}
+	if len(sigs) == 0 {
+		return
+	}
+
+	// batch getTransaction
+	onlySigs := make([]string, 0, len(sigs))
+	for _, it := range sigs {
+		onlySigs = append(onlySigs, it.sig)
+	}
+	start := time.Now()
+	txs, err := rpcBatchGetTransactions(ctx, cfg.RPC, onlySigs)
+	lat := time.Since(start)
+	if err != nil {
+		log.Printf("[SCRAPE] batch getTransaction err=%v", err)
+		return
+	}
+	log.Printf("[SCRAPE] batch getTransaction: n=%d took=%dms", len(txs), lat.Milliseconds())
+
+	now := time.Now()
+	cutoff24 := now.Add(-24 * time.Hour).Unix()
+	skippedLag := 0
+	for _, tx := range txs {
+		ev := parseTxEventFromMeta(tx.LogMessages)
+		if ev == nil || ev.User.IsZero() || ev.Mint.IsZero() {
+			continue
+		}
+		// latency shield: if event too old, ignore it
+		if ev.Timestamp > 0 {
+			ageMs := now.Sub(time.Unix(ev.Timestamp, 0)).Milliseconds()
+			if ageMs > 250 {
+				skippedLag++
+				continue
+			}
+		}
+		w := ev.User.String()
+		if w == myKey {
+			continue
+		}
+		ws := getWS(freq, w)
+		ws.trades++
+		if ev.Timestamp >= cutoff24 && ev.IsBuy && ev.Sol >= 500_000_000 {
+			ws.win24h2x = true
+		}
+		if ev.IsBuy {
+			ws.mintBuys[ev.Mint.String()]++
+			ws.totalBuySOL += ev.Sol
+		} else {
+			ws.totalSellSOL += ev.Sol
+		}
+	}
+	if skippedLag > 0 {
+		log.Printf("[SCRAPE] Skip: latency shield (%d tx >250ms old)", skippedLag)
 	}
 }
 
+type batchTx struct {
+	Signature   string
+	LogMessages []string
+}
+
+func parseTxEventFromMeta(logs []string) *TradeEvent {
+	for _, l := range logs {
+		if !strings.HasPrefix(l, "Program data: ") {
+			continue
+		}
+		raw, _ := base64.StdEncoding.DecodeString(l[14:])
+		if len(raw) >= 8 && bytes.Equal(raw[:8], tradeDisc[:]) {
+			if ev := parseTE(raw); ev != nil {
+				return ev
+			}
+		}
+	}
+	return nil
+}
+
+func rpcBatchGetTransactions(ctx context.Context, rpcURL string, sigs []string) ([]batchTx, error) {
+	type req struct {
+		JSONRPC string        `json:"jsonrpc"`
+		ID      int           `json:"id"`
+		Method  string        `json:"method"`
+		Params  []any         `json:"params"`
+	}
+	type resp struct {
+		ID     int             `json:"id"`
+		Result json.RawMessage `json:"result"`
+		Error  *struct {
+			Code    int    `json:"code"`
+			Message string `json:"message"`
+		} `json:"error"`
+	}
+	payload := make([]req, 0, len(sigs))
+	for i, s := range sigs {
+		payload = append(payload, req{
+			JSONRPC: "2.0",
+			ID:      i + 1,
+			Method:  "getTransaction",
+			Params: []any{
+				s,
+				map[string]any{
+					"maxSupportedTransactionVersion": 0,
+					"encoding":                       "json",
+					"commitment":                     "confirmed",
+				},
+			},
+		})
+	}
+	b, _ := json.Marshal(payload)
+	hreq, _ := http.NewRequestWithContext(ctx, "POST", rpcURL, bytes.NewReader(b))
+	hreq.Header.Set("Content-Type", "application/json")
+	hreq.Header.Set("Accept", "application/json")
+	r, err := http.DefaultClient.Do(hreq)
+	if err != nil {
+		return nil, err
+	}
+	defer r.Body.Close()
+	body, _ := io.ReadAll(r.Body)
+	if r.StatusCode != 200 {
+		return nil, fmt.Errorf("HTTP %d", r.StatusCode)
+	}
+	var out []resp
+	if json.Unmarshal(body, &out) != nil {
+		return nil, fmt.Errorf("bad json")
+	}
+
+	type txResult struct {
+		Meta *struct {
+			LogMessages []string `json:"logMessages"`
+		} `json:"meta"`
+	}
+	res := make([]batchTx, 0, len(out))
+	for _, it := range out {
+		if it.Error != nil || len(it.Result) == 0 || string(it.Result) == "null" {
+			continue
+		}
+		var tr txResult
+		if json.Unmarshal(it.Result, &tr) != nil || tr.Meta == nil {
+			continue
+		}
+		res = append(res, batchTx{LogMessages: tr.Meta.LogMessages})
+	}
+	return res, nil
+}
+
 func scrapeDexEndpoint(ctx context.Context, freq map[string]*walletStats, myKey, url string, maxCheck int, tag string) {
-	cutoff := time.Now().Add(-24 * time.Hour).Unix()
 	body, err := httpGet(url)
 	if err != nil {
 		log.Printf("[SCRAPE] Dex/%s: %v", tag, err)
@@ -748,46 +845,8 @@ func scrapeDexEndpoint(ctx context.Context, freq map[string]*walletStats, myKey,
 		if err != nil {
 			continue
 		}
-		bc, _, _ := solana.FindProgramAddress([][]byte{[]byte("bonding-curve"), mint.Bytes()}, PumpProgram)
-
-		rpcWait()
-		lim := 20
-		sigs, err := rpcClient().GetSignaturesForAddressWithOpts(ctx, bc, &rpc.GetSignaturesForAddressOpts{Limit: &lim})
-		rpcNote(err)
-		if err != nil || len(sigs) == 0 {
-			continue
-		}
+		_ = mint // kept for future optional per-token validation without RPC
 		checked++
-
-		parsed := 0
-		for _, s := range sigs {
-			if s.Err != nil || parsed >= 5 {
-				continue
-			}
-			te := parseTxEvent(ctx, s.Signature)
-			if te == nil {
-				continue
-			}
-			parsed++
-			w := te.User.String()
-			if w == myKey {
-				continue
-			}
-			ws := getWS(freq, w)
-			ws.trades++
-			if te.Timestamp >= cutoff && te.IsBuy && te.Sol > 0 {
-				if te.Sol >= 500_000_000 {
-					ws.win24h2x = true
-				}
-			}
-			if te.IsBuy {
-				totalBuyers++
-				ws.mintBuys[te.Mint.String()]++
-				ws.totalBuySOL += te.Sol
-			} else {
-				ws.totalSellSOL += te.Sol
-			}
-		}
 	}
 	if checked > 0 || totalBuyers > 0 {
 		log.Printf("[SCRAPE] Dex/%s: %d pump.fun токенов, %d покупателей", tag, checked, totalBuyers)
@@ -814,6 +873,60 @@ type wsMsg struct {
 		Sub    int             `json:"subscription"`
 		Result json.RawMessage `json:"result"`
 	} `json:"params,omitempty"`
+}
+
+// bonding-curve cache updated via WS accountSubscribe
+var (
+	bcMu    sync.RWMutex
+	bcCache = map[string]struct {
+		state *BondingCurve
+		bc    solana.PublicKey
+		ts    time.Time
+	}{}
+)
+
+type wsSubKind int
+
+const (
+	wsSubWalletLogs wsSubKind = iota
+	wsSubPumpLogs
+	wsSubBCAccount
+)
+
+func parseBCData(d []byte) *BondingCurve {
+	if len(d) < 49 {
+		return nil
+	}
+	s := &BondingCurve{
+		VTK:    binary.LittleEndian.Uint64(d[8:]),
+		VSR:    binary.LittleEndian.Uint64(d[16:]),
+		RTK:    binary.LittleEndian.Uint64(d[24:]),
+		RSR:    binary.LittleEndian.Uint64(d[32:]),
+		Supply: binary.LittleEndian.Uint64(d[40:]),
+		Done:   d[48] != 0,
+	}
+	if len(d) >= 81 {
+		copy(s.Creator[:], d[49:81])
+	}
+	if len(d) > 82 {
+		s.Cashback = d[82] != 0
+	}
+	return s
+}
+
+func cachedBCState(mint solana.PublicKey) (*BondingCurve, solana.PublicKey, bool) {
+	key := mint.String()
+	bcMu.RLock()
+	it, ok := bcCache[key]
+	bcMu.RUnlock()
+	if !ok || it.state == nil {
+		return nil, solana.PublicKey{}, false
+	}
+	// считаем свежим, если было обновление < 2s назад
+	if time.Since(it.ts) > 2*time.Second {
+		return nil, solana.PublicKey{}, false
+	}
+	return it.state, it.bc, true
 }
 
 func runWSListener(ctx context.Context) {
@@ -851,6 +964,10 @@ func wsLoop(ctx context.Context) error {
 	subToWallet := map[int]string{}
 	reqToWallet := map[int]string{}
 	subbed := map[string]bool{}
+	subKind := map[int]wsSubKind{}  // subscription id -> kind
+	subToMint := map[int]string{}   // accountSubscribe subID -> mint
+	reqToMint := map[int]string{}   // request id -> mint
+	subbedBC := map[string]bool{}   // mint -> subscribed
 	nextID := 0
 	var writeMu sync.Mutex
 
@@ -880,8 +997,67 @@ func wsLoop(ctx context.Context) error {
 		return added
 	}
 
+	// One global logsSubscribe to pump program → collect tx signatures for batch getTransaction.
+	addPumpSubOnce := func() {
+		for _, k := range subKind {
+			if k == wsSubPumpLogs {
+				return
+			}
+		}
+		nextID++
+		id := nextID
+		writeMu.Lock()
+		_ = conn.WriteJSON(map[string]any{
+			"jsonrpc": "2.0", "id": id,
+			"method": "logsSubscribe",
+			"params": []any{
+				map[string]any{"mentions": []string{PumpProgram.String()}},
+				map[string]any{"commitment": "confirmed"},
+			},
+		})
+		writeMu.Unlock()
+		// mark request id as "pump logs" by storing empty mint and using kind on subID when result arrives
+		reqToMint[id] = "__PUMP__"
+	}
+
+	addBCSubs := func() int {
+		posMu.RLock()
+		defer posMu.RUnlock()
+		added := 0
+		for mintStr, p := range pos {
+			if p == nil {
+				continue
+			}
+			if subbedBC[mintStr] {
+				continue
+			}
+			mint, err := solana.PublicKeyFromBase58(mintStr)
+			if err != nil {
+				continue
+			}
+			bc, _, _ := solana.FindProgramAddress([][]byte{[]byte("bonding-curve"), mint.Bytes()}, PumpProgram)
+			nextID++
+			reqToMint[nextID] = mintStr
+			subbedBC[mintStr] = true
+			added++
+			writeMu.Lock()
+			_ = conn.WriteJSON(map[string]any{
+				"jsonrpc": "2.0", "id": nextID,
+				"method": "accountSubscribe",
+				"params": []any{
+					bc.String(),
+					map[string]any{"encoding": "base64", "commitment": "confirmed"},
+				},
+			})
+			writeMu.Unlock()
+		}
+		return added
+	}
+
 	mu.Lock()
 	addNewSubs()
+	addPumpSubOnce()
+	addBCSubs()
 	count := len(subbed)
 	mu.Unlock()
 	log.Printf("[WS] Подключён, подписки: %d", count)
@@ -904,9 +1080,11 @@ func wsLoop(ctx context.Context) error {
 			case <-wsReconnCh:
 				mu.Lock()
 				added := addNewSubs()
+				addPumpSubOnce()
+				addedBC := addBCSubs()
 				mu.Unlock()
-				if added > 0 {
-					log.Printf("[WS] +%d подписок (без реконнекта), всего %d", added, len(subbed))
+				if added > 0 || addedBC > 0 {
+					log.Printf("[WS] +%d logs, +%d account (без реконнекта)", added, addedBC)
 				}
 			}
 		}
@@ -928,9 +1106,60 @@ func wsLoop(ctx context.Context) error {
 				mu.Lock()
 				if w, ok := reqToWallet[*m.ID]; ok {
 					subToWallet[subID] = w
+					subKind[subID] = wsSubWalletLogs
+				} else if mintStr, ok := reqToMint[*m.ID]; ok {
+					if mintStr == "__PUMP__" {
+						subKind[subID] = wsSubPumpLogs
+					} else {
+						subToMint[subID] = mintStr
+						subKind[subID] = wsSubBCAccount
+					}
 				}
 				mu.Unlock()
 			}
+			continue
+		}
+
+		if m.Method == "accountNotification" && m.Params != nil {
+			mu.Lock()
+			mintStr := subToMint[m.Params.Sub]
+			mu.Unlock()
+			if mintStr == "" {
+				continue
+			}
+			var ar struct {
+				Value struct {
+					Data []any `json:"data"` // ["base64","..."]
+				} `json:"value"`
+			}
+			if json.Unmarshal(m.Params.Result, &ar) != nil || len(ar.Value.Data) == 0 {
+				continue
+			}
+			// first element: base64 string
+			raw, ok := ar.Value.Data[0].(string)
+			if !ok || raw == "" {
+				continue
+			}
+			bin, err := base64.StdEncoding.DecodeString(raw)
+			if err != nil {
+				continue
+			}
+			st := parseBCData(bin)
+			if st == nil {
+				continue
+			}
+			mint, err := solana.PublicKeyFromBase58(mintStr)
+			if err != nil {
+				continue
+			}
+			bc, _, _ := solana.FindProgramAddress([][]byte{[]byte("bonding-curve"), mint.Bytes()}, PumpProgram)
+			bcMu.Lock()
+			bcCache[mintStr] = struct {
+				state *BondingCurve
+				bc    solana.PublicKey
+				ts    time.Time
+			}{state: st, bc: bc, ts: time.Now()}
+			bcMu.Unlock()
 			continue
 		}
 
@@ -939,22 +1168,22 @@ func wsLoop(ctx context.Context) error {
 		}
 
 		mu.Lock()
+		kind := subKind[m.Params.Sub]
 		wallet := subToWallet[m.Params.Sub]
 		mu.Unlock()
-		if wallet == "" {
-			continue
-		}
 
 		tgtMu.RLock()
 		_, active := targets[wallet]
 		tgtMu.RUnlock()
-		if !active {
+		if kind == wsSubWalletLogs && !active {
 			continue
 		}
 
-		tgtMu.Lock()
-		targets[wallet] = time.Now()
-		tgtMu.Unlock()
+		if kind == wsSubWalletLogs {
+			tgtMu.Lock()
+			targets[wallet] = time.Now()
+			tgtMu.Unlock()
+		}
 
 		var lr struct {
 			Value struct {
@@ -967,7 +1196,17 @@ func wsLoop(ctx context.Context) error {
 			continue
 		}
 
-		go parseBuySignal(wallet, lr.Value.Logs)
+		if kind == wsSubPumpLogs {
+			// feed scraper pipeline (we will batch getTransaction later)
+			select {
+			case scrapeSigCh <- scrapeSig{sig: lr.Value.Signature, recvTime: time.Now()}:
+			default:
+			}
+			continue
+		}
+		if kind == wsSubWalletLogs {
+			go parseBuySignal(wallet, lr.Value.Logs)
+		}
 	}
 }
 
@@ -1322,6 +1561,7 @@ func addPos(mint solana.PublicKey, tok, spent uint64, wallet string, tokProg sol
 	posMu.Lock()
 	pos[mint.String()] = &Position{Mint: mint, Tokens: tok, Spent: spent, Entry: time.Now(), Wallet: wallet, TokProg: tokProg}
 	posMu.Unlock()
+	notifyWSReconn() // добавим accountSubscribe на bonding curve без реконнекта
 }
 
 func removePos(mint string) {
@@ -1432,9 +1672,13 @@ func checkAll(ctx context.Context) bool {
 
 	var jobs []sellJob
 	for _, s := range snaps {
-		state, bc, err := readBC(ctx, s.p.Mint)
-		if err != nil {
-			continue
+		state, bc, ok := cachedBCState(s.p.Mint)
+		if !ok {
+			var err error
+			state, bc, err = readBC(ctx, s.p.Mint)
+			if err != nil {
+				continue
+			}
 		}
 		if state.Done {
 			log.Printf("[MON] %s graduated — удаляем", short(s.mint))
@@ -1755,27 +1999,7 @@ func readBC(ctx context.Context, mint solana.PublicKey) (*BondingCurve, solana.P
 	return s, bc, nil
 }
 
-func parseTxEvent(ctx context.Context, sig solana.Signature) *TradeEvent {
-	rpcWait()
-	v := uint64(0)
-	out, err := rpcClient().GetTransaction(ctx, sig, &rpc.GetTransactionOpts{MaxSupportedTransactionVersion: &v})
-	rpcNote(err)
-	if err != nil || out == nil || out.Meta == nil {
-		return nil
-	}
-	for _, l := range out.Meta.LogMessages {
-		if !strings.HasPrefix(l, "Program data: ") {
-			continue
-		}
-		raw, _ := base64.StdEncoding.DecodeString(l[14:])
-		if len(raw) >= 8 && bytes.Equal(raw[:8], tradeDisc[:]) {
-			if ev := parseTE(raw); ev != nil {
-				return ev
-			}
-		}
-	}
-	return nil
-}
+// parseTxEvent removed: scraper no longer uses sequential GetTransaction polling.
 
 func parseTE(d []byte) *TradeEvent {
 	need := 8 + 32 + 8 + 8 + 1 + 32 + 8

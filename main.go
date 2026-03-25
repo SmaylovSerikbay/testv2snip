@@ -77,6 +77,8 @@ type Config struct {
 	PrioLampSell   uint64  // priority fee for SELL (lamports)
 	JitoTipLamp    uint64  // optional: lamports tip via SystemProgram transfer
 	JitoTipAcc     solana.PublicKey
+	JitoHTTP       bool
+	JitoHTTPURL    string
 	TP             float64
 	SL             float64
 	TimeKillSec    int
@@ -214,8 +216,8 @@ var (
 
 	wsRestartCh = make(chan struct{}, 1)
 
-	// Scraper WS → batch getTransaction pipeline
-	scrapeSigCh = make(chan scrapeSig, 2048)
+	// Scraper WS-only pipeline
+	scrapeEvCh  = make(chan scrapeEv, 4096)
 )
 
 func rpcWait() { <-rpcBucket }
@@ -241,6 +243,72 @@ func requestWSRestart() {
 	}
 }
 
+func sendTx(ctx context.Context, tx *solana.Transaction) (solana.Signature, error) {
+	if cfg.JitoHTTP && cfg.JitoHTTPURL != "" {
+		if sig, err := sendTxViaJitoHTTP(ctx, cfg.JitoHTTPURL, tx); err == nil {
+			return sig, nil
+		} else {
+			log.Printf("[JITO] sendTransaction failed, fallback to RPC: %v", err)
+		}
+	}
+	rpcWait()
+	noRetry := uint(0)
+	sig, err := rpcClient().SendTransactionWithOpts(ctx, tx, rpc.TransactionOpts{
+		SkipPreflight: true,
+		MaxRetries:    &noRetry,
+	})
+	rpcNote(err)
+	return sig, err
+}
+
+func sendTxViaJitoHTTP(ctx context.Context, url string, tx *solana.Transaction) (solana.Signature, error) {
+	bin, err := tx.MarshalBinary()
+	if err != nil {
+		return solana.Signature{}, err
+	}
+	b64 := base64.StdEncoding.EncodeToString(bin)
+	reqBody, _ := json.Marshal(map[string]any{
+		"id":      1,
+		"jsonrpc": "2.0",
+		"method":  "sendTransaction",
+		"params": []any{
+			b64,
+			map[string]any{"encoding": "base64"},
+		},
+	})
+	hreq, _ := http.NewRequestWithContext(ctx, "POST", url, bytes.NewReader(reqBody))
+	hreq.Header.Set("Content-Type", "application/json")
+	hreq.Header.Set("Accept", "application/json")
+	c := &http.Client{Timeout: 3 * time.Second}
+	r, err := c.Do(hreq)
+	if err != nil {
+		return solana.Signature{}, err
+	}
+	defer r.Body.Close()
+	body, _ := io.ReadAll(r.Body)
+	if r.StatusCode != 200 {
+		return solana.Signature{}, fmt.Errorf("HTTP %d", r.StatusCode)
+	}
+	var out struct {
+		Result string `json:"result"`
+		Error  *struct {
+			Code    int    `json:"code"`
+			Message string `json:"message"`
+		} `json:"error"`
+	}
+	if json.Unmarshal(body, &out) != nil {
+		return solana.Signature{}, fmt.Errorf("bad json")
+	}
+	if out.Error != nil {
+		return solana.Signature{}, fmt.Errorf("jito err %d: %s", out.Error.Code, out.Error.Message)
+	}
+	sig, err := solana.SignatureFromBase58(out.Result)
+	if err != nil {
+		return solana.Signature{}, err
+	}
+	return sig, nil
+}
+
 func isSlippageErr(err error) bool {
 	if err == nil {
 		return false
@@ -250,8 +318,8 @@ func isSlippageErr(err error) bool {
 	return strings.Contains(s, "0xbc4") || strings.Contains(s, "slippage")
 }
 
-type scrapeSig struct {
-	sig      string
+type scrapeEv struct {
+	ev       *TradeEvent
 	recvTime time.Time
 }
 
@@ -405,6 +473,7 @@ func loadCfg() Config {
 		MaxSessionLoss: 30.0,        // -30%
 		WalletCD:       5 * time.Second,
 		MaxTokInfoLag:  150 * time.Millisecond,
+		JitoHTTPURL:    "https://mainnet.block-engine.jito.wtf/api/v1/transactions",
 	}
 	// EXCLUSIVE HELIUS: никаких иных RPC/WSS (старые эндпойнты полностью отключены)
 	if v := os.Getenv("HELIUS_API_KEY"); v != "" {
@@ -433,6 +502,10 @@ func loadCfg() Config {
 	c.MinReserve = evU("MIN_BALANCE_RESERVE", c.MinReserve)
 	c.MaxSessionLoss = evF("MAX_SESSION_LOSS_PCT", c.MaxSessionLoss)
 	c.JitoTipLamp = evU("JITO_TIP_LAMPORTS", c.JitoTipLamp)
+	c.JitoHTTP = ev("JITO_HTTP_SEND", "0") == "1"
+	if u := os.Getenv("JITO_HTTP_URL"); u != "" {
+		c.JitoHTTPURL = u
+	}
 	if a := os.Getenv("JITO_TIP_ACCOUNT"); a != "" {
 		if pk, err := solana.PublicKeyFromBase58(a); err == nil {
 			c.JitoTipAcc = pk
@@ -602,7 +675,7 @@ func scrape(ctx context.Context) {
 	freq := map[string]*walletStats{}
 
 	// HIGH-PERF: WS → batch getTransaction (raw HTTP). Убрали последовательный polling GetTransaction.
-	scrapeFromWSBatch(ctx, freq, myKey, 30)
+	scrapeFromWSEvents(freq, myKey, 250*time.Millisecond, 4000)
 	scrapeDexEndpoint(ctx, freq, myKey,
 		"https://api.dexscreener.com/token-profiles/latest/v1", 10, "profiles")
 	scrapeDexEndpoint(ctx, freq, myKey,
@@ -659,168 +732,68 @@ func scrape(ctx context.Context) {
 		time.Since(start).Round(time.Millisecond), len(freq), added, stale, total)
 }
 
-// scrapeRPCLive removed: sequential GetTransaction polling disabled (replaced by WS→batch).
+// scrapeRPCLive removed: sequential GetTransaction polling disabled (WS-only).
 
-func scrapeFromWSBatch(ctx context.Context, freq map[string]*walletStats, myKey string, maxTx int) {
-	var sigs []scrapeSig
-	seen := map[string]bool{}
-drain:
-	for len(sigs) < maxTx {
+func scrapeFromWSEvents(freq map[string]*walletStats, myKey string, maxAge time.Duration, maxDrain int) {
+	now := time.Now()
+	drained := 0
+	skippedLag := 0
+	for drained < maxDrain {
 		select {
-		case <-ctx.Done():
-			return
-		case it := <-scrapeSigCh:
-			if it.sig == "" || seen[it.sig] {
+		case it := <-scrapeEvCh:
+			drained++
+			if it.ev == nil || it.ev.User.IsZero() || it.ev.Mint.IsZero() {
 				continue
 			}
-			seen[it.sig] = true
-			sigs = append(sigs, it)
-		default:
-			break drain
-		}
-	}
-	if len(sigs) == 0 {
-		return
-	}
-
-	// batch getTransaction
-	onlySigs := make([]string, 0, len(sigs))
-	for _, it := range sigs {
-		onlySigs = append(onlySigs, it.sig)
-	}
-	start := time.Now()
-	txs, err := rpcBatchGetTransactions(ctx, cfg.RPC, onlySigs)
-	lat := time.Since(start)
-	if err != nil {
-		log.Printf("[SCRAPE] batch getTransaction err=%v", err)
-		return
-	}
-	log.Printf("[SCRAPE] batch getTransaction: n=%d took=%dms", len(txs), lat.Milliseconds())
-
-	now := time.Now()
-	cutoff24 := now.Add(-24 * time.Hour).Unix()
-	skippedLag := 0
-	for _, tx := range txs {
-		ev := parseTxEventFromMeta(tx.LogMessages)
-		if ev == nil || ev.User.IsZero() || ev.Mint.IsZero() {
-			continue
-		}
-		// latency shield: if event too old, ignore it
-		if ev.Timestamp > 0 {
-			ageMs := now.Sub(time.Unix(ev.Timestamp, 0)).Milliseconds()
-			if ageMs > 250 {
+			if maxAge > 0 && now.Sub(it.recvTime) > maxAge {
 				skippedLag++
 				continue
 			}
-		}
-		w := ev.User.String()
-		if w == myKey {
-			continue
-		}
-		ws := getWS(freq, w)
-		ws.trades++
-		if ev.Timestamp >= cutoff24 && ev.IsBuy && ev.Sol >= 500_000_000 {
-			ws.win24h2x = true
-		}
-		if ev.IsBuy {
-			ws.mintBuys[ev.Mint.String()]++
-			ws.totalBuySOL += ev.Sol
-		} else {
-			ws.totalSellSOL += ev.Sol
+			w := it.ev.User.String()
+			if w == myKey {
+				continue
+			}
+			ws := getWS(freq, w)
+			ws.trades++
+			if it.ev.IsBuy && it.ev.Sol >= 500_000_000 {
+				ws.win24h2x = true
+			}
+			if it.ev.IsBuy {
+				ws.mintBuys[it.ev.Mint.String()]++
+				ws.totalBuySOL += it.ev.Sol
+			} else {
+				ws.totalSellSOL += it.ev.Sol
+			}
+		default:
+			drained = maxDrain
 		}
 	}
 	if skippedLag > 0 {
-		log.Printf("[SCRAPE] Skip: latency shield (%d tx >250ms old)", skippedLag)
+		log.Printf("[SCRAPE] Skip: latency shield (%d ws-events >%dms old)", skippedLag, maxAge.Milliseconds())
 	}
 }
 
-type batchTx struct {
-	Signature   string
-	LogMessages []string
-}
-
-func parseTxEventFromMeta(logs []string) *TradeEvent {
+func parseTradeFromLogs(logs []string) *TradeEvent {
+	hasPump := false
+	var evData []byte
 	for _, l := range logs {
-		if !strings.HasPrefix(l, "Program data: ") {
-			continue
+		if strings.Contains(l, PumpProgram.String()) && strings.Contains(l, "invoke") {
+			hasPump = true
 		}
-		raw, _ := base64.StdEncoding.DecodeString(l[14:])
-		if len(raw) >= 8 && bytes.Equal(raw[:8], tradeDisc[:]) {
-			if ev := parseTE(raw); ev != nil {
-				return ev
+		if strings.HasPrefix(l, "Program data: ") {
+			raw, _ := base64.StdEncoding.DecodeString(l[14:])
+			if len(raw) >= 8 && bytes.Equal(raw[:8], tradeDisc[:]) {
+				evData = raw
 			}
 		}
 	}
-	return nil
+	if !hasPump || evData == nil {
+		return nil
+	}
+	return parseTE(evData)
 }
 
-func rpcBatchGetTransactions(ctx context.Context, rpcURL string, sigs []string) ([]batchTx, error) {
-	type req struct {
-		JSONRPC string        `json:"jsonrpc"`
-		ID      int           `json:"id"`
-		Method  string        `json:"method"`
-		Params  []any         `json:"params"`
-	}
-	type resp struct {
-		ID     int             `json:"id"`
-		Result json.RawMessage `json:"result"`
-		Error  *struct {
-			Code    int    `json:"code"`
-			Message string `json:"message"`
-		} `json:"error"`
-	}
-	payload := make([]req, 0, len(sigs))
-	for i, s := range sigs {
-		payload = append(payload, req{
-			JSONRPC: "2.0",
-			ID:      i + 1,
-			Method:  "getTransaction",
-			Params: []any{
-				s,
-				map[string]any{
-					"maxSupportedTransactionVersion": 0,
-					"encoding":                       "json",
-					"commitment":                     "confirmed",
-				},
-			},
-		})
-	}
-	b, _ := json.Marshal(payload)
-	hreq, _ := http.NewRequestWithContext(ctx, "POST", rpcURL, bytes.NewReader(b))
-	hreq.Header.Set("Content-Type", "application/json")
-	hreq.Header.Set("Accept", "application/json")
-	r, err := http.DefaultClient.Do(hreq)
-	if err != nil {
-		return nil, err
-	}
-	defer r.Body.Close()
-	body, _ := io.ReadAll(r.Body)
-	if r.StatusCode != 200 {
-		return nil, fmt.Errorf("HTTP %d", r.StatusCode)
-	}
-	var out []resp
-	if json.Unmarshal(body, &out) != nil {
-		return nil, fmt.Errorf("bad json")
-	}
-
-	type txResult struct {
-		Meta *struct {
-			LogMessages []string `json:"logMessages"`
-		} `json:"meta"`
-	}
-	res := make([]batchTx, 0, len(out))
-	for _, it := range out {
-		if it.Error != nil || len(it.Result) == 0 || string(it.Result) == "null" {
-			continue
-		}
-		var tr txResult
-		if json.Unmarshal(it.Result, &tr) != nil || tr.Meta == nil {
-			continue
-		}
-		res = append(res, batchTx{LogMessages: tr.Meta.LogMessages})
-	}
-	return res, nil
-}
+// batch getTransaction removed (zero-RPC scraper).
 
 func scrapeDexEndpoint(ctx context.Context, freq map[string]*walletStats, myKey, url string, maxCheck int, tag string) {
 	body, err := httpGet(url)
@@ -997,7 +970,7 @@ func wsLoop(ctx context.Context) error {
 		return added
 	}
 
-	// One global logsSubscribe to pump program → collect tx signatures for batch getTransaction.
+		// One global logsSubscribe to pump program.
 	addPumpSubOnce := func() {
 		for _, k := range subKind {
 			if k == wsSubPumpLogs {
@@ -1016,7 +989,7 @@ func wsLoop(ctx context.Context) error {
 			},
 		})
 		writeMu.Unlock()
-		// mark request id as "pump logs" by storing empty mint and using kind on subID when result arrives
+		// mark request id as "pump logs"
 		reqToMint[id] = "__PUMP__"
 	}
 
@@ -1197,10 +1170,23 @@ func wsLoop(ctx context.Context) error {
 		}
 
 		if kind == wsSubPumpLogs {
-			// feed scraper pipeline (we will batch getTransaction later)
-			select {
-			case scrapeSigCh <- scrapeSig{sig: lr.Value.Signature, recvTime: time.Now()}:
-			default:
+			// ZERO-RPC: фильтруем BUY и парсим TradeEvent прямо из logs.
+			now := time.Now()
+			isBuy := false
+			for _, l := range lr.Value.Logs {
+				if l == "Program log: Instruction: Buy" {
+					isBuy = true
+					break
+				}
+			}
+			if !isBuy {
+				continue
+			}
+			if ev := parseTradeFromLogs(lr.Value.Logs); ev != nil && ev.IsBuy {
+				select {
+				case scrapeEvCh <- scrapeEv{ev: ev, recvTime: now}:
+				default:
+				}
 			}
 			continue
 		}
@@ -1211,27 +1197,17 @@ func wsLoop(ctx context.Context) error {
 }
 
 func parseBuySignal(wallet string, logs []string) {
-	hasPump, isBuy := false, false
-	var evData []byte
-
+	isBuy := false
 	for _, l := range logs {
-		if strings.Contains(l, PumpProgram.String()) && strings.Contains(l, "invoke") {
-			hasPump = true
-		}
 		if l == "Program log: Instruction: Buy" {
 			isBuy = true
-		}
-		if strings.HasPrefix(l, "Program data: ") {
-			raw, _ := base64.StdEncoding.DecodeString(l[14:])
-			if len(raw) >= 8 && bytes.Equal(raw[:8], tradeDisc[:]) {
-				evData = raw
-			}
+			break
 		}
 	}
-	if !hasPump || !isBuy || evData == nil {
+	if !isBuy {
 		return
 	}
-	ev := parseTE(evData)
+	ev := parseTradeFromLogs(logs)
 	if ev == nil || ev.User.String() != wallet {
 		return
 	}
@@ -1508,13 +1484,7 @@ func doBuy(ctx context.Context, sig Signal) {
 		return
 	}
 
-	rpcWait()
-	noRetry := uint(0)
-	txSig, err := rpcClient().SendTransactionWithOpts(ctx, tx, rpc.TransactionOpts{
-		SkipPreflight: true,
-		MaxRetries:    &noRetry,
-	})
-	rpcNote(err)
+	txSig, err := sendTx(ctx, tx)
 	if err != nil {
 		errMsg := fmt.Sprintf("%v", err)
 		if len(errMsg) > 200 {
@@ -1902,13 +1872,7 @@ func doSell(ctx context.Context, p *Position, reason string, cachedState *Bondin
 			return nil
 		})
 
-		rpcWait()
-		sellRetry := uint(0)
-		txSig, err := rpcClient().SendTransactionWithOpts(ctx, tx, rpc.TransactionOpts{
-			SkipPreflight: true,
-			MaxRetries:    &sellRetry,
-		})
-		rpcNote(err)
+		txSig, err := sendTx(ctx, tx)
 
 		if err != nil {
 			if isSlippageErr(err) && attempt < len(trySlips)-1 {

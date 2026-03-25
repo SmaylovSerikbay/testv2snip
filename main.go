@@ -317,7 +317,9 @@ func isSlippageErr(err error) bool {
 	}
 	// common: "custom program error: 0xbc4"
 	s := strings.ToLower(err.Error())
-	return strings.Contains(s, "0xbc4") || strings.Contains(s, "slippage")
+	// 0xbc4: classic slippage error
+	// custom:6003: часто означает, что min_sol_out/min constraints не прошли (по сути тоже slippage на выходе)
+	return strings.Contains(s, "0xbc4") || strings.Contains(s, "slippage") || strings.Contains(s, "custom:6003")
 }
 
 func isBuyCustomErr6042(err error) bool {

@@ -222,7 +222,10 @@ var (
 	statWins   atomic.Int64
 	statLosses atomic.Int64
 	statPnlMu  sync.Mutex
-	statPnlSum float64
+	// Реализованный PnL сессии в lamports (сумма (solNet−spent) по закрытым сделкам).
+	statPnlLamports int64
+	// Баланс кошелька при старте бота — база для MAX_SESSION_LOSS_PCT (0 = ещё не задан).
+	sessionRefLamports uint64
 
 	circuitOpen atomic.Bool // session PnL circuit breaker
 
@@ -441,7 +444,7 @@ func main() {
 		cfg.Slip, cfg.SellSlip, float64(cfg.PrioLamp)/1e9, float64(cfg.PrioLampSell)/1e9)
 	log.Printf("[INIT] MaxTargets %d | MaxPos %d | Scrape %v | Monitor %dms",
 		cfg.MaxTargets, cfg.MaxPositions, cfg.ScrapeIvl, cfg.MonitorMs)
-	log.Printf("[INIT] MinReserve %.4f SOL | MaxSessionLoss -%.0f%%",
+	log.Printf("[INIT] MinReserve %.4f SOL | MaxSessionLoss -%.0f%% (от стартового баланса, не сумма %% по сделкам)",
 		float64(cfg.MinReserve)/1e9, cfg.MaxSessionLoss)
 	log.Printf("[INIT] LagShields: tokeninfo<=%dms signal<=%dms",
 		cfg.MaxTokInfoLag.Milliseconds(), cfg.MaxSignalLag.Milliseconds())
@@ -460,6 +463,7 @@ func main() {
 		rpcNote(err)
 		if err == nil {
 			log.Printf("[INIT] Баланс: %.6f SOL", float64(b.Value)/1e9)
+			initSessionRefBalance(b.Value)
 		}
 	}
 
@@ -1435,12 +1439,9 @@ func doBuy(ctx context.Context, sig Signal) {
 	tgtCDMap[sig.Wallet] = time.Now()
 	tgtCDMu.Unlock()
 
-	statPnlMu.Lock()
-	sessionPnl := statPnlSum
-	statPnlMu.Unlock()
-	if sessionPnl <= -cfg.MaxSessionLoss {
+	if sp := sessionPnlPct(); sp <= -cfg.MaxSessionLoss {
 		circuitOpen.Store(true)
-		log.Printf("[BUY] Skip: session PnL breaker (%.1f%% <= -%.0f%%) — торговля остановлена", sessionPnl, cfg.MaxSessionLoss)
+		log.Printf("[BUY] Skip: session PnL breaker (%.2f%% от старта <= -%.0f%%) — торговля остановлена", sp, cfg.MaxSessionLoss)
 		return
 	}
 
@@ -2049,7 +2050,7 @@ func doSell(ctx context.Context, p *Position, reason string, cachedState *Bondin
 		log.Printf("[SELL][PAPER] %s | %s | PnL %+.1f%% | %.6f SOL",
 			reason, short(mintStr), pnl, float64(solNet)/1e9)
 		statSells.Add(1)
-		recordPnl(pnl)
+		recordPnl(p.Spent, solNet)
 		return true
 	}
 
@@ -2108,7 +2109,8 @@ func doSell(ctx context.Context, p *Position, reason string, cachedState *Bondin
 		statSells.Add(1)
 
 	savedPos := *p
-	savedPnl := pnl
+	savedSpent := p.Spent
+	savedSolNet := solNet
 	savedMint := mintStr
 	savedTokProg := tokProg
 	go func() {
@@ -2118,7 +2120,7 @@ func doSell(ctx context.Context, p *Position, reason string, cachedState *Bondin
 			bal := getTokenBalance(ctx, ata)
 			if bal == 0 {
 				log.Printf("[SELL] TX не подтверждена, но токены проданы: %s", short(savedMint))
-				recordPnl(savedPnl)
+				recordPnl(savedSpent, savedSolNet)
 				return
 			}
 			addPos(savedPos.Mint, bal, savedPos.Spent, savedPos.Wallet, savedPos.TokProg)
@@ -2136,7 +2138,7 @@ func doSell(ctx context.Context, p *Position, reason string, cachedState *Bondin
 		st, err := rpcClient().GetSignatureStatuses(ctx, false, txSig)
 		rpcNote(err)
 		if err == nil && len(st.Value) > 0 && st.Value[0] != nil && st.Value[0].Err == nil {
-			recordPnl(savedPnl)
+			recordPnl(savedSpent, savedSolNet)
 		}
 	}()
 		return true
@@ -2341,19 +2343,54 @@ func short(s string) string {
 	return s[:4] + ".." + s[len(s)-4:]
 }
 
-func recordPnl(pnlPct float64) {
-	if pnlPct > 0 {
+func initSessionRefBalance(lamports uint64) {
+	statPnlMu.Lock()
+	defer statPnlMu.Unlock()
+	if sessionRefLamports != 0 || lamports == 0 {
+		return
+	}
+	sessionRefLamports = lamports
+	log.Printf("[INIT] База session PnL: %.6f SOL (circuit при накопленном убытке ≥%.0f%% от этой суммы)",
+		float64(lamports)/1e9, cfg.MaxSessionLoss)
+}
+
+// sessionPnlPct — реализованный PnL сессии в %% от баланса при старте (не сумма %% по сделкам).
+func sessionPnlPct() float64 {
+	statPnlMu.Lock()
+	defer statPnlMu.Unlock()
+	if sessionRefLamports == 0 {
+		return 0
+	}
+	return 100 * float64(statPnlLamports) / float64(sessionRefLamports)
+}
+
+// recordPnl учитывает оценку выхода: solNet (lamports) минус spent на входе.
+func recordPnl(spent uint64, solNet uint64) {
+	if spent == 0 {
+		return
+	}
+	delta := int64(solNet) - int64(spent)
+	tradePct := float64(solNet)/float64(spent)*100 - 100
+	if tradePct > 0 {
 		statWins.Add(1)
 	} else {
 		statLosses.Add(1)
 	}
+
 	statPnlMu.Lock()
-	statPnlSum += pnlPct
-	pnl := statPnlSum
+	statPnlLamports += delta
+	lam := statPnlLamports
+	ref := sessionRefLamports
 	statPnlMu.Unlock()
-	if pnl <= -cfg.MaxSessionLoss && !circuitOpen.Load() {
+
+	if ref == 0 || cfg.MaxSessionLoss <= 0 {
+		return
+	}
+	pct := 100 * float64(lam) / float64(ref)
+	if pct <= -cfg.MaxSessionLoss && !circuitOpen.Load() {
 		circuitOpen.Store(true)
-		log.Printf("[CIRCUIT] Session PnL %.1f%% <= -%.0f%% — торговля остановлена!", pnl, cfg.MaxSessionLoss)
+		log.Printf("[CIRCUIT] Session PnL %.2f%% от старта (Σ≈%+.6f SOL) ≤ -%.0f%% — торговля остановлена!",
+			pct, float64(lam)/1e9, cfg.MaxSessionLoss)
 	}
 }
 
@@ -2361,8 +2398,10 @@ func printStats() {
 	w := statWins.Load()
 	l := statLosses.Load()
 	total := w + l
+	sessPct := sessionPnlPct()
 	statPnlMu.Lock()
-	pnl := statPnlSum
+	lam := statPnlLamports
+	ref := sessionRefLamports
 	statPnlMu.Unlock()
 	wr := float64(0)
 	if total > 0 {
@@ -2380,8 +2419,12 @@ func printStats() {
 			balStr = fmt.Sprintf(" | Bal=%.4f SOL", float64(b.Value)/1e9)
 		}
 	}
-	log.Printf("[STAT] Wins=%d Losses=%d WR=%.0f%% | PnL=%+.1f%% | Open=%d | Buys=%d Sells=%d%s",
-		w, l, wr, pnl, open, statBuys.Load(), statSells.Load(), balStr)
+	sessExtra := ""
+	if ref > 0 {
+		sessExtra = fmt.Sprintf(" (sess %+.4f SOL)", float64(lam)/1e9)
+	}
+	log.Printf("[STAT] Wins=%d Losses=%d WR=%.0f%% | PnL=%+.2f%% от старта%s | Open=%d | Buys=%d Sells=%d%s",
+		w, l, wr, sessPct, sessExtra, open, statBuys.Load(), statSells.Load(), balStr)
 }
 
 func runStats(ctx context.Context) {

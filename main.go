@@ -472,7 +472,7 @@ func loadCfg() Config {
 		MinReserve:     15_000_000,  // 0.015 SOL
 		MaxSessionLoss: 30.0,        // -30%
 		WalletCD:       5 * time.Second,
-		MaxTokInfoLag:  150 * time.Millisecond,
+		MaxTokInfoLag:  500 * time.Millisecond,
 		JitoHTTPURL:    "https://mainnet.block-engine.jito.wtf/api/v1/transactions",
 	}
 	// EXCLUSIVE HELIUS: никаких иных RPC/WSS (старые эндпойнты полностью отключены)
@@ -674,8 +674,9 @@ func scrape(ctx context.Context) {
 	}
 	freq := map[string]*walletStats{}
 
-	// HIGH-PERF: WS → batch getTransaction (raw HTTP). Убрали последовательный polling GetTransaction.
-	scrapeFromWSEvents(freq, myKey, 250*time.Millisecond, 4000)
+	// ZERO-RPC: цели набираем из WS логов. Для targets не ограничиваем по maxAge,
+	// иначе при scrape-цикле в минуты все события будут "старее 250ms".
+	scrapeFromWSEvents(freq, myKey, 0, 4000)
 	scrapeDexEndpoint(ctx, freq, myKey,
 		"https://api.dexscreener.com/token-profiles/latest/v1", 10, "profiles")
 	scrapeDexEndpoint(ctx, freq, myKey,
@@ -1372,6 +1373,17 @@ func doBuy(ctx context.Context, sig Signal) {
 	}
 
 	state, bc := preState, preBC
+	// retry for freshest mints: sometimes bonding curve account isn't readable immediately
+	if (preBCErr != nil || state == nil) && preBCErr != nil && strings.Contains(strings.ToLower(preBCErr.Error()), "not found") {
+		for i := 0; i < 3; i++ {
+			time.Sleep(50 * time.Millisecond)
+			s2, bc2, e2 := readBC(ctx, sig.Mint)
+			if e2 == nil && s2 != nil {
+				state, bc, preBCErr = s2, bc2, nil
+				break
+			}
+		}
+	}
 	if preBCErr != nil || state == nil || state.Done {
 		if preBCErr != nil {
 			log.Printf("[BUY] Skip: bonding curve error (%v) | %s", preBCErr, short(mint))
@@ -1390,7 +1402,7 @@ func doBuy(ctx context.Context, sig Signal) {
 		return
 	}
 
-	if state.RTK > 0 && state.Supply > 0 && float64(state.RTK)/float64(state.Supply) < 0.20 {
+	if state.RTK > 0 && state.Supply > 0 && float64(state.RTK)/float64(state.Supply) < 0.10 {
 		log.Printf("[BUY] Skip: low remaining tokens (%.0f%%) | %s",
 			float64(state.RTK)/float64(state.Supply)*100, short(mint))
 		setMintCooldown(mint)

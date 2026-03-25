@@ -776,6 +776,9 @@ func parseBuySignal(wallet string, logs []string) {
 	if ev == nil || ev.User.String() != wallet {
 		return
 	}
+	if ev.Sol < 10_000_000 {
+		return
+	}
 
 	select {
 	case signalCh <- Signal{Mint: ev.Mint, Wallet: wallet}:
@@ -864,22 +867,49 @@ func doBuy(ctx context.Context, sig Signal) {
 	tgtCDMap[sig.Wallet] = time.Now()
 	tgtCDMu.Unlock()
 
-	rpcWait()
-	bal, bErr := rpcCl.GetBalance(ctx, cfg.Key.PublicKey(), rpc.CommitmentConfirmed)
-	if bErr == nil && bal.Value < cfg.BuyLamp+3_000_000 {
-		log.Printf("[BUY] Баланс слишком мал: %.4f SOL — пропуск", float64(bal.Value)/1e9)
+	log.Printf("[BUY] Сигнал: %s от %s", short(mint), short(sig.Wallet))
+
+	var (
+		preBal    uint64
+		preBalOK  bool
+		preTokPrg solana.PublicKey
+		preState  *BondingCurve
+		preBC     solana.PublicKey
+		preBCErr  error
+	)
+	var pwg sync.WaitGroup
+	pwg.Add(3)
+	go func() {
+		defer pwg.Done()
+		rpcWait()
+		b, err := rpcCl.GetBalance(ctx, cfg.Key.PublicKey(), rpc.CommitmentConfirmed)
+		if err == nil {
+			preBal = b.Value
+			preBalOK = true
+		}
+	}()
+	go func() {
+		defer pwg.Done()
+		preTokPrg = getMintTokenProgram(ctx, sig.Mint)
+	}()
+	go func() {
+		defer pwg.Done()
+		preState, preBC, preBCErr = readBC(ctx, sig.Mint)
+	}()
+	pwg.Wait()
+
+	if preBalOK && preBal < cfg.BuyLamp+3_000_000 {
+		log.Printf("[BUY] Баланс слишком мал: %.4f SOL — пропуск", float64(preBal)/1e9)
 		return
 	}
 
-	log.Printf("[BUY] Сигнал: %s от %s", short(mint), short(sig.Wallet))
-
-	tokProg := getMintTokenProgram(ctx, sig.Mint)
+	tokProg := preTokPrg
 	if tokProg == Token2022 {
 		log.Printf("[BUY] Token-2022: %s", short(mint))
 	}
 
-	state, bc, err := readBC(ctx, sig.Mint)
-	if err != nil || state.Done {
+	state, bc := preState, preBC
+	if preBCErr != nil || state == nil || state.Done {
 		setMintCooldown(mint)
 		return
 	}
@@ -889,7 +919,6 @@ func doBuy(ctx context.Context, sig Signal) {
 		return
 	}
 
-	// Не входить если осталось <20% токенов (bonding curve почти завершена — опасно)
 	if state.RTK > 0 && state.Supply > 0 && float64(state.RTK)/float64(state.Supply) < 0.20 {
 		setMintCooldown(mint)
 		return
@@ -1070,7 +1099,7 @@ func confirmTx(ctx context.Context, txSig solana.Signature, tag, mintStr string,
 
 func runMonitor(ctx context.Context) {
 	normalInterval := time.Duration(cfg.MonitorMs) * time.Millisecond
-	fastInterval := 500 * time.Millisecond
+	fastInterval := 250 * time.Millisecond
 	t := time.NewTicker(normalInterval)
 	defer t.Stop()
 	fast := false
@@ -1103,9 +1132,16 @@ type sellJob struct {
 
 func checkAll(ctx context.Context) bool {
 	hasProfit := false
-	var jobs []sellJob
+
+	type posSnap struct {
+		mint   string
+		p      *Position
+		tokens uint64
+		spent  uint64
+	}
 
 	posMu.Lock()
+	var snaps []posSnap
 	for mint, p := range pos {
 		if !p.LastSellTry.IsZero() {
 			wait := time.Duration(2+p.SellFails*2) * time.Second
@@ -1116,32 +1152,35 @@ func checkAll(ctx context.Context) bool {
 				continue
 			}
 		}
-
 		if p.SellFails >= 7 {
 			log.Printf("[MON] %s удалена (7 неудачных sell)", short(mint))
 			delete(pos, mint)
 			continue
 		}
+		snaps = append(snaps, posSnap{mint, p, p.Tokens, p.Spent})
+	}
+	posMu.Unlock()
 
-		state, bc, err := readBC(ctx, p.Mint)
+	var jobs []sellJob
+	for _, s := range snaps {
+		state, bc, err := readBC(ctx, s.p.Mint)
 		if err != nil {
 			continue
 		}
 		if state.Done {
-			log.Printf("[MON] %s graduated — удаляем", short(mint))
-			delete(pos, mint)
+			log.Printf("[MON] %s graduated — удаляем", short(s.mint))
+			removePos(s.mint)
 			continue
 		}
 
-		solOut := calcSolOut(state.VTK, state.VSR, p.Tokens)
+		solOut := calcSolOut(state.VTK, state.VSR, s.tokens)
 		solNet := solOut - solOut/100
-		pnl := float64(solNet)/float64(p.Spent) - 1.0
-		age := time.Since(p.Entry)
+		pnl := float64(solNet)/float64(s.spent) - 1.0
+		age := time.Since(s.p.Entry)
 
-		if pnl > p.HiPnl {
-			p.HiPnl = pnl
+		if pnl > s.p.HiPnl {
+			s.p.HiPnl = pnl
 		}
-
 		if pnl > 0.02 {
 			hasProfit = true
 		}
@@ -1154,9 +1193,9 @@ func checkAll(ctx context.Context) bool {
 			reason = fmt.Sprintf("QUICKTP %ds +%.0f%%", int(age.Seconds()), pnl*100)
 		case pnl <= -cfg.SL:
 			reason = fmt.Sprintf("SL %.0f%%", pnl*100)
-		case p.HiPnl >= 0.03 && pnl < p.HiPnl-0.02 && pnl > 0:
-			reason = fmt.Sprintf("TRAIL peak+%.0f%% now+%.0f%%", p.HiPnl*100, pnl*100)
-		case p.HiPnl >= 0.03 && pnl < p.HiPnl-0.02 && pnl <= 0:
+		case s.p.HiPnl >= 0.04 && pnl < s.p.HiPnl-0.025 && pnl > 0:
+			reason = fmt.Sprintf("TRAIL peak+%.0f%% now+%.0f%%", s.p.HiPnl*100, pnl*100)
+		case s.p.HiPnl >= 0.04 && pnl < s.p.HiPnl-0.025 && pnl <= 0:
 			reason = fmt.Sprintf("SL(trail) %.0f%%", pnl*100)
 		case age >= time.Duration(cfg.TimeKillSec)*time.Second && pnl < 0 && pnl > -cfg.SL:
 			reason = fmt.Sprintf("TIMEKILL %ds pnl=%+.1f%%", int(age.Seconds()), pnl*100)
@@ -1167,10 +1206,9 @@ func checkAll(ctx context.Context) bool {
 			continue
 		}
 
-		p.LastSellTry = time.Now()
-		jobs = append(jobs, sellJob{mint, p, reason, state, bc, pnl, pnl > 0})
+		s.p.LastSellTry = time.Now()
+		jobs = append(jobs, sellJob{s.mint, s.p, reason, state, bc, pnl, pnl > 0})
 	}
-	posMu.Unlock()
 
 	for _, j := range jobs {
 		ok := doSell(ctx, j.p, j.reason, j.state, j.bc)
@@ -1202,11 +1240,11 @@ func trackTargetResult(wallet string, win bool) {
 		tgtLosses[wallet] = 0
 	} else {
 		tgtLosses[wallet]++
-		if tgtLosses[wallet] >= 3 {
+		if tgtLosses[wallet] >= 2 {
 			tgtMu.Lock()
 			delete(targets, wallet)
 			tgtMu.Unlock()
-			log.Printf("[MON] Удалена цель %s (3 убытка подряд)", short(wallet))
+			log.Printf("[MON] Удалена цель %s (2 убытка подряд)", short(wallet))
 			notifyWSReconn()
 		}
 	}

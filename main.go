@@ -115,6 +115,8 @@ type Config struct {
 	// 0 = выкл.
 	MintMinAge time.Duration
 	MintCD     time.Duration // skip re-buy same mint for this long after attempt/skip
+	// После профитного закрытия — не входить в этот mint N сек (анти "второго захода" в уже отыгранный памп). 0 = выкл.
+	MintWinCD time.Duration
 	// После убыточного закрытия — не входить в этот mint N сек (0 = выкл.)
 	MintLossCD time.Duration
 	// Трейлинг сессии: если реализованный PnL сессии когда-то был ≥ Min (%% от старта), при откате от пика на Giveback п.п. — стоп новых BUY (как CIRCUIT).
@@ -263,6 +265,7 @@ var (
 	cdMu      sync.Mutex
 	cdMap     = map[string]time.Time{} // mint → last attempt
 	lossCdMap = map[string]time.Time{} // mint → last убыточное закрытие (для MINT_LOSS_COOLDOWN)
+	winCdMap  = map[string]time.Time{} // mint → last профитное закрытие (для MINT_REBUY_COOLDOWN_AFTER_WIN)
 
 	// Макс. sessionPnlPct() с момента старта — для SESSION_TRAIL_*
 	sessionPeakPctMu  sync.Mutex
@@ -568,6 +571,10 @@ func main() {
 	} else {
 		log.Printf("[INIT] MINT_LOSS_COOLDOWN выкл. — можно сразу снова покупать тот же mint после минуса")
 	}
+	if cfg.MintWinCD > 0 {
+		log.Printf("[INIT] После профита по mint — пауза повторного входа %v (MINT_REBUY_COOLDOWN_AFTER_WIN_SEC; 0=выкл.)",
+			cfg.MintWinCD.Round(time.Second))
+	}
 	if cfg.SessionTrailGiveback > 0 && cfg.SessionTrailMinPeak > 0 {
 		if cfg.SessionTrailNetRedPct > 0 {
 			log.Printf("[INIT] Session trail: пик≥+%.2f%%, откат≥%.2f п.п. — стоп BUY только если сессия ≤−%.2f%%",
@@ -849,6 +856,13 @@ func loadCfg() Config {
 	c.MinVSRLam = evU("MIN_VSR_LAMPORTS", c.MinVSRLam)
 	if s := evU("MINT_MIN_AGE_SEC", 0); s > 0 {
 		c.MintMinAge = time.Duration(s) * time.Second
+	}
+	if v := strings.TrimSpace(os.Getenv("MINT_REBUY_COOLDOWN_AFTER_WIN_SEC")); v == "0" {
+		c.MintWinCD = 0
+	} else if v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n >= 0 {
+			c.MintWinCD = time.Duration(n) * time.Second
+		}
 	}
 	if v := strings.TrimSpace(os.Getenv("SCRAPE_SAME_MINT_MIN")); v == "0" {
 		c.ScrapeSameMintMin = 0
@@ -1697,6 +1711,12 @@ func mintBuyCooldownWhy(mint string) string {
 	defer cdMu.Unlock()
 	if t, ok := cdMap[mint]; ok && time.Since(t) < cfg.MintCD {
 		return "mint cooldown"
+	}
+	if cfg.MintWinCD > 0 {
+		if t, ok := winCdMap[mint]; ok && time.Since(t) < cfg.MintWinCD {
+			left := cfg.MintWinCD - time.Since(t)
+			return fmt.Sprintf("mint cooldown after win (%s left)", left.Round(time.Second))
+		}
 	}
 	if cfg.MintLossCD > 0 {
 		if t, ok := lossCdMap[mint]; ok && time.Since(t) < cfg.MintLossCD {
@@ -3030,6 +3050,13 @@ func recordPnl(spent uint64, solNet uint64, mintOpt string) {
 		cdMu.Unlock()
 		log.Printf("[PNL] %s — повторный BUY этого mint заблокирован на %v (закрытие в минус)",
 			short(mintOpt), cfg.MintLossCD.Round(time.Second))
+	}
+	if mintOpt != "" && delta > 0 && cfg.MintWinCD > 0 {
+		cdMu.Lock()
+		winCdMap[mintOpt] = time.Now()
+		cdMu.Unlock()
+		log.Printf("[PNL] %s — повторный BUY этого mint заблокирован на %v (закрытие в плюс)",
+			short(mintOpt), cfg.MintWinCD.Round(time.Second))
 	}
 
 	sp := sessionPnlPct()

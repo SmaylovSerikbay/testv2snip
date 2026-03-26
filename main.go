@@ -94,8 +94,10 @@ type Config struct {
 	// Пока позиция «молодая» (сек после Entry) — держать быстрый тик монитора (иначе при обвале ждём до MONITOR_MS).
 	MonitorFastYoungSec int
 	// FLASHSL: в первые N сек при pnl <= -X% — резать хвост (0 = выкл.)
-	FlashSLWindow  time.Duration
-	FlashSLPct     float64
+	FlashSLWindow time.Duration
+	FlashSLPct    float64
+	// Не применять FLASHSL раньше чем через столько после Entry (кривая/RPC после BUY часто «ломают» pnl)
+	FlashSLMinAge  time.Duration
 	Live           bool
 	MinReserve     uint64  // min SOL balance to keep (lamports)
 	MaxSessionLoss float64 // stop trading if session PnL <= -X%
@@ -499,7 +501,12 @@ func main() {
 			cfg.MaxTargets, cfg.MaxPositions, cfg.ScrapeIvl, cfg.MonitorMs)
 	}
 	if cfg.FlashSLWindow > 0 {
-		log.Printf("[INIT] FLASHSL первые %ds при ≤-%.0f%%", int(cfg.FlashSLWindow.Seconds()), cfg.FlashSLPct*100)
+		if cfg.FlashSLMinAge > 0 {
+			log.Printf("[INIT] FLASHSL с %ds до %ds при ≤-%.0f%% (без мгновенного срабатывания на шуме кривой)",
+				int(cfg.FlashSLMinAge.Seconds()), int(cfg.FlashSLWindow.Seconds()), cfg.FlashSLPct*100)
+		} else {
+			log.Printf("[INIT] FLASHSL первые %ds при ≤-%.0f%%", int(cfg.FlashSLWindow.Seconds()), cfg.FlashSLPct*100)
+		}
 	} else {
 		log.Printf("[INIT] FLASHSL выкл.")
 	}
@@ -807,6 +814,18 @@ func loadCfg() Config {
 		}
 	}
 	c.FlashSLPct = evF("FLASH_SL_MIN_PCT", c.FlashSLPct*100) / 100
+	if v := strings.TrimSpace(os.Getenv("FLASH_SL_MIN_ENTRY_SEC")); v == "0" {
+		c.FlashSLMinAge = 0
+	} else if n := evU("FLASH_SL_MIN_ENTRY_SEC", 0); n > 0 {
+		c.FlashSLMinAge = time.Duration(n) * time.Second
+	} else if c.FlashSLWindow > 0 {
+		c.FlashSLMinAge = 5 * time.Second
+	}
+	if c.FlashSLWindow > 0 && c.FlashSLMinAge > 0 && c.FlashSLWindow <= c.FlashSLMinAge {
+		c.FlashSLWindow = c.FlashSLMinAge + 10*time.Second
+		log.Printf("[CFG] FLASH_SL_SEC увеличен до %.0fs (должен быть > FLASH_SL_MIN_ENTRY_SEC=%.0fs)",
+			c.FlashSLWindow.Seconds(), c.FlashSLMinAge.Seconds())
+	}
 	if n := evU("BC_RETRY_MAX", 0); n > 0 {
 		c.BCRetryMax = int(n)
 	}
@@ -2173,7 +2192,7 @@ func checkAll(ctx context.Context) (hasProfit bool, needFastYoung bool) {
 		switch {
 		case pnl >= cfg.TP:
 			reason = fmt.Sprintf("TP +%.0f%%", pnl*100)
-		case cfg.FlashSLWindow > 0 && age <= cfg.FlashSLWindow && pnl <= -cfg.FlashSLPct:
+		case cfg.FlashSLWindow > 0 && age >= cfg.FlashSLMinAge && age <= cfg.FlashSLWindow && pnl <= -cfg.FlashSLPct:
 			reason = fmt.Sprintf("FLASHSL %ds pnl=%+.1f%%", int(age.Seconds()), pnl*100)
 		case cfg.EarlySLWindow > 0 && age <= cfg.EarlySLWindow && pnl <= -cfg.EarlySLPct:
 			reason = fmt.Sprintf("EARLYSL %ds pnl=%+.1f%%", int(age.Seconds()), pnl*100)

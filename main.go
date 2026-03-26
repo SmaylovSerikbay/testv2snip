@@ -1064,10 +1064,11 @@ func main() {
 func loadCfg() Config {
 	c := Config{
 		BuyLamp:                  7_000_000, // 0.007 SOL
-		Slip:                     2000,      // 20% buy slippage
+		Slip:                     2500,      // 25% buy slippage (pump: волатильность кривой)
 		SellSlip:                 4000,      // 40% sell slippage
-		PrioLamp:                 2_000_000, // 0.002 SOL buy priority
+		PrioLamp:                 800_000, // 0.0008 SOL buy priority (конкуренция за слот)
 		PrioLampSell:             1_500_000, // 0.0015 SOL sell priority
+		JitoTipLamp:              600_000, // 0.0006 SOL Jito tip (bundles / inclusion)
 		TP:                       0.40,
 		QuickTPPct:               0.22, // +22% за первые 15с — иначе ждём основной TP
 		EarlySLWindow:            5 * time.Second,
@@ -1102,7 +1103,7 @@ func loadCfg() Config {
 		PreSimBuy:                false,
 		PreSimTimeout:            140 * time.Millisecond,
 		PreSimLagBudget:          80 * time.Millisecond,
-		BuyConfirmTimeout:        12 * time.Second,
+		BuyConfirmTimeout:        30 * time.Second,
 		JitoHTTPURL:              "https://mainnet.block-engine.jito.wtf/api/v1/transactions",
 		JitoHTTPTimeout:          400 * time.Millisecond,
 		JitoBundleBuy:            false,
@@ -1121,7 +1122,7 @@ func loadCfg() Config {
 		MinWhaleBuyLam:           200_000_000,    // 0.2 SOL
 		MinVSRLam:                20_000_000_000, // 20 SOL liquidity floor
 		MintMinAge:               0,
-		MintCD:                   90 * time.Second,
+		MintCD:                   45 * time.Second, // пауза после скипа/попытки по тому же mint (не «возраст токена»)
 		MintLossCD:               600 * time.Second, // 10 мин после минуса по mint — не повторять вход как с 6T7m
 		SessionTrailMinPeak:      0,                 // включи в .env: SESSION_TRAIL_*
 		SessionTrailGiveback:     0,

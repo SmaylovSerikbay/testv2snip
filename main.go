@@ -330,6 +330,12 @@ var (
 
 	circuitOpen atomic.Bool // session PnL circuit breaker
 
+	// Fee protection: если серия BUY FAIL (Custom:6000 / slippage), делаем короткую паузу,
+	// чтобы не продолжать платить комиссии за заведомо неподходящие constraints.
+	buyPauseUntil atomic.Int64 // unix ms
+	buyFailMu      sync.Mutex
+	buyFailTimes   []time.Time
+
 	rpcCalls atomic.Int64
 	rpcErrs  atomic.Int64
 
@@ -556,7 +562,12 @@ func isSlippageErr(err error) bool {
 	s := strings.ToLower(err.Error())
 	// 0xbc4: classic slippage error
 	// custom:6003: часто означает, что min_sol_out/min constraints не прошли (по сути тоже slippage на выходе)
-	return strings.Contains(s, "0xbc4") || strings.Contains(s, "slippage") || strings.Contains(s, "custom:6003")
+	// custom:6000: часто встречается на pump-style curves как "min_tokens_out constraint failed"
+	// (т.е. опять-таки слиппедж/минимальные выходные ограничения).
+	return strings.Contains(s, "0xbc4") ||
+		strings.Contains(s, "slippage") ||
+		strings.Contains(s, "custom:6003") ||
+		strings.Contains(s, "custom:6000")
 }
 
 func isBuyCustomErr6042(err error) bool {
@@ -565,6 +576,43 @@ func isBuyCustomErr6042(err error) bool {
 	}
 	// seen as: InstructionError ... Custom:6042
 	return strings.Contains(err.Error(), "Custom:6042") || strings.Contains(err.Error(), "custom:6042")
+}
+
+func registerBuyFailure(now time.Time, err error) {
+	if !(isBuyCustomErr6042(err) || isSlippageErr(err)) {
+		return
+	}
+
+	// Пауза только от последовательных неудачных входов:
+	// ограничивает "платить комиссии за очевидно неподходящие constraints".
+	const (
+		window   = 30 * time.Second
+		threshold = 3
+		pause    = 10 * time.Second
+	)
+
+	buyFailMu.Lock()
+	defer buyFailMu.Unlock()
+
+	buyFailTimes = append(buyFailTimes, now)
+	cutoff := now.Add(-window)
+	i := 0
+	for ; i < len(buyFailTimes); i++ {
+		if buyFailTimes[i].After(cutoff) {
+			break
+		}
+	}
+	if i > 0 {
+		buyFailTimes = buyFailTimes[i:]
+	}
+
+	if len(buyFailTimes) >= threshold {
+		cnt := len(buyFailTimes)
+		// Сбрасываем историю, чтобы не уходить в бесконечные паузы подряд.
+		buyFailTimes = nil
+		buyPauseUntil.Store(now.Add(pause).UnixMilli())
+		log.Printf("[BUY] Fee-protection: pause %.0fs after %d BUY FAILs | lastErr=%v", pause.Seconds(), cnt, err)
+	}
 }
 
 type scrapeEv struct {
@@ -2118,6 +2166,16 @@ func doBuy(ctx context.Context, sig Signal) {
 		return
 	}
 
+	// Fee protection: после серии BUY FAIL делаем короткую паузу.
+	if untilMs := buyPauseUntil.Load(); untilMs > 0 {
+		nowMs := time.Now().UnixMilli()
+		if nowMs < untilMs {
+			left := time.Duration(untilMs-nowMs) * time.Millisecond
+			log.Printf("[BUY] Skip: fee-protection pause %.0fs left | %s", left.Seconds(), short(mint))
+			return
+		}
+	}
+
 	if why := mintBuyCooldownWhy(mint); why != "" {
 		log.Printf("[BUY] Skip: %s | %s", why, short(mint))
 		return
@@ -2443,6 +2501,7 @@ func doBuy(ctx context.Context, sig Signal) {
 		lastPreSendLagMs int64
 		lastSendRTTMs    int64
 	)
+	tokOutCur := tokOut
 	for attempt, slip := range trySlips {
 		if cfg.MaxSignalLag > 0 && time.Since(signalT) > cfg.MaxSignalLag {
 			log.Printf("[BUY] Skip: signal lag %dms > %dms (pre-build) | %s", time.Since(signalT).Milliseconds(), cfg.MaxSignalLag.Milliseconds(), short(mint))
@@ -2451,7 +2510,7 @@ func doBuy(ctx context.Context, sig Signal) {
 		if slip > 9900 {
 			slip = 9900
 		}
-		minTok := tokOut * (10000 - slip) / 10000
+		minTok := tokOutCur * (10000 - slip) / 10000
 		tx, buildErr := signTx(buildIxs(buildBuyData(minTok)))
 		if buildErr != nil {
 			log.Printf("[BUY] Build/Sign: %v", buildErr)
@@ -2469,6 +2528,14 @@ func doBuy(ctx context.Context, sig Signal) {
 		if err != nil && (isBuyCustomErr6042(err) || isSlippageErr(err)) && attempt < len(trySlips)-1 {
 			log.Printf("[BUY] retry %d/%d | %s | slip=%dbps | preSendLag=%dms | err=%v",
 				attempt+1, len(trySlips), short(mint), slip, preSendLagMs, err)
+			// На pump.fun кривая меняется очень быстро.
+			// Если мы не обновим BC/estimations, то повтор с другим minTok может быть всё равно обречён
+			// и мы продолжим платить комиссии за заведомо неподходящие constraints.
+			if freshState, _, e2 := readBC(ctx, sig.Mint); e2 == nil && freshState != nil && !freshState.Done {
+				state = freshState
+				tokOutCur = calcTokOut(state.VTK, state.VSR, cfg.BuyLamp-fee)
+				tokOut = tokOutCur
+			}
 			continue
 		}
 		break
@@ -2479,6 +2546,7 @@ func doBuy(ctx context.Context, sig Signal) {
 			errMsg = errMsg[:200] + "…"
 		}
 		log.Printf("[BUY] ✗ %s | %s", errMsg, short(mint))
+		registerBuyFailure(time.Now(), err)
 		return
 	}
 	totalLagMs := time.Since(signalT).Milliseconds()

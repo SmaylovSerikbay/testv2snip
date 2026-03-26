@@ -289,6 +289,15 @@ var (
 	tgtCDMu  sync.Mutex
 	tgtCDMap = map[string]time.Time{}
 
+	mintProgMu    sync.RWMutex
+	mintProgCache = map[string]solana.PublicKey{}
+
+	ataKnownMu   sync.RWMutex
+	ataKnownUser = map[string]bool{} // key: user|mint|tokProg -> true (ATA exists)
+
+	walletBalCache   atomic.Uint64
+	walletBalCacheAt atomic.Int64 // unix ms
+
 	bhMu    sync.RWMutex
 	bhHash  solana.Hash
 	bhStale int64 // unix seconds when fetched
@@ -342,6 +351,70 @@ func accountExists(ctx context.Context, pk solana.PublicKey) bool {
 	})
 	rpcNote(err)
 	return err == nil && info != nil && info.Value != nil
+}
+
+func setWalletBalCache(v uint64) {
+	walletBalCache.Store(v)
+	walletBalCacheAt.Store(time.Now().UnixMilli())
+}
+
+func getWalletBalCache(maxAge time.Duration) (uint64, bool) {
+	ts := walletBalCacheAt.Load()
+	if ts == 0 {
+		return 0, false
+	}
+	if maxAge > 0 && time.Since(time.UnixMilli(ts)) > maxAge {
+		return 0, false
+	}
+	return walletBalCache.Load(), true
+}
+
+func mintProgCached(mint solana.PublicKey) (solana.PublicKey, bool) {
+	mintProgMu.RLock()
+	v, ok := mintProgCache[mint.String()]
+	mintProgMu.RUnlock()
+	return v, ok
+}
+
+func setMintProgCache(mint solana.PublicKey, prog solana.PublicKey) {
+	mintProgMu.Lock()
+	mintProgCache[mint.String()] = prog
+	mintProgMu.Unlock()
+}
+
+func getMintTokenProgramCached(ctx context.Context, mint solana.PublicKey) solana.PublicKey {
+	if v, ok := mintProgCached(mint); ok && !v.IsZero() {
+		return v
+	}
+	v := getMintTokenProgram(ctx, mint)
+	setMintProgCache(mint, v)
+	return v
+}
+
+func ataKnownKey(user, mint, tokProg solana.PublicKey) string {
+	return user.String() + "|" + mint.String() + "|" + tokProg.String()
+}
+
+func markUserATAKnown(user, mint, tokProg solana.PublicKey) {
+	ataKnownMu.Lock()
+	ataKnownUser[ataKnownKey(user, mint, tokProg)] = true
+	ataKnownMu.Unlock()
+}
+
+func userATAExistsCached(ctx context.Context, user, mint, tokProg solana.PublicKey) bool {
+	key := ataKnownKey(user, mint, tokProg)
+	ataKnownMu.RLock()
+	if ataKnownUser[key] {
+		ataKnownMu.RUnlock()
+		return true
+	}
+	ataKnownMu.RUnlock()
+	ata := findATA(user, mint, tokProg)
+	ok := accountExists(ctx, ata)
+	if ok {
+		markUserATAKnown(user, mint, tokProg)
+	}
+	return ok
 }
 
 func requestWSRestart() {
@@ -629,6 +702,7 @@ func main() {
 		b, err := rpcClient().GetBalance(ctx, cfg.Key.PublicKey(), rpc.CommitmentConfirmed)
 		rpcNote(err)
 		if err == nil {
+			setWalletBalCache(b.Value)
 			log.Printf("[INIT] Баланс: %.6f SOL", float64(b.Value)/1e9)
 			initSessionRefBalance(b.Value)
 		}
@@ -1990,29 +2064,28 @@ func doBuy(ctx context.Context, sig Signal) {
 		preBCErr  error
 	)
 	var pwg sync.WaitGroup
-	pwg.Add(4)
+	pwg.Add(3)
 	go func() {
 		defer pwg.Done()
+		if v, ok := getWalletBalCache(2 * time.Second); ok {
+			preBal = v
+			preBalOK = true
+			return
+		}
 		rpcWait()
 		b, err := rpcClient().GetBalance(ctx, cfg.Key.PublicKey(), rpc.CommitmentConfirmed)
 		rpcNote(err)
 		if err == nil {
 			preBal = b.Value
 			preBalOK = true
+			setWalletBalCache(b.Value)
 		}
 	}()
 	go func() {
 		defer pwg.Done()
 		t0 := time.Now()
-		preTokPrg = getMintTokenProgram(ctx, sig.Mint)
+		preTokPrg = getMintTokenProgramCached(ctx, sig.Mint)
 		tokInfoMs = time.Since(t0).Milliseconds()
-	}()
-	go func() {
-		defer pwg.Done()
-		// check if ATA already exists (otherwise we need rent to create it)
-		user := cfg.Key.PublicKey()
-		ata := findATA(user, sig.Mint, solana.TokenProgramID)
-		preATAOK = accountExists(ctx, ata)
 	}()
 	go func() {
 		defer pwg.Done()
@@ -2046,6 +2119,7 @@ func doBuy(ctx context.Context, sig Signal) {
 	if tokProg == Token2022 {
 		log.Printf("[BUY] Token-2022: %s", short(mint))
 	}
+	preATAOK = userATAExistsCached(ctx, cfg.Key.PublicKey(), sig.Mint, tokProg)
 
 	state, bc := preState, preBC
 	// retry for freshest mints: sometimes bonding curve account isn't readable immediately
@@ -2264,6 +2338,7 @@ func doBuy(ctx context.Context, sig Signal) {
 		ata := findATA(user, sig.Mint, tokProg)
 		real := getTokenBalance(ctx, ata)
 		if real > 0 {
+			markUserATAKnown(user, sig.Mint, tokProg)
 			posMu.Lock()
 			if p, ok := pos[mint]; ok {
 				old := p.Tokens
@@ -3186,6 +3261,7 @@ func printStats() {
 		b, err := rpcClient().GetBalance(context.Background(), cfg.Key.PublicKey(), rpc.CommitmentConfirmed)
 		rpcNote(err)
 		if err == nil {
+			setWalletBalCache(b.Value)
 			balStr = fmt.Sprintf(" | Bal=%.4f SOL", float64(b.Value)/1e9)
 		}
 	}

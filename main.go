@@ -119,6 +119,9 @@ type Config struct {
 	MintWinCD time.Duration
 	// После убыточного закрытия — не входить в этот mint N сек (0 = выкл.)
 	MintLossCD time.Duration
+	// Анти-скэм: проверка концентрации холдеров по RPC getTokenLargestAccounts (0 = выкл.)
+	HolderMaxPct float64 // порог в долях, напр. 0.10 = 10%
+	HolderTopN   int     // сколько крупнейших аккаунтов смотреть (по умолчанию 20)
 	// Трейлинг сессии: если реализованный PnL сессии когда-то был ≥ Min (%% от старта), при откате от пика на Giveback п.п. — стоп новых BUY (как CIRCUIT).
 	SessionTrailMinPeak  float64 // %% от баланса при старте, 0 = выкл.
 	SessionTrailGiveback float64 // п.п. ниже пика сессии
@@ -741,6 +744,8 @@ func loadCfg() Config {
 		MintMinPumpBuys:          0,
 		MintMinPumpBuysWindow:    12 * time.Second,
 		ScrapeSameMintMin:        5,    // вариант B: было жёстко 3
+		HolderMaxPct:             0.10, // 10%: анти-концентрация холдеров
+		HolderTopN:               20,
 		PinWalletMinPnl:          0.08, // +8% и выше — закрепляем кошелёк
 		PinWalletsFile:           "pinned_wallets.txt",
 		PinUnpinLosses:           2,
@@ -854,6 +859,16 @@ func loadCfg() Config {
 		}
 	}
 	c.MinVSRLam = evU("MIN_VSR_LAMPORTS", c.MinVSRLam)
+	if v := strings.TrimSpace(os.Getenv("HOLDER_MAX_PCT")); v == "0" {
+		c.HolderMaxPct = 0
+	} else if v != "" {
+		if f, err := strconv.ParseFloat(v, 64); err == nil && f > 0 {
+			c.HolderMaxPct = f / 100
+		}
+	}
+	if n := evU("HOLDER_TOPN", 0); n > 0 {
+		c.HolderTopN = int(n)
+	}
 	if s := evU("MINT_MIN_AGE_SEC", 0); s > 0 {
 		c.MintMinAge = time.Duration(s) * time.Second
 	}
@@ -1794,6 +1809,63 @@ func mintFirstSeenAge(mintStr string) (age time.Duration, ok bool) {
 	return time.Since(minT), true
 }
 
+func holderConcentrationPct(ctx context.Context, mint solana.PublicKey, tokProg solana.PublicKey, excludeATA solana.PublicKey, topN int) (maxPct float64, maxAcc solana.PublicKey, err error) {
+	if topN <= 0 {
+		topN = 20
+	}
+	// Supply
+	rpcWait()
+	sup, e1 := rpcClient().GetTokenSupply(ctx, mint, rpc.CommitmentConfirmed)
+	rpcNote(e1)
+	if e1 != nil || sup == nil || sup.Value == nil {
+		if e1 == nil {
+			e1 = errors.New("nil token supply")
+		}
+		return 0, solana.PublicKey{}, e1
+	}
+	supply, e2 := strconv.ParseUint(sup.Value.Amount, 10, 64)
+	if e2 != nil || supply == 0 {
+		if e2 == nil {
+			e2 = errors.New("zero supply")
+		}
+		return 0, solana.PublicKey{}, e2
+	}
+
+	// Largest accounts (token accounts)
+	rpcWait()
+	la, e3 := rpcClient().GetTokenLargestAccounts(ctx, mint, rpc.CommitmentConfirmed)
+	rpcNote(e3)
+	if e3 != nil || la == nil || la.Value == nil {
+		if e3 == nil {
+			e3 = errors.New("nil largest accounts")
+		}
+		return 0, solana.PublicKey{}, e3
+	}
+	lim := topN
+	if lim > len(la.Value) {
+		lim = len(la.Value)
+	}
+	for i := 0; i < lim; i++ {
+		it := la.Value[i]
+		// it.Address is token account pubkey
+		if excludeATA != (solana.PublicKey{}) && it.Address == excludeATA {
+			continue
+		}
+		amt, pe := strconv.ParseUint(it.Amount, 10, 64)
+		if pe != nil {
+			continue
+		}
+		pct := float64(amt) / float64(supply)
+		if pct > maxPct {
+			maxPct = pct
+			maxAcc = it.Address
+		}
+	}
+
+	_ = tokProg // reserved: for future exclusions if needed
+	return maxPct, maxAcc, nil
+}
+
 func positionSLlimit(p *Position) float64 {
 	if p == nil {
 		return cfg.SL
@@ -2006,6 +2078,20 @@ func doBuy(ctx context.Context, sig Signal) {
 		log.Printf("[BUY] Skip: low liquidity (%.2f SOL) | %s", float64(state.VSR)/1e9, short(mint))
 		setMintCooldown(mint)
 		return
+	}
+
+	if cfg.HolderMaxPct > 0 {
+		// Exclude bonding-curve ATA from holder concentration check
+		excl := findATA(bc, sig.Mint, tokProg)
+		hctx, cancel := context.WithTimeout(ctx, 400*time.Millisecond)
+		maxPct, maxAcc, herr := holderConcentrationPct(hctx, sig.Mint, tokProg, excl, cfg.HolderTopN)
+		cancel()
+		if herr == nil && maxPct >= cfg.HolderMaxPct {
+			log.Printf("[BUY] Skip: whale concentration %.1f%% >= %.1f%% (acc %s) | %s",
+				maxPct*100, cfg.HolderMaxPct*100, short(maxAcc.String()), short(mint))
+			setMintCooldown(mint)
+			return
+		}
 	}
 
 	if state.RTK > 0 && state.Supply > 0 && float64(state.RTK)/float64(state.Supply) < 0.05 {

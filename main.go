@@ -2042,6 +2042,17 @@ func fixedTradeCostsLamports() uint64 {
 	return cfg.PrioLamp + cfg.PrioLampSell + 2*cfg.JitoTipLamp
 }
 
+func walletBalanceLamports(ctx context.Context) (uint64, bool) {
+	rpcWait()
+	b, err := rpcClient().GetBalance(ctx, cfg.Key.PublicKey(), rpc.CommitmentConfirmed)
+	rpcNote(err)
+	if err != nil {
+		return 0, false
+	}
+	setWalletBalCache(b.Value)
+	return b.Value, true
+}
+
 func doBuy(ctx context.Context, sig Signal) {
 	signalT := sig.At
 	if signalT.IsZero() {
@@ -2867,6 +2878,7 @@ func doSell(ctx context.Context, p *Position, reason string, cachedState *Bondin
 	// анти-0xbc4: быстрые ретраи с увеличением slippage (если цена резко двигается)
 	// базовый cfg.SellSlip (например 4000), затем 6000, 8000, 9500.
 	trySlips := []uint64{cfg.SellSlip, 6000, 8000, 9500}
+	preBal, preBalOK := walletBalanceLamports(ctx)
 	for attempt, slip := range trySlips {
 		if slip > 9900 {
 			slip = 9900
@@ -2915,7 +2927,9 @@ func doSell(ctx context.Context, p *Position, reason string, cachedState *Bondin
 			return false
 		}
 
-		log.Printf("[SELL] %s | TX %s | %s | PnL %+.1f%% | slip=%dbps", reason, txSig.String()[:12], short(mintStr), pnl, slip)
+		netFloor := minNetExitThreshold() * 100
+		log.Printf("[SELL] %s | TX %s | %s | est_pnl=%+.1f%% | net_floor=%+.2f%% | slip=%dbps",
+			reason, txSig.String()[:12], short(mintStr), pnl, netFloor, slip)
 		statSells.Add(1)
 
 		savedPos := *p
@@ -2923,6 +2937,8 @@ func doSell(ctx context.Context, p *Position, reason string, cachedState *Bondin
 		savedSolNet := solNet
 		savedMint := mintStr
 		savedTokProg := tokProg
+		savedPreBal := preBal
+		savedPreBalOK := preBalOK
 		go func() {
 			confirmTx(ctx, txSig, "SELL", savedMint, func() {
 				ata := findATA(cfg.Key.PublicKey(), savedPos.Mint, savedTokProg)
@@ -2948,7 +2964,19 @@ func doSell(ctx context.Context, p *Position, reason string, cachedState *Bondin
 			st, err := rpcClient().GetSignatureStatuses(ctx, false, txSig)
 			rpcNote(err)
 			if err == nil && len(st.Value) > 0 && st.Value[0] != nil && st.Value[0].Err == nil {
-				recordPnl(savedSpent, savedSolNet, savedMint)
+				usedSolNet := savedSolNet
+				if savedPreBalOK {
+					if postBal, ok := walletBalanceLamports(ctx); ok && postBal >= savedPreBal {
+						actual := postBal - savedPreBal
+						if actual > 0 {
+							usedSolNet = actual
+						}
+					}
+				}
+				netPct := float64(usedSolNet)/float64(savedSpent)*100 - 100
+				recordPnl(savedSpent, usedSolNet, savedMint)
+				log.Printf("[SELL][FACT] %s | actual_in=%0.6f SOL | spent=%0.6f SOL | net=%+.2f%%",
+					short(savedMint), float64(usedSolNet)/1e9, float64(savedSpent)/1e9, netPct)
 			}
 		}()
 		return true

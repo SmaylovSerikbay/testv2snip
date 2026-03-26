@@ -120,6 +120,10 @@ type Config struct {
 	BCSigLagBuf  time.Duration // stop retries when signal lag exceeds MaxSignalLag minus this
 	// After BUY confirm: if token balance vs expected is worse than -this %, mark BadEntry
 	BadEntryPct float64
+	// Если >0: при подтверждении BUY и плохом fill (скорр. токенов) ≤ -X% — немедленно закрыть позицию (анти мгновенных -20..-30%).
+	BadEntryImmediateSellPct float64
+	// Не продавать «мгновенно» раньше чем через N секунд после Entry (страховка от гонок confirm/ATA).
+	BadEntryImmediateMinAge time.Duration
 	// При BadEntry — ужесточить порог полного SL (доля; 0.14 = −14%%). 0 = не ужесточать (как STOP_LOSS)
 	BadEntrySLPct float64
 	// При BadEntry — раньше выходить в минус (сек; 0 = только классический BADEXIT через 10с)
@@ -156,17 +160,18 @@ type Signal struct {
 }
 
 type Position struct {
-	Mint        solana.PublicKey
-	Tokens      uint64
-	Spent       uint64 // lamports
-	Entry       time.Time
-	Wallet      string
-	HiPnl       float64 // peak PnL for trailing stop
-	TokProg     solana.PublicKey
-	LastSellTry time.Time
-	SellFails   int
-	BadEntry    bool
-	Confirmed   bool
+	Mint            solana.PublicKey
+	Tokens          uint64
+	Spent           uint64 // lamports
+	Entry           time.Time
+	Wallet          string
+	HiPnl           float64 // peak PnL for trailing stop
+	TokProg         solana.PublicKey
+	LastSellTry     time.Time
+	SellFails       int
+	BadEntry        bool
+	BadEntryDiffPct float64 // отрицательное число, напр. -15 означает -15% токенов от ожидаемого
+	Confirmed       bool
 }
 
 type BondingCurve struct {
@@ -659,56 +664,58 @@ func main() {
 
 func loadCfg() Config {
 	c := Config{
-		BuyLamp:               7_000_000, // 0.007 SOL
-		Slip:                  2000,      // 20% buy slippage
-		SellSlip:              4000,      // 40% sell slippage
-		PrioLamp:              2_000_000, // 0.002 SOL buy priority
-		PrioLampSell:          1_500_000, // 0.0015 SOL sell priority
-		TP:                    0.40,
-		QuickTPPct:            0.22, // +22% за первые 15с — иначе ждём основной TP
-		EarlySLWindow:         5 * time.Second,
-		EarlySLPct:            0.08, // −8% в первые 5с — на pump часто шум; см. EARLYSL_* в .env
-		SL:                    0.25,
-		BreakevenMinPeak:      0.30,
-		ProfitLockMinPeak:     0.06,  // +6% peak → начинаем «не отдавать»
-		ProfitLockFloor:       0.005, // держим минимум +0.5% (учёт комиссий/проскальзывания)
-		TrailMinPeak:          0.03,  // +3%% пика — уже следим за откатом (не ждать только +4%%)
-		PeakPullbackPct:       0.05,  // −5 п.п. от пика → SELL (анти «висел в плюсе и уехал в минус»)
-		TrailRelMult:          0.65,
-		ScrapeAutoTargets:     true,
-		TimeKillSec:           60,
-		TimeKillMin:           0.05,
-		MaxTargets:            50,
-		MaxPositions:          2,
-		ScrapeIvl:             3 * time.Minute,
-		MonitorMs:             1000,
-		MonitorFastYoungSec:   25,
-		FlashSLWindow:         4 * time.Second,
-		FlashSLPct:            0.12,       // −12% в первые 4с — до EARLYSL/SL
-		MinReserve:            15_000_000, // 0.015 SOL
-		MaxSessionLoss:        30.0,       // -30%
-		WalletCD:              5 * time.Second,
-		MaxTokInfoLag:         500 * time.Millisecond,
-		MaxSignalLag:          250 * time.Millisecond,
-		JitoHTTPURL:           "https://mainnet.block-engine.jito.wtf/api/v1/transactions",
-		JitoHTTPTimeout:       400 * time.Millisecond,
-		MinWhaleBuyLam:        200_000_000,    // 0.2 SOL
-		MinVSRLam:             20_000_000_000, // 20 SOL liquidity floor
-		MintCD:                90 * time.Second,
-		MintLossCD:            600 * time.Second, // 10 мин после минуса по mint — не повторять вход как с 6T7m
-		SessionTrailMinPeak:   0,                 // включи в .env: SESSION_TRAIL_*
-		SessionTrailGiveback:  0,
-		SessionTrailNetRedPct: 0,
-		BCRetryMax:            12,
-		BCRetrySleep:          100 * time.Millisecond,
-		BCSigLagBuf:           100 * time.Millisecond,
-		BadEntryPct:           20,
-		BadEntrySLPct:         0.14,
-		BadExitFastSec:        4,
-		BadEntryFlashPct:      0.10,
-		MintMinPumpBuys:       0,
-		MintMinPumpBuysWindow: 12 * time.Second,
-		ScrapeSameMintMin:     5, // вариант B: было жёстко 3
+		BuyLamp:                  7_000_000, // 0.007 SOL
+		Slip:                     2000,      // 20% buy slippage
+		SellSlip:                 4000,      // 40% sell slippage
+		PrioLamp:                 2_000_000, // 0.002 SOL buy priority
+		PrioLampSell:             1_500_000, // 0.0015 SOL sell priority
+		TP:                       0.40,
+		QuickTPPct:               0.22, // +22% за первые 15с — иначе ждём основной TP
+		EarlySLWindow:            5 * time.Second,
+		EarlySLPct:               0.08, // −8% в первые 5с — на pump часто шум; см. EARLYSL_* в .env
+		SL:                       0.25,
+		BreakevenMinPeak:         0.30,
+		ProfitLockMinPeak:        0.06,  // +6% peak → начинаем «не отдавать»
+		ProfitLockFloor:          0.005, // держим минимум +0.5% (учёт комиссий/проскальзывания)
+		TrailMinPeak:             0.03,  // +3%% пика — уже следим за откатом (не ждать только +4%%)
+		PeakPullbackPct:          0.05,  // −5 п.п. от пика → SELL (анти «висел в плюсе и уехал в минус»)
+		TrailRelMult:             0.65,
+		ScrapeAutoTargets:        true,
+		TimeKillSec:              60,
+		TimeKillMin:              0.05,
+		MaxTargets:               50,
+		MaxPositions:             2,
+		ScrapeIvl:                3 * time.Minute,
+		MonitorMs:                1000,
+		MonitorFastYoungSec:      25,
+		FlashSLWindow:            4 * time.Second,
+		FlashSLPct:               0.12,       // −12% в первые 4с — до EARLYSL/SL
+		MinReserve:               15_000_000, // 0.015 SOL
+		MaxSessionLoss:           30.0,       // -30%
+		WalletCD:                 5 * time.Second,
+		MaxTokInfoLag:            500 * time.Millisecond,
+		MaxSignalLag:             250 * time.Millisecond,
+		JitoHTTPURL:              "https://mainnet.block-engine.jito.wtf/api/v1/transactions",
+		JitoHTTPTimeout:          400 * time.Millisecond,
+		MinWhaleBuyLam:           200_000_000,    // 0.2 SOL
+		MinVSRLam:                20_000_000_000, // 20 SOL liquidity floor
+		MintCD:                   90 * time.Second,
+		MintLossCD:               600 * time.Second, // 10 мин после минуса по mint — не повторять вход как с 6T7m
+		SessionTrailMinPeak:      0,                 // включи в .env: SESSION_TRAIL_*
+		SessionTrailGiveback:     0,
+		SessionTrailNetRedPct:    0,
+		BCRetryMax:               12,
+		BCRetrySleep:             100 * time.Millisecond,
+		BCSigLagBuf:              100 * time.Millisecond,
+		BadEntryPct:              20,
+		BadEntryImmediateSellPct: 8,               // если fill хуже -8% — закрываем сразу
+		BadEntryImmediateMinAge:  2 * time.Second, // дать подтвердиться/обновиться ATA
+		BadEntrySLPct:            0.14,
+		BadExitFastSec:           4,
+		BadEntryFlashPct:         0.10,
+		MintMinPumpBuys:          0,
+		MintMinPumpBuysWindow:    12 * time.Second,
+		ScrapeSameMintMin:        5, // вариант B: было жёстко 3
 	}
 	// EXCLUSIVE HELIUS: никаких иных RPC/WSS (старые эндпойнты полностью отключены)
 	if v := os.Getenv("HELIUS_API_KEY"); v != "" {
@@ -760,6 +767,14 @@ func loadCfg() Config {
 		}
 	}
 	c.EarlySLPct = evF("EARLYSL_MIN_PCT", c.EarlySLPct*100) / 100
+	if v := strings.TrimSpace(os.Getenv("BAD_ENTRY_IMMEDIATE_SELL_PCT")); v == "0" {
+		c.BadEntryImmediateSellPct = 0
+	} else {
+		c.BadEntryImmediateSellPct = evF("BAD_ENTRY_IMMEDIATE_SELL_PCT", c.BadEntryImmediateSellPct)
+	}
+	if s := evU("BAD_ENTRY_IMMEDIATE_MIN_AGE_SEC", 0); s > 0 {
+		c.BadEntryImmediateMinAge = time.Duration(s) * time.Second
+	}
 	c.BreakevenMinPeak = evF("BREAKEVEN_MIN_PEAK_PCT", c.BreakevenMinPeak*100) / 100
 	if v := strings.TrimSpace(os.Getenv("PROFIT_LOCK_MIN_PEAK_PCT")); v == "0" {
 		c.ProfitLockMinPeak = 0
@@ -2081,6 +2096,7 @@ func doBuy(ctx context.Context, sig Signal) {
 						short(mint), old, real, diff)
 					if diff < -cfg.BadEntryPct {
 						p.BadEntry = true
+						p.BadEntryDiffPct = diff
 						log.Printf("[BUY] ⚠ Плохой вход (%.0f%%) порог -%.0f%%, быстрый выход через 10с", diff, cfg.BadEntryPct)
 					}
 				}
@@ -2245,6 +2261,8 @@ func checkAll(ctx context.Context) (hasProfit bool, needFastYoung bool) {
 		switch {
 		case pnl >= cfg.TP:
 			reason = fmt.Sprintf("TP +%.0f%%", pnl*100)
+		case s.p.BadEntry && cfg.BadEntryImmediateSellPct > 0 && s.p.BadEntryDiffPct <= -cfg.BadEntryImmediateSellPct && age >= cfg.BadEntryImmediateMinAge:
+			reason = fmt.Sprintf("BADENTRYIMM %.0f%% (fill %.0f%%) age=%ds", cfg.BadEntryImmediateSellPct, s.p.BadEntryDiffPct, int(age.Seconds()))
 		case s.p.BadEntry && cfg.BadExitFastSec > 0 && age >= time.Duration(cfg.BadExitFastSec)*time.Second && pnl < 0:
 			reason = fmt.Sprintf("BADEXITfast %ds pnl=%+.1f%%", int(age.Seconds()), pnl*100)
 		case cfg.FlashSLWindow > 0 && age >= cfg.FlashSLMinAge && age <= cfg.FlashSLWindow && pnl <= -flashSLThreshold(s.p):

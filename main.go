@@ -184,6 +184,12 @@ type Config struct {
 	// Shadowing: если цель продала тот же mint — продаём нашу позицию сразу (copy-sell якорь).
 	CopySellExit      bool
 	CopySellMinAgeSec int
+	// VSR Speed exit: выход по затуханию притока ликвидности на кривую.
+	VSRSExit             bool
+	VSRSWindowSec        int     // окно для оценки скорости VSR (сек)
+	VSRSMinUpSOLPerSec   float64 // если скорость ниже этого порога — считаем "затухло"
+	VSRSMinPeakPnlPct    float64 // активировать только если пик pnl был ≥ этого (%%)
+	VSRSMinAgeSec        int     // не применять раньше этого возраста позиции (сек)
 	// Порог "утверждения" кандидата.
 	CandMinAge         time.Duration
 	CandMinTrades      int
@@ -217,6 +223,10 @@ type Position struct {
 	BadEntry        bool
 	BadEntryDiffPct float64 // отрицательное число, напр. -15 означает -15% токенов от ожидаемого
 	Confirmed       bool
+
+	// VSR speed tracking (for VSR_SPEED_EXIT)
+	VSR0   uint64
+	VSR0At time.Time
 }
 
 type BondingCurve struct {
@@ -962,6 +972,11 @@ func loadCfg() Config {
 		CandRequireWin2x:         false,
 		CopySellExit:             false,
 		CopySellMinAgeSec:        3,
+		VSRSExit:                 false,
+		VSRSWindowSec:            6,
+		VSRSMinUpSOLPerSec:       0.8,
+		VSRSMinPeakPnlPct:        6,
+		VSRSMinAgeSec:            8,
 		MintMinPumpBuys:          0,
 		MintMinPumpBuysWindow:    12 * time.Second,
 		ScrapeSameMintMin:        5,    // вариант B: было жёстко 3
@@ -1052,6 +1067,11 @@ func loadCfg() Config {
 	c.ObserveOnly = ev("OBSERVE_ONLY", "0") == "1"
 	c.CopySellExit = ev("COPY_SELL_EXIT", "0") == "1"
 	c.CopySellMinAgeSec = int(evU("COPY_SELL_MIN_AGE_SEC", uint64(c.CopySellMinAgeSec)))
+	c.VSRSExit = ev("VSR_SPEED_EXIT", "0") == "1"
+	c.VSRSWindowSec = int(evU("VSR_SPEED_WINDOW_SEC", uint64(c.VSRSWindowSec)))
+	c.VSRSMinUpSOLPerSec = evF("VSR_SPEED_MIN_UP_SOL_PER_SEC", c.VSRSMinUpSOLPerSec)
+	c.VSRSMinPeakPnlPct = evF("VSR_SPEED_MIN_PEAK_PNL_PCT", c.VSRSMinPeakPnlPct)
+	c.VSRSMinAgeSec = int(evU("VSR_SPEED_MIN_AGE_SEC", uint64(c.VSRSMinAgeSec)))
 	if v := strings.TrimSpace(os.Getenv("COPY_WALLETS")); v != "" {
 		for _, part := range strings.Split(v, ",") {
 			part = strings.TrimSpace(part)
@@ -2995,6 +3015,13 @@ func checkAll(ctx context.Context) (hasProfit bool, needFastYoung bool) {
 		if pnl > s.p.HiPnl {
 			s.p.HiPnl = pnl
 		}
+		// VSR speed tracking: обновляем "точку отсчёта" раз в окно.
+		if cfg.VSRSExit && state != nil && state.VSR > 0 && cfg.VSRSWindowSec > 0 {
+			if s.p.VSR0At.IsZero() || time.Since(s.p.VSR0At) >= time.Duration(cfg.VSRSWindowSec)*time.Second {
+				s.p.VSR0 = state.VSR
+				s.p.VSR0At = time.Now()
+			}
+		}
 		if pnl >= minNetExitThreshold() {
 			hasProfit = true
 		}
@@ -3021,6 +3048,22 @@ func checkAll(ctx context.Context) (hasProfit bool, needFastYoung bool) {
 			reason = fmt.Sprintf("BADEXITfast %ds pnl=%+.1f%%", int(age.Seconds()), pnl*100)
 		case cfg.FlashSLWindow > 0 && age >= cfg.FlashSLMinAge && age <= cfg.FlashSLWindow && pnl <= -flashSLThreshold(s.p):
 			reason = fmt.Sprintf("FLASHSL %ds pnl=%+.1f%%", int(age.Seconds()), pnl*100)
+		case cfg.VSRSExit &&
+			cfg.VSRSWindowSec > 0 &&
+			age >= time.Duration(cfg.VSRSMinAgeSec)*time.Second &&
+			s.p.VSR0At.After(time.Time{}) &&
+			time.Since(s.p.VSR0At) >= time.Duration(cfg.VSRSWindowSec)*time.Second &&
+			(s.p.HiPnl*100) >= cfg.VSRSMinPeakPnlPct:
+			// Если приток ликвидности на кривую (VSR) затух — фиксируем прибыль/микро-плюс,
+			// чтобы не ждать "дампа толпы" и не отдавать пик.
+			dVSR := int64(state.VSR) - int64(s.p.VSR0)
+			sec := time.Since(s.p.VSR0At).Seconds()
+			if sec > 0 {
+				speedSOL := (float64(dVSR) / 1e9) / sec
+				if speedSOL <= cfg.VSRSMinUpSOLPerSec && pnl >= minNetExit {
+					reason = fmt.Sprintf("VSRSPEED %.2f SOL/s (peak+%.1f%% now%+.1f%%)", speedSOL, s.p.HiPnl*100, pnl*100)
+				}
+			}
 		case cfg.EarlySLWindow > 0 && age <= cfg.EarlySLWindow && pnl <= -cfg.EarlySLPct:
 			reason = fmt.Sprintf("EARLYSL %ds pnl=%+.1f%%", int(age.Seconds()), pnl*100)
 		case age <= 15*time.Second && pnl >= cfg.QuickTPPct:

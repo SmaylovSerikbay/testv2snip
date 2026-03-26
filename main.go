@@ -2905,9 +2905,9 @@ func doSell(ctx context.Context, p *Position, reason string, cachedState *Bondin
 		return true
 	}
 
-	// анти-0xbc4: быстрые ретраи с увеличением slippage (если цена резко двигается)
-	// базовый cfg.SellSlip (например 4000), затем 6000, 8000, 9500.
-	trySlips := []uint64{cfg.SellSlip, 6000, 8000, 9500}
+	// Для SELL строго уважаем лимит из .env (SELL_SLIPPAGE_BPS).
+	// Иначе ретраи с 6000/8000/9500 bps дают "неожиданные" большие минуса на исполнении.
+	trySlips := []uint64{cfg.SellSlip}
 	for attempt, slip := range trySlips {
 		if slip > 9900 {
 			slip = 9900

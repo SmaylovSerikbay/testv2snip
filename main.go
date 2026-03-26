@@ -2777,14 +2777,10 @@ func doBuy(ctx context.Context, sig Signal) {
 		real := getTokenBalance(ctx, ata)
 		posMu.Lock()
 		if p, ok := pos[mint]; ok {
-			// Корректируем p.Spent под фактическую сумму списания по BUY-TX.
-			// Иначе PnL/пороги SELL могут быть смещены (rent на ATA, fees/tip).
-			if delta, ok := txPayerDeltaLamports(ctx, txSig); ok && delta < 0 {
-				actualSpent := uint64(-delta)
-				if actualSpent > 0 {
-					p.Spent = actualSpent
-				}
-			}
+			// Важно: p.Spent используем как principal (ставка BUY_AMOUNT_SOL),
+			// а не как полный wallet-delta на BUY (который включает rent на ATA и комиссии).
+			// Иначе почти каждый новый mint выглядит как "мгновенный -20%+" и SL/ветки
+			// срабатывают ложно (rent ~0.0021 SOL на каждый новый ATA).
 			// В live-режиме SELL-логика требует Confirmed=true.
 			// Ставим флаг после confirm-check даже если ATA вернул 0 (временный RPC-глюк).
 			p.Confirmed = true

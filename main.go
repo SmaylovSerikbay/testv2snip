@@ -314,6 +314,10 @@ var (
 	// Token-bucket rate limiter: allows bursts, ~8 req/s sustained
 	rpcBucket chan struct{}
 
+	// Jito sendBundle (JSON-RPC): по документации Jito — 1 запрос/с на IP на регион.
+	jitoBundleSendMu    sync.Mutex
+	jitoLastBundleStart time.Time
+
 	signalCh      = make(chan Signal, 64)
 	wsReconnCh    = make(chan struct{}, 1)
 	monitorWakeCh = make(chan struct{}, 1)
@@ -676,7 +680,21 @@ func sendTxViaJitoHTTP(ctx context.Context, url string, tx *solana.Transaction) 
 	return sig, nil
 }
 
+func jitoBundleThrottle() {
+	jitoBundleSendMu.Lock()
+	defer jitoBundleSendMu.Unlock()
+	if !jitoLastBundleStart.IsZero() {
+		if d := time.Since(jitoLastBundleStart); d < time.Second {
+			wait := time.Second - d
+			log.Printf("[TX] Jito bundle: пауза %dms (лимит 1 req/s/IP per region, docs.jito.wtf)", wait.Milliseconds())
+			time.Sleep(wait)
+		}
+	}
+	jitoLastBundleStart = time.Now()
+}
+
 func sendBuyAsJitoBundle(ctx context.Context, url string, tx *solana.Transaction) (solana.Signature, error) {
+	jitoBundleThrottle()
 	bin, err := tx.MarshalBinary()
 	if err != nil {
 		return solana.Signature{}, err
@@ -748,46 +766,29 @@ func isJitoRateLimitErr(err error) bool {
 }
 
 func sendBuyAsJitoBundleRace(ctx context.Context, urls []string, tx *solana.Transaction) (solana.Signature, string, error) {
-	// Один проход по URL: при 429 на регионе не перебираем остальные (часто тот же глобальный лимит).
-	oneRound := func() (solana.Signature, string, error) {
-		var firstErr error
-		for _, u := range urls {
-			u := strings.TrimSpace(u)
-			if u == "" {
-				continue
-			}
-			sig, err := sendBuyAsJitoBundle(ctx, u, tx)
-			if err == nil {
-				return sig, u, nil
-			}
-			if firstErr == nil {
-				firstErr = err
-			}
-			if isJitoRateLimitErr(err) {
-				return solana.Signature{}, "", err
-			}
+	// Один проход по URL: при 429 не перебираем регионы (глобальный лимит / перегруз).
+	// Повтор через 800ms после первого sendBundle нарушал лимит Jito: 1 req/s/IP/region.
+	var firstErr error
+	for _, u := range urls {
+		u := strings.TrimSpace(u)
+		if u == "" {
+			continue
+		}
+		sig, err := sendBuyAsJitoBundle(ctx, u, tx)
+		if err == nil {
+			return sig, u, nil
 		}
 		if firstErr == nil {
-			firstErr = errors.New("no bundle urls")
+			firstErr = err
 		}
-		return solana.Signature{}, "", firstErr
-	}
-
-	sig, u, err := oneRound()
-	if err == nil {
-		return sig, u, nil
-	}
-	// Один повтор после паузы — иногда 429 кратковременный; не спамим регионами.
-	if isJitoRateLimitErr(err) {
-		log.Printf("[TX] Jito bundle 429 — повтор через 800ms")
-		select {
-		case <-ctx.Done():
-			return solana.Signature{}, "", ctx.Err()
-		case <-time.After(800 * time.Millisecond):
+		if isJitoRateLimitErr(err) {
+			return solana.Signature{}, "", err
 		}
-		return oneRound()
 	}
-	return sig, u, err
+	if firstErr == nil {
+		firstErr = errors.New("no bundle urls")
+	}
+	return solana.Signature{}, "", firstErr
 }
 
 func isSlippageErr(err error) bool {

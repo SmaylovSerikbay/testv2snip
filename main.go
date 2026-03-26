@@ -3058,8 +3058,21 @@ func doBuy(ctx context.Context, sig Signal) {
 			// позицию не удаляем и разрешаем монитору SELL.
 			user := cfg.Key.PublicKey()
 			ata := findATA(user, sig.Mint, tokProg)
-			rpcWait()
-			bal := getTokenBalance(ctx, ata)
+			// Важно: не делаем вывод по одному чтению.
+			// При Jito-bundle/нагрузке RPC часто запаздывает по confirmed, хотя токены уже видны на processed.
+			var bal uint64
+			deadline := time.Now().Add(8 * time.Second)
+			for time.Now().Before(deadline) {
+				bal = getTokenBalanceWithCommitment(ctx, ata, rpc.CommitmentProcessed)
+				if bal > 0 {
+					break
+				}
+				bal = getTokenBalanceWithCommitment(ctx, ata, rpc.CommitmentConfirmed)
+				if bal > 0 {
+					break
+				}
+				time.Sleep(500 * time.Millisecond)
+			}
 			if bal == 0 {
 				removePos(mint)
 				log.Printf("[BUY] Удалена фантомная позиция: %s", short(mint))
@@ -4039,11 +4052,11 @@ func calcSolOut(vtk, vsr, tok uint64) uint64 {
 //  INSTRUCTION BUILDERS
 // ═══════════════════════════════════════════════════════════════════════════════
 
-func getTokenBalance(ctx context.Context, ata solana.PublicKey) uint64 {
+func getTokenBalanceWithCommitment(ctx context.Context, ata solana.PublicKey, commitment rpc.CommitmentType) uint64 {
 	rpcWait()
 	info, err := rpcClient().GetAccountInfoWithOpts(ctx, ata, &rpc.GetAccountInfoOpts{
 		Encoding:   solana.EncodingBase64,
-		Commitment: rpc.CommitmentConfirmed,
+		Commitment: commitment,
 	})
 	rpcNote(err)
 	if err != nil || info == nil || info.Value == nil {
@@ -4054,6 +4067,10 @@ func getTokenBalance(ctx context.Context, ata solana.PublicKey) uint64 {
 		return 0
 	}
 	return binary.LittleEndian.Uint64(d[64:72])
+}
+
+func getTokenBalance(ctx context.Context, ata solana.PublicKey) uint64 {
+	return getTokenBalanceWithCommitment(ctx, ata, rpc.CommitmentConfirmed)
 }
 
 func getMintTokenProgram(ctx context.Context, mint solana.PublicKey) solana.PublicKey {

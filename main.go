@@ -181,6 +181,9 @@ type Config struct {
 	// Observe/Approve: сначала собираем статистику по кошелькам, и только потом добавляем их в цели.
 	// OBSERVE_ONLY=1 — торгуем только по PINNED/COPY_WALLETS/уже утверждённым целям.
 	ObserveOnly bool
+	// Shadowing: если цель продала тот же mint — продаём нашу позицию сразу (copy-sell якорь).
+	CopySellExit      bool
+	CopySellMinAgeSec int
 	// Порог "утверждения" кандидата.
 	CandMinAge         time.Duration
 	CandMinTrades      int
@@ -957,6 +960,8 @@ func loadCfg() Config {
 		CandMinProfitPct:         0.30,
 		CandMinTotalBuyLam:       5_000_000_000, // 5 SOL
 		CandRequireWin2x:         false,
+		CopySellExit:             false,
+		CopySellMinAgeSec:        3,
 		MintMinPumpBuys:          0,
 		MintMinPumpBuysWindow:    12 * time.Second,
 		ScrapeSameMintMin:        5,    // вариант B: было жёстко 3
@@ -1045,6 +1050,8 @@ func loadCfg() Config {
 	}
 	c.ScrapeAutoTargets = ev("SCRAPE_AUTO_TARGETS", "1") != "0"
 	c.ObserveOnly = ev("OBSERVE_ONLY", "0") == "1"
+	c.CopySellExit = ev("COPY_SELL_EXIT", "0") == "1"
+	c.CopySellMinAgeSec = int(evU("COPY_SELL_MIN_AGE_SEC", uint64(c.CopySellMinAgeSec)))
 	if v := strings.TrimSpace(os.Getenv("COPY_WALLETS")); v != "" {
 		for _, part := range strings.Split(v, ",") {
 			part = strings.TrimSpace(part)
@@ -1941,7 +1948,9 @@ func wsLoop(ctx context.Context) error {
 			continue
 		}
 		if kind == wsSubWalletLogs {
+			// BUY signal -> trade executor; SELL signal -> shadow exit (copy-sell)
 			go parseBuySignal(wallet, lr.Value.Logs)
+			go parseSellSignal(wallet, lr.Value.Logs)
 		}
 	}
 }
@@ -1971,6 +1980,54 @@ func parseBuySignal(wallet string, logs []string) {
 	default:
 		log.Println("[WS] signalCh full — пропуск")
 	}
+}
+
+func parseSellSignal(wallet string, logs []string) {
+	isSell := false
+	for _, l := range logs {
+		if l == "Program log: Instruction: Sell" {
+			isSell = true
+			break
+		}
+	}
+	if !isSell {
+		return
+	}
+	ev := parseTradeFromLogs(logs)
+	if ev == nil || ev.User.String() != wallet || ev.IsBuy {
+		return
+	}
+	if !cfg.CopySellExit {
+		return
+	}
+	tryCopySellExit(wallet, ev.Mint)
+}
+
+func tryCopySellExit(wallet string, mint solana.PublicKey) {
+	mintStr := mint.String()
+	posMu.RLock()
+	p := pos[mintStr]
+	posMu.RUnlock()
+	if p == nil {
+		return
+	}
+	// выходим только если позиция была открыта именно по этому кошельку-цели
+	if strings.TrimSpace(p.Wallet) != strings.TrimSpace(wallet) {
+		return
+	}
+	// не продаём до подтверждения BUY и минимального возраста, чтобы избежать гонок confirm/ATA
+	if cfg.Live && !p.Confirmed {
+		return
+	}
+	if cfg.CopySellMinAgeSec > 0 && time.Since(p.Entry) < time.Duration(cfg.CopySellMinAgeSec)*time.Second {
+		return
+	}
+	go func(saved *Position) {
+		// Копи-селл: игнорируем текущий pnl — выходим по действию цели.
+		if doSell(context.Background(), saved, "COPYSELL", nil, solana.PublicKey{}) {
+			removePos(mintStr)
+		}
+	}(p)
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════

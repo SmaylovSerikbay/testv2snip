@@ -736,9 +736,19 @@ func sendBuyAsJitoBundle(ctx context.Context, url string, tx *solana.Transaction
 	return sig, nil
 }
 
+func isJitoRateLimitErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	s := strings.ToLower(err.Error())
+	return strings.Contains(s, "429") ||
+		strings.Contains(s, "rate limit") ||
+		strings.Contains(s, "congest")
+}
+
 func sendBuyAsJitoBundleRace(ctx context.Context, urls []string, tx *solana.Transaction) (solana.Signature, string, error) {
-	// Последовательные попытки: параллельная гонка на 3–4 регионах даёт лишнюю нагрузку на Jito
-	// и чаще ловит HTTP 429 (глобальный rate limit), не ускоряя включение бандла.
+	// Последовательные попытки: несколько регионов подряд = лишние запросы и чаще HTTP 429.
+	// При rate limit не перебираем остальные URL (глобальный лимит Jito).
 	var firstErr error
 	for _, u := range urls {
 		u := strings.TrimSpace(u)
@@ -751,6 +761,9 @@ func sendBuyAsJitoBundleRace(ctx context.Context, urls []string, tx *solana.Tran
 		}
 		if firstErr == nil {
 			firstErr = err
+		}
+		if isJitoRateLimitErr(err) {
+			return solana.Signature{}, "", err
 		}
 	}
 	if firstErr == nil {
@@ -1068,7 +1081,7 @@ func loadCfg() Config {
 		SellSlip:                 4000,      // 40% sell slippage
 		PrioLamp:                 800_000, // 0.0008 SOL buy priority (конкуренция за слот)
 		PrioLampSell:             1_500_000, // 0.0015 SOL sell priority
-		JitoTipLamp:              600_000, // 0.0006 SOL Jito tip (bundles / inclusion)
+		JitoTipLamp:              800_000, // 0.0008 SOL Jito tip (bundles / inclusion)
 		TP:                       0.40,
 		QuickTPPct:               0.22, // +22% за первые 15с — иначе ждём основной TP
 		EarlySLWindow:            5 * time.Second,
@@ -1238,6 +1251,22 @@ func loadCfg() Config {
 	}
 	if c.JitoBundleURL != "" {
 		c.JitoBundleURLs = append([]string{c.JitoBundleURL}, c.JitoBundleURLs...)
+	}
+	if len(c.JitoBundleURLs) > 0 {
+		seen := make(map[string]struct{}, len(c.JitoBundleURLs))
+		var uniq []string
+		for _, u := range c.JitoBundleURLs {
+			u = strings.TrimSpace(u)
+			if u == "" {
+				continue
+			}
+			if _, ok := seen[u]; ok {
+				continue
+			}
+			seen[u] = struct{}{}
+			uniq = append(uniq, u)
+		}
+		c.JitoBundleURLs = uniq
 	}
 	if ms := evU("JITO_HTTP_TIMEOUT_MS", 0); ms > 0 {
 		c.JitoHTTPTimeout = time.Duration(ms) * time.Millisecond

@@ -263,6 +263,7 @@ var (
 
 	signalCh   = make(chan Signal, 64)
 	wsReconnCh = make(chan struct{}, 1)
+	monitorWakeCh = make(chan struct{}, 1)
 
 	tgtMu   sync.RWMutex
 	targets = map[string]time.Time{} // wallet → lastSeen
@@ -1441,6 +1442,13 @@ func notifyWSReconn() {
 	}
 }
 
+func notifyMonitorWake() {
+	select {
+	case monitorWakeCh <- struct{}{}:
+	default:
+	}
+}
+
 // ═══════════════════════════════════════════════════════════════════════════════
 //  WS LISTENER — logsSubscribe на каждый target, сигналы → signalCh
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -2563,6 +2571,7 @@ func addPos(mint solana.PublicKey, tok, spent uint64, wallet string, tokProg sol
 	pos[mint.String()] = &Position{Mint: mint, Tokens: tok, Spent: spent, Entry: time.Now(), Wallet: wallet, TokProg: tokProg, Confirmed: !cfg.Live}
 	posMu.Unlock()
 	notifyWSReconn() // добавим accountSubscribe на bonding curve без реконнекта
+	notifyMonitorWake()
 }
 
 func removePos(mint string) {
@@ -2618,6 +2627,18 @@ func runMonitor(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-t.C:
+			hasProfit, needFastYoung := checkAll(ctx)
+			wantFast := hasProfit || needFastYoung
+			if wantFast && !fast {
+				t.Reset(fastInterval)
+				fast = true
+			} else if !wantFast && fast {
+				t.Reset(normalInterval)
+				fast = false
+			}
+		case <-monitorWakeCh:
+			// Сразу пробуждаем monitor при открытии новой позиции (уменьшаем шанс "проморгать" FlashSL/SL).
+			// Без этого первые проверки могут ждать до cfg.MonitorMs после BUY.
 			hasProfit, needFastYoung := checkAll(ctx)
 			wantFast := hasProfit || needFastYoung
 			if wantFast && !fast {
@@ -2927,9 +2948,20 @@ func doSell(ctx context.Context, p *Position, reason string, cachedState *Bondin
 		return true
 	}
 
-	// Для SELL строго уважаем лимит из .env (SELL_SLIPPAGE_BPS).
-	// Иначе ретраи с 6000/8000/9500 bps дают "неожиданные" большие минуса на исполнении.
-	trySlips := []uint64{cfg.SellSlip}
+	// Для SELL строго уважаем лимит из .env (SELL_SLIPPAGE_BPS),
+	// но для net-ориентированных выходов (NETLOCK) сначала пробуем более жёсткий slip,
+	// чтобы не превращать "плюс по оценке" в большой net-минус из-за движения кривой.
+	firstSlip := cfg.SellSlip
+	if strings.Contains(reason, "NETLOCK") {
+		// 1500 bps = 15% — заметно меньше 3000 bps (30%), но часто всё ещё хватает на fill.
+		if firstSlip > 1500 {
+			firstSlip = 1500
+		}
+	}
+	trySlips := []uint64{firstSlip}
+	if firstSlip != cfg.SellSlip && cfg.SellSlip > 0 {
+		trySlips = append(trySlips, cfg.SellSlip)
+	}
 	for attempt, slip := range trySlips {
 		if slip > 9900 {
 			slip = 9900

@@ -2053,6 +2053,19 @@ func walletBalanceLamports(ctx context.Context) (uint64, bool) {
 	return b.Value, true
 }
 
+func finalizeSellOutcome(wallet string, spent uint64, solNet uint64, mint string) {
+	if spent == 0 {
+		return
+	}
+	netOut := int64(solNet) - int64(fixedTradeCostsLamports())
+	netFrac := float64(netOut)/float64(spent) - 1.0
+	recordPnl(spent, solNet, mint)
+	trackTargetResult(wallet, netFrac > 0)
+	notePinnedWalletOnWin(wallet, netFrac)
+	log.Printf("[SELL][FACT] %s | actual_in=%0.6f SOL | spent=%0.6f SOL | net=%+.2f%%",
+		short(mint), float64(solNet)/1e9, float64(spent)/1e9, netFrac*100)
+}
+
 func doBuy(ctx context.Context, sig Signal) {
 	signalT := sig.At
 	if signalT.IsZero() {
@@ -2596,13 +2609,12 @@ func runMonitor(ctx context.Context) {
 }
 
 type sellJob struct {
-	mint       string
-	p          *Position
-	reason     string
-	state      *BondingCurve
-	bc         solana.PublicKey
-	pnl        float64
-	profitable bool
+	mint   string
+	p      *Position
+	reason string
+	state  *BondingCurve
+	bc     solana.PublicKey
+	pnl    float64
 }
 
 func checkAll(ctx context.Context) (hasProfit bool, needFastYoung bool) {
@@ -2726,15 +2738,13 @@ func checkAll(ctx context.Context) (hasProfit bool, needFastYoung bool) {
 		}
 
 		s.p.LastSellTry = time.Now()
-		jobs = append(jobs, sellJob{s.mint, s.p, reason, state, bc, pnl, pnl >= minNetExit})
+		jobs = append(jobs, sellJob{s.mint, s.p, reason, state, bc, pnl})
 	}
 
 	for _, j := range jobs {
 		ok := doSell(ctx, j.p, j.reason, j.state, j.bc)
 		if ok {
 			removePos(j.mint)
-			trackTargetResult(j.p.Wallet, j.profitable)
-			notePinnedWalletOnWin(j.p.Wallet, j.pnl)
 		} else {
 			posMu.Lock()
 			j.p.SellFails++
@@ -2946,7 +2956,7 @@ func doSell(ctx context.Context, p *Position, reason string, cachedState *Bondin
 				bal := getTokenBalance(ctx, ata)
 				if bal == 0 {
 					log.Printf("[SELL] TX не подтверждена, но токены проданы: %s", short(savedMint))
-					recordPnl(savedSpent, savedSolNet, savedMint)
+					finalizeSellOutcome(savedPos.Wallet, savedSpent, savedSolNet, savedMint)
 					return
 				}
 				addPos(savedPos.Mint, bal, savedPos.Spent, savedPos.Wallet, savedPos.TokProg)
@@ -2973,10 +2983,7 @@ func doSell(ctx context.Context, p *Position, reason string, cachedState *Bondin
 						}
 					}
 				}
-				netPct := float64(usedSolNet)/float64(savedSpent)*100 - 100
-				recordPnl(savedSpent, usedSolNet, savedMint)
-				log.Printf("[SELL][FACT] %s | actual_in=%0.6f SOL | spent=%0.6f SOL | net=%+.2f%%",
-					short(savedMint), float64(usedSolNet)/1e9, float64(savedSpent)/1e9, netPct)
+				finalizeSellOutcome(savedPos.Wallet, savedSpent, usedSolNet, savedMint)
 			}
 		}()
 		return true
@@ -3467,7 +3474,7 @@ func printStats() {
 	if ref > 0 {
 		sessExtra = fmt.Sprintf(" (sess %+.4f SOL)", float64(lam)/1e9)
 	}
-	log.Printf("[STAT] Wins=%d Losses=%d WR=%.0f%% | PnL=%+.2f%% от старта%s | Open=%d | Buys=%d Sells=%d%s",
+	log.Printf("[STAT] Wins=%d Losses=%d WR=%.0f%% | PnL=%+.2f%% от запуска%s | Open=%d | Buys=%d Sells=%d%s",
 		w, l, wr, sessPct, sessExtra, open, statBuys.Load(), statSells.Load(), balStr)
 	checkSessionTrail()
 }

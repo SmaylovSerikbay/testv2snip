@@ -228,6 +228,8 @@ var (
 
 	posMu sync.RWMutex
 	pos   = map[string]*Position{} // mint_str → position
+	// Покупки в полёте, ещё не в pos (анти гонка MAX_POSITIONS при двух сигналах сразу)
+	pendingPosBuys int
 
 	// Dedup: prevents concurrent buys of the same mint
 	buyingMu sync.Mutex
@@ -1726,18 +1728,25 @@ func doBuy(ctx context.Context, sig Signal) {
 	buyingMu.Unlock()
 	defer func() { buyingMu.Lock(); delete(buying, mint); buyingMu.Unlock() }()
 
-	posMu.RLock()
-	_, dup := pos[mint]
-	cnt := len(pos)
-	posMu.RUnlock()
-	if dup {
+	posMu.Lock()
+	if _, dup := pos[mint]; dup {
+		posMu.Unlock()
 		log.Printf("[BUY] Skip: already in position | %s", short(mint))
 		return
 	}
-	if cnt >= cfg.MaxPositions {
-		log.Printf("[BUY] Skip: max positions (%d/%d) | %s", cnt, cfg.MaxPositions, short(mint))
+	if len(pos)+pendingPosBuys >= cfg.MaxPositions {
+		posMu.Unlock()
+		log.Printf("[BUY] Skip: max positions (%d/%d) | %s", len(pos)+pendingPosBuys, cfg.MaxPositions, short(mint))
 		return
 	}
+	pendingPosBuys++
+	posMu.Unlock()
+	defer func() {
+		posMu.Lock()
+		pendingPosBuys--
+		posMu.Unlock()
+	}()
+
 	if len(cfg.Key) != 64 {
 		log.Printf("[BUY] Skip: no private key | %s", short(mint))
 		return

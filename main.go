@@ -83,6 +83,9 @@ type Config struct {
 	JitoHTTP        bool
 	JitoHTTPURL     string
 	JitoHTTPTimeout time.Duration
+	// Jito Bundles (sendBundle)
+	JitoBundleBuy bool
+	JitoBundleURL string
 	TP              float64
 	QuickTPPct      float64       // ранний выход QUICKTP: в первые 15с при pnl >= этого порога (доля, напр. 0.22 = +22%)
 	EarlySLWindow   time.Duration // 0 = выкл.; иначе в первые N сек выход если pnl <= -EarlySLPct (анти-просадка)
@@ -528,6 +531,16 @@ func requestWSRestart() {
 
 // rpcFallback: если true и Jito не ответил — отправить через Helius RPC (важно для SELL, иначе позиция «зависает»).
 func sendTx(ctx context.Context, tx *solana.Transaction, rpcFallback bool) (solana.Signature, error) {
+	// BUY: optionally send as Jito bundle (sendBundle) for validator-side atomic inclusion.
+	// This is not the same as RPC pre-sim; BE decides inclusion close to block production.
+	if cfg.JitoBundleBuy && !rpcFallback && cfg.JitoBundleURL != "" {
+		sig, err := sendBuyAsJitoBundle(ctx, cfg.JitoBundleURL, tx)
+		if err == nil {
+			return sig, nil
+		}
+		// If bundle fails, fall through to normal Jito HTTP (or return error for BUY depending on settings).
+		log.Printf("[TX] Jito bundle BUY failed → fallback | %v", err)
+	}
 	if cfg.JitoHTTP && cfg.JitoHTTPURL != "" {
 		sig, err := sendTxViaJitoHTTP(ctx, cfg.JitoHTTPURL, tx)
 		if err == nil {
@@ -633,6 +646,61 @@ func sendTxViaJitoHTTP(ctx context.Context, url string, tx *solana.Transaction) 
 	sig, err := solana.SignatureFromBase58(out.Result)
 	if err != nil {
 		return solana.Signature{}, err
+	}
+	return sig, nil
+}
+
+func sendBuyAsJitoBundle(ctx context.Context, url string, tx *solana.Transaction) (solana.Signature, error) {
+	bin, err := tx.MarshalBinary()
+	if err != nil {
+		return solana.Signature{}, err
+	}
+	b64 := base64.StdEncoding.EncodeToString(bin)
+
+	// sendBundle: [tx1..txN] base64
+	reqBody, _ := json.Marshal(map[string]any{
+		"id":      1,
+		"jsonrpc": "2.0",
+		"method":  "sendBundle",
+		"params": []any{
+			[]any{b64},
+			map[string]any{"encoding": "base64"},
+		},
+	})
+	hreq, _ := http.NewRequestWithContext(ctx, "POST", url, bytes.NewReader(reqBody))
+	hreq.Header.Set("Content-Type", "application/json")
+	hreq.Header.Set("Accept", "application/json")
+	to := cfg.JitoHTTPTimeout
+	if to <= 0 {
+		to = 400 * time.Millisecond
+	}
+	c := &http.Client{Timeout: to}
+	r, err := c.Do(hreq)
+	if err != nil {
+		return solana.Signature{}, err
+	}
+	defer r.Body.Close()
+	body, _ := io.ReadAll(r.Body)
+	if r.StatusCode != 200 {
+		return solana.Signature{}, fmt.Errorf("HTTP %d", r.StatusCode)
+	}
+
+	// We return tx signature (what the rest of the code expects).
+	// sendBundle returns bundle id; for our logging/tracking we can still use txSig.
+	var out struct {
+		Result any `json:"result"`
+		Error  *struct {
+			Code    int    `json:"code"`
+			Message string `json:"message"`
+		} `json:"error"`
+	}
+	_ = json.Unmarshal(body, &out)
+	if out.Error != nil {
+		return solana.Signature{}, fmt.Errorf("jito bundle err %d: %s", out.Error.Code, out.Error.Message)
+	}
+	sig := tx.Signatures[0]
+	if sig == (solana.Signature{}) {
+		return solana.Signature{}, errors.New("nil tx signature")
 	}
 	return sig, nil
 }
@@ -982,6 +1050,8 @@ func loadCfg() Config {
 		PreSimLagBudget:          80 * time.Millisecond,
 		JitoHTTPURL:              "https://mainnet.block-engine.jito.wtf/api/v1/transactions",
 		JitoHTTPTimeout:          400 * time.Millisecond,
+		JitoBundleBuy:            false,
+		JitoBundleURL:            "https://mainnet.block-engine.jito.wtf/api/v1/bundles",
 		MinWhaleBuyLam:           200_000_000,    // 0.2 SOL
 		MinVSRLam:                20_000_000_000, // 20 SOL liquidity floor
 		MintMinAge:               0,
@@ -1053,6 +1123,13 @@ func loadCfg() Config {
 	c.JitoHTTP = ev("JITO_HTTP_SEND", "0") == "1"
 	if u := os.Getenv("JITO_HTTP_URL"); u != "" {
 		c.JitoHTTPURL = u
+	}
+	c.JitoBundleBuy = ev("JITO_BUNDLE_BUY", "0") == "1"
+	if u := os.Getenv("JITO_BUNDLE_URL"); u != "" {
+		c.JitoBundleURL = u
+	} else if strings.Contains(c.JitoHTTPURL, "/api/v1/transactions") {
+		// удобный дефолт: если задан /transactions, то bundle рядом
+		c.JitoBundleURL = strings.ReplaceAll(c.JitoHTTPURL, "/api/v1/transactions", "/api/v1/bundles")
 	}
 	if ms := evU("JITO_HTTP_TIMEOUT_MS", 0); ms > 0 {
 		c.JitoHTTPTimeout = time.Duration(ms) * time.Millisecond

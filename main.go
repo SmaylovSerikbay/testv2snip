@@ -2519,6 +2519,14 @@ func doBuy(ctx context.Context, sig Signal) {
 		real := getTokenBalance(ctx, ata)
 		posMu.Lock()
 		if p, ok := pos[mint]; ok {
+			// Корректируем p.Spent под фактическую сумму списания по BUY-TX.
+			// Иначе PnL/пороги SELL могут быть смещены (rent на ATA, fees/tip).
+			if delta, ok := txPayerDeltaLamports(ctx, txSig); ok && delta < 0 {
+				actualSpent := uint64(-delta)
+				if actualSpent > 0 {
+					p.Spent = actualSpent
+				}
+			}
 			// В live-режиме SELL-логика требует Confirmed=true.
 			// Ставим флаг после confirm-check даже если ATA вернул 0 (временный RPC-глюк).
 			p.Confirmed = true

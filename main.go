@@ -128,6 +128,8 @@ type Config struct {
 	PreSimBuy       bool
 	PreSimTimeout   time.Duration
 	PreSimLagBudget time.Duration // don't simulate if remaining lag budget is less than this
+	// Confirmation timeouts
+	BuyConfirmTimeout time.Duration
 	MinWhaleBuyLam uint64        // min whale buy size to follow (lamports)
 	MinVSRLam      uint64        // min virtual SOL reserve (lamports)
 	// Минимальный «возраст» mint по нашему WS-стриму (без RPC): если mint впервые увидели меньше N сек назад — skip BUY.
@@ -539,7 +541,12 @@ func sendTx(ctx context.Context, tx *solana.Transaction, rpcFallback bool) (sola
 		if err == nil {
 			return sig, nil
 		}
-		// If bundle fails, fall through to normal Jito HTTP (or return error for BUY depending on settings).
+		// If bundle fails due to global rate limit / congestion, do NOT fallback to paid sendTransaction.
+		// Better to skip the entry than to pay fees and likely fail/late-fill in the same congested conditions.
+		if strings.Contains(err.Error(), "429") || strings.Contains(strings.ToLower(err.Error()), "rate limit") || strings.Contains(strings.ToLower(err.Error()), "congest") {
+			return solana.Signature{}, err
+		}
+		// Otherwise fall through to normal Jito HTTP.
 		log.Printf("[TX] Jito bundle BUY failed → fallback | %v", err)
 	}
 	if cfg.JitoHTTP && cfg.JitoHTTPURL != "" {
@@ -1053,6 +1060,7 @@ func loadCfg() Config {
 		PreSimBuy:                false,
 		PreSimTimeout:            140 * time.Millisecond,
 		PreSimLagBudget:          80 * time.Millisecond,
+		BuyConfirmTimeout:        12 * time.Second,
 		JitoHTTPURL:              "https://mainnet.block-engine.jito.wtf/api/v1/transactions",
 		JitoHTTPTimeout:          400 * time.Millisecond,
 		JitoBundleBuy:            false,
@@ -1241,6 +1249,9 @@ func loadCfg() Config {
 	}
 	if ms := evU("PRE_SIM_LAG_BUDGET_MS", 0); ms > 0 {
 		c.PreSimLagBudget = time.Duration(ms) * time.Millisecond
+	}
+	if s := evU("BUY_CONFIRM_TIMEOUT_SEC", 0); s > 0 {
+		c.BuyConfirmTimeout = time.Duration(s) * time.Second
 	}
 	if v := os.Getenv("MIN_WHALE_BUY_SOL"); v != "" {
 		if f, err := strconv.ParseFloat(v, 64); err == nil && f > 0 {
@@ -3004,9 +3015,18 @@ func removePos(mint string) {
 }
 
 func confirmTx(ctx context.Context, txSig solana.Signature, tag, mintStr string, onFail func()) {
-	time.Sleep(3 * time.Second)
+	// BUY: не держим слот позиции 43 секунды — это убивает throughput при MAX_POSITIONS=1.
+	initialSleep := 3 * time.Second
+	timeout := 43 * time.Second
+	if tag == "BUY" && cfg.BuyConfirmTimeout > 0 {
+		timeout = cfg.BuyConfirmTimeout
+		// быстрее начинаем проверку, чтобы раньше освободить слот при фантоме
+		initialSleep = 1 * time.Second
+	}
+	time.Sleep(initialSleep)
 
-	for attempt := 0; attempt < 20; attempt++ {
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
 		rpcWait()
 		statuses, err := rpcClient().GetSignatureStatuses(ctx, false, txSig)
 		rpcNote(err)
@@ -3029,7 +3049,7 @@ func confirmTx(ctx context.Context, txSig solana.Signature, tag, mintStr string,
 		}
 		time.Sleep(2 * time.Second)
 	}
-	log.Printf("[%s] ⚠ Не подтверждена за 43с: %s | %s", tag, txSig.String()[:12], short(mintStr))
+	log.Printf("[%s] ⚠ Не подтверждена за %ds: %s | %s", tag, int(timeout.Seconds()), txSig.String()[:12], short(mintStr))
 	if onFail != nil {
 		onFail()
 	}
@@ -3172,6 +3192,12 @@ func checkAll(ctx context.Context) (hasProfit bool, needFastYoung bool) {
 		if pnl > s.p.HiPnl {
 			s.p.HiPnl = pnl
 		}
+		// If we already achieved a net-positive peak, keep fast monitoring on.
+		// Otherwise NETLOCK can miss the net-floor and sell below it (turning into net-negative).
+		minNetExit := minNetExitThreshold()
+		if s.p.HiPnl >= minNetExit+0.003 {
+			hasProfit = true
+		}
 		// VSR speed tracking: обновляем "точку отсчёта" раз в окно.
 		if cfg.VSRSExit && state != nil && state.VSR > 0 && cfg.VSRSWindowSec > 0 {
 			if s.p.VSR0At.IsZero() || time.Since(s.p.VSR0At) >= time.Duration(cfg.VSRSWindowSec)*time.Second {
@@ -3179,10 +3205,9 @@ func checkAll(ctx context.Context) (hasProfit bool, needFastYoung bool) {
 				s.p.VSR0At = time.Now()
 			}
 		}
-		if pnl >= minNetExitThreshold() {
+		if pnl >= minNetExit {
 			hasProfit = true
 		}
-		minNetExit := minNetExitThreshold()
 
 		var reason string
 		switch {

@@ -2346,6 +2346,7 @@ func doBuy(ctx context.Context, sig Signal) {
 		lagMs := time.Since(signalT).Milliseconds()
 		log.Printf("[BUY][PAPER] %s | %.4f SOL → %d tok | lag=%dms", short(mint), float64(cfg.BuyLamp)/1e9, tokOut, lagMs)
 		addPos(sig.Mint, tokOut, cfg.BuyLamp, sig.Wallet, tokProg)
+		logBuyEntryInfo(sig.Mint, cfg.BuyLamp, tokOut)
 		statBuys.Add(1)
 		return
 	}
@@ -2416,6 +2417,7 @@ func doBuy(ctx context.Context, sig Signal) {
 	log.Printf("[BUY][TIMING] %s | bal=%dms(hit=%t) tok=%dms(hit=%t) bc=%dms ata=%dms(hit=%t) holders=%dms (-1=skipped)",
 		short(mint), preBalMs, balHit, tokInfoMs, tokHit, preBCMs, preATAMs, ataHit, holderMs)
 	addPos(sig.Mint, tokOut, cfg.BuyLamp, sig.Wallet, tokProg)
+	logBuyEntryInfo(sig.Mint, cfg.BuyLamp, tokOut)
 	statBuys.Add(1)
 
 	go func() {
@@ -2448,6 +2450,23 @@ func doBuy(ctx context.Context, sig Signal) {
 			posMu.Unlock()
 		}
 	}()
+}
+
+func logBuyEntryInfo(mint solana.PublicKey, spentLamports, tokens uint64) {
+	if spentLamports == 0 || tokens == 0 {
+		return
+	}
+	solSpent := float64(spentLamports) / 1e9
+	priceSolPerTok := solSpent / float64(tokens)
+	tokPerSol := float64(tokens) / solSpent
+	url := "https://dexscreener.com/solana/" + mint.String()
+	log.Printf("[BUY] ENTRY %s | at=%s | price=%.12f SOL/tok (%.0f tok/SOL) | %s",
+		short(mint.String()),
+		time.Now().Format("15:04:05"),
+		priceSolPerTok,
+		tokPerSol,
+		url,
+	)
 }
 
 func addPos(mint solana.PublicKey, tok, spent uint64, wallet string, tokProg solana.PublicKey) {

@@ -1158,12 +1158,27 @@ func loadCfg() Config {
 		PinWalletsFile:           "pinned_wallets.txt",
 		PinUnpinLosses:           2,
 	}
-	// EXCLUSIVE HELIUS: никаких иных RPC/WSS (старые эндпойнты полностью отключены)
-	if v := os.Getenv("HELIUS_API_KEY"); v != "" {
-		c.RPC = "https://mainnet.helius-rpc.com/?api-key=" + v
-		c.WSS = "wss://mainnet.helius-rpc.com/?api-key=" + v
-	} else {
-		log.Fatalf("[CFG] HELIUS_API_KEY обязателен (exclusive Helius mode)")
+	// RPC/WSS override (allows Helius Gatekeeper / other providers)
+	// If not set, fall back to Helius URLs from HELIUS_API_KEY.
+	if u := strings.TrimSpace(os.Getenv("RPC_URL")); u != "" {
+		c.RPC = u
+	}
+	if u := strings.TrimSpace(os.Getenv("WSS_URL")); u != "" {
+		c.WSS = u
+	}
+	if v := strings.TrimSpace(os.Getenv("HELIUS_API_KEY")); v != "" {
+		// Optional: use Gatekeeper RPC (beta) without manually pasting URL.
+		if c.RPC == "" && ev("HELIUS_GATEKEEPER_RPC", "0") == "1" {
+			c.RPC = "https://beta.helius-rpc.com/?api-key=" + v
+		}
+		if c.RPC == "" {
+			c.RPC = "https://mainnet.helius-rpc.com/?api-key=" + v
+		}
+		if c.WSS == "" {
+			c.WSS = "wss://mainnet.helius-rpc.com/?api-key=" + v
+		}
+	} else if c.RPC == "" || c.WSS == "" {
+		log.Fatalf("[CFG] HELIUS_API_KEY обязателен (если не задан RPC_URL/WSS_URL)")
 	}
 	// Optional multi-WSS race: additional WS endpoints (comma separated).
 	if v := strings.TrimSpace(os.Getenv("WSS_URLS")); v != "" {

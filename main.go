@@ -2031,6 +2031,11 @@ func minNetExitThreshold() float64 {
 	return auto
 }
 
+func fixedTradeCostsLamports() uint64 {
+	// Round-trip fixed costs per completed trade (buy+sell): priority + jito tips.
+	return cfg.PrioLamp + cfg.PrioLampSell + 2*cfg.JitoTipLamp
+}
+
 func doBuy(ctx context.Context, sig Signal) {
 	signalT := sig.At
 	if signalT.IsZero() {
@@ -2427,20 +2432,38 @@ func doBuy(ctx context.Context, sig Signal) {
 
 	go func() {
 		confirmTx(ctx, txSig, "BUY", mint, func() {
-			removePos(mint)
-			log.Printf("[BUY] Удалена фантомная позиция: %s", short(mint))
+			// RPC может не увидеть confirm вовремя. Проверяем ATA: если токены уже пришли,
+			// позицию не удаляем и разрешаем монитору SELL.
+			user := cfg.Key.PublicKey()
+			ata := findATA(user, sig.Mint, tokProg)
+			rpcWait()
+			bal := getTokenBalance(ctx, ata)
+			if bal == 0 {
+				removePos(mint)
+				log.Printf("[BUY] Удалена фантомная позиция: %s", short(mint))
+				return
+			}
+			markUserATAKnown(user, sig.Mint, tokProg)
+			posMu.Lock()
+			if p, ok := pos[mint]; ok {
+				p.Confirmed = true
+				p.Tokens = bal
+			}
+			posMu.Unlock()
+			log.Printf("[BUY] confirm-timeout, но токены есть: %s | bal=%d (позиция сохранена)", short(mint), bal)
 		})
 		// После подтверждения — обновить p.Tokens реальным балансом ATA
 		user := cfg.Key.PublicKey()
 		ata := findATA(user, sig.Mint, tokProg)
 		real := getTokenBalance(ctx, ata)
-		if real > 0 {
-			markUserATAKnown(user, sig.Mint, tokProg)
-			posMu.Lock()
-			if p, ok := pos[mint]; ok {
+		posMu.Lock()
+		if p, ok := pos[mint]; ok {
+			// В live-режиме SELL-логика требует Confirmed=true.
+			// Ставим флаг после confirm-check даже если ATA вернул 0 (временный RPC-глюк).
+			p.Confirmed = true
+			if real > 0 {
 				old := p.Tokens
 				p.Tokens = real
-				p.Confirmed = true
 				if old != real {
 					diff := float64(real)/float64(old)*100 - 100
 					p.BadEntryDiffPct = diff
@@ -2452,7 +2475,10 @@ func doBuy(ctx context.Context, sig Signal) {
 					}
 				}
 			}
-			posMu.Unlock()
+		}
+		posMu.Unlock()
+		if real > 0 {
+			markUserATAKnown(user, sig.Mint, tokProg)
 		}
 	}()
 }
@@ -2674,7 +2700,7 @@ func checkAll(ctx context.Context) (hasProfit bool, needFastYoung bool) {
 		}
 
 		s.p.LastSellTry = time.Now()
-		jobs = append(jobs, sellJob{s.mint, s.p, reason, state, bc, pnl, pnl > 0})
+		jobs = append(jobs, sellJob{s.mint, s.p, reason, state, bc, pnl, pnl >= minNetExit})
 	}
 
 	for _, j := range jobs {
@@ -3310,14 +3336,18 @@ func checkSessionTrail() {
 		peak, sp, cfg.SessionTrailGiveback)
 }
 
-// recordPnl учитывает оценку выхода: solNet (lamports) минус spent на входе.
+// recordPnl учитывает оценку выхода: solNet (lamports) минус spent на входе
+// и вычитает фиксированные round-trip издержки (priority/jito), чтобы метрика была ближе к балансу кошелька.
 // mintOpt — base58 mint; при убытке ставит loss-cooldown на этот mint (если включён).
 func recordPnl(spent uint64, solNet uint64, mintOpt string) {
 	if spent == 0 {
 		return
 	}
-	delta := int64(solNet) - int64(spent)
-	tradePct := float64(solNet)/float64(spent)*100 - 100
+	grossDelta := int64(solNet) - int64(spent)
+	fixed := int64(fixedTradeCostsLamports())
+	delta := grossDelta - fixed
+	netOut := int64(solNet) - fixed
+	tradePct := float64(netOut)/float64(spent)*100 - 100
 	if tradePct > 0 {
 		statWins.Add(1)
 	} else {

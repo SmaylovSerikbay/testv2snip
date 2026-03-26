@@ -545,19 +545,25 @@ func sendTx(ctx context.Context, tx *solana.Transaction, rpcFallback bool) (sola
 	// BUY: optionally send as Jito bundle (sendBundle) for validator-side atomic inclusion.
 	// This is not the same as RPC pre-sim; BE decides inclusion close to block production.
 	if cfg.JitoBundleBuy && !rpcFallback && len(cfg.JitoBundleURLs) > 0 {
-		sig, err := sendBuyAsJitoBundleRace(ctx, cfg.JitoBundleURLs, tx)
+		log.Printf("[TX] BUY via bundle race (%d urls)", len(cfg.JitoBundleURLs))
+		sig, usedURL, err := sendBuyAsJitoBundleRace(ctx, cfg.JitoBundleURLs, tx)
 		if err == nil {
+			log.Printf("[TX] BUY bundle accepted | url=%s | tx=%s", usedURL, sig.String()[:12])
 			return sig, nil
 		}
 		// If bundle fails due to global rate limit / congestion, do NOT fallback to paid sendTransaction.
 		// Better to skip the entry than to pay fees and likely fail/late-fill in the same congested conditions.
 		if strings.Contains(err.Error(), "429") || strings.Contains(strings.ToLower(err.Error()), "rate limit") || strings.Contains(strings.ToLower(err.Error()), "congest") {
+			log.Printf("[TX] BUY bundle blocked (no fallback) | err=%v", err)
 			return solana.Signature{}, err
 		}
 		// Otherwise fall through to normal Jito HTTP.
 		log.Printf("[TX] Jito bundle BUY failed → fallback | %v", err)
 	}
 	if cfg.JitoHTTP && cfg.JitoHTTPURL != "" {
+		if !rpcFallback {
+			log.Printf("[TX] BUY via jito-http sendTransaction")
+		}
 		sig, err := sendTxViaJitoHTTP(ctx, cfg.JitoHTTPURL, tx)
 		if err == nil {
 			return sig, nil
@@ -578,6 +584,9 @@ func sendTx(ctx context.Context, tx *solana.Transaction, rpcFallback bool) (sola
 	}
 	rpcWait()
 	noRetry := uint(0)
+	if !rpcFallback {
+		log.Printf("[TX] BUY via rpc SendTransactionWithOpts")
+	}
 	sig, err := rpcClient().SendTransactionWithOpts(ctx, tx, rpc.TransactionOpts{
 		SkipPreflight: true,
 		MaxRetries:    &noRetry,
@@ -705,10 +714,9 @@ func sendBuyAsJitoBundle(ctx context.Context, url string, tx *solana.Transaction
 		return solana.Signature{}, fmt.Errorf("HTTP %d: %s", r.StatusCode, msg)
 	}
 
-	// We return tx signature (what the rest of the code expects).
-	// sendBundle returns bundle id; for our logging/tracking we can still use txSig.
+	// sendBundle returns bundle id; log it to understand acceptance.
 	var out struct {
-		Result any `json:"result"`
+		Result string `json:"result"`
 		Error  *struct {
 			Code    int    `json:"code"`
 			Message string `json:"message"`
@@ -718,6 +726,9 @@ func sendBuyAsJitoBundle(ctx context.Context, url string, tx *solana.Transaction
 	if out.Error != nil {
 		return solana.Signature{}, fmt.Errorf("jito bundle err %d: %s", out.Error.Code, out.Error.Message)
 	}
+	if out.Result != "" && tx != nil && len(tx.Signatures) > 0 {
+		log.Printf("[TX] sendBundle ok | url=%s | bundle_id=%s | tx=%s", url, out.Result, tx.Signatures[0].String()[:12])
+	}
 	sig := tx.Signatures[0]
 	if sig == (solana.Signature{}) {
 		return solana.Signature{}, errors.New("nil tx signature")
@@ -725,7 +736,7 @@ func sendBuyAsJitoBundle(ctx context.Context, url string, tx *solana.Transaction
 	return sig, nil
 }
 
-func sendBuyAsJitoBundleRace(ctx context.Context, urls []string, tx *solana.Transaction) (solana.Signature, error) {
+func sendBuyAsJitoBundleRace(ctx context.Context, urls []string, tx *solana.Transaction) (solana.Signature, string, error) {
 	type res struct {
 		url string
 		sig solana.Signature
@@ -746,7 +757,7 @@ func sendBuyAsJitoBundleRace(ctx context.Context, urls []string, tx *solana.Tran
 	for i := 0; i < len(urls); i++ {
 		r := <-ch
 		if r.err == nil {
-			return r.sig, nil
+			return r.sig, r.url, nil
 		}
 		if firstErr == nil {
 			firstErr = r.err
@@ -755,7 +766,7 @@ func sendBuyAsJitoBundleRace(ctx context.Context, urls []string, tx *solana.Tran
 	if firstErr == nil {
 		firstErr = errors.New("no bundle urls")
 	}
-	return solana.Signature{}, firstErr
+	return solana.Signature{}, "", firstErr
 }
 
 func isSlippageErr(err error) bool {

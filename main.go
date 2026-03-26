@@ -2647,7 +2647,7 @@ func checkAll(ctx context.Context) (hasProfit bool, needFastYoung bool) {
 		if pnl > s.p.HiPnl {
 			s.p.HiPnl = pnl
 		}
-		if pnl > 0.02 {
+		if pnl >= minNetExitThreshold() {
 			hasProfit = true
 		}
 		minNetExit := minNetExitThreshold()
@@ -2656,6 +2656,10 @@ func checkAll(ctx context.Context) (hasProfit bool, needFastYoung bool) {
 		switch {
 		case pnl >= cfg.TP:
 			reason = fmt.Sprintf("TP +%.0f%%", pnl*100)
+		case s.p.HiPnl >= minNetExit+0.003 && pnl <= minNetExit:
+			// Защита "набрал net-плюс и отдал обратно": выходим сразу у net-порога,
+			// не дожидаясь PROFITLOCK/HARDKILL.
+			reason = fmt.Sprintf("NETLOCK peak+%.1f%% now%+.1f%% (net floor %+.2f%%)", s.p.HiPnl*100, pnl*100, minNetExit*100)
 		case cfg.BadEntryImmediateSellPct > 0 && s.p.BadEntryDiffPct <= -cfg.BadEntryImmediateSellPct && age >= cfg.BadEntryImmediateMinAge:
 			reason = fmt.Sprintf("BADENTRYIMM %.0f%% (fill %.0f%%) age=%ds", cfg.BadEntryImmediateSellPct, s.p.BadEntryDiffPct, int(age.Seconds()))
 		case s.p.BadEntry && cfg.BadExitFastSec > 0 && age >= time.Duration(cfg.BadExitFastSec)*time.Second && pnl < 0:

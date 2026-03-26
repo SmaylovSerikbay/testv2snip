@@ -1,12 +1,14 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/binary"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -157,6 +159,10 @@ type Config struct {
 	ScrapeAutoTargets bool
 	// Мин. покупок в один и тот же mint для эвристики «same-mint»; 0 = не использовать (только profitOK / крупный бай)
 	ScrapeSameMintMin int
+	// PIN: сохранять профитные кошельки в файл и всегда наблюдать за ними (переживает рестарт)
+	PinWalletMinPnl float64 // доля, напр. 0.05 = +5%
+	PinWalletsFile  string  // путь к файлу со списком (по одному адресу в строке)
+	PinUnpinLosses  int     // после N убыточных закрытий подряд — unpin и удалить из файла (0 = выкл.)
 }
 
 type Signal struct {
@@ -240,6 +246,9 @@ var (
 
 	tgtMu   sync.RWMutex
 	targets = map[string]time.Time{} // wallet → lastSeen
+
+	pinMu        sync.Mutex
+	pinnedWallet = map[string]bool{} // wallet → pinned (persisted)
 
 	posMu sync.RWMutex
 	pos   = map[string]*Position{} // mint_str → position
@@ -451,6 +460,7 @@ func main() {
 	log.SetFlags(log.Ltime | log.Lmicroseconds)
 	_ = godotenv.Load()
 	cfg = loadCfg()
+	loadPinnedWallets()
 	rpcCl = rpc.New(cfg.RPC)
 
 	// Token bucket: 10 burst, refill at ~8/s
@@ -723,7 +733,10 @@ func loadCfg() Config {
 		BadEntryFlashPct:         0.10,
 		MintMinPumpBuys:          0,
 		MintMinPumpBuysWindow:    12 * time.Second,
-		ScrapeSameMintMin:        5, // вариант B: было жёстко 3
+		ScrapeSameMintMin:        5,    // вариант B: было жёстко 3
+		PinWalletMinPnl:          0.08, // +8% и выше — закрепляем кошелёк
+		PinWalletsFile:           "pinned_wallets.txt",
+		PinUnpinLosses:           2,
 	}
 	// EXCLUSIVE HELIUS: никаких иных RPC/WSS (старые эндпойнты полностью отключены)
 	if v := os.Getenv("HELIUS_API_KEY"); v != "" {
@@ -841,6 +854,21 @@ func loadCfg() Config {
 		c.ScrapeSameMintMin = 0
 	} else {
 		c.ScrapeSameMintMin = int(evU("SCRAPE_SAME_MINT_MIN", uint64(c.ScrapeSameMintMin)))
+	}
+	if v := strings.TrimSpace(os.Getenv("PIN_WALLET_MIN_PNL_PCT")); v == "0" {
+		c.PinWalletMinPnl = 0
+	} else {
+		c.PinWalletMinPnl = evF("PIN_WALLET_MIN_PNL_PCT", c.PinWalletMinPnl*100) / 100
+	}
+	if v := strings.TrimSpace(os.Getenv("PIN_WALLETS_FILE")); v != "" {
+		c.PinWalletsFile = v
+	}
+	if v := strings.TrimSpace(os.Getenv("PIN_UNPIN_AFTER_LOSSES")); v == "0" {
+		c.PinUnpinLosses = 0
+	} else if v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n >= 0 {
+			c.PinUnpinLosses = n
+		}
 	}
 	if s := evU("MINT_COOLDOWN_SEC", 0); s > 0 {
 		c.MintCD = time.Duration(s) * time.Second
@@ -1075,6 +1103,16 @@ func scrape(ctx context.Context) {
 	now := time.Now()
 	tgtMu.Lock()
 	added := 0
+	// Всегда добавляем pinned кошельки (переживают рестарт)
+	for w := range snapshotPinnedWallets() {
+		if _, ok := targets[w]; !ok && len(targets) < cfg.MaxTargets {
+			targets[w] = now
+			added++
+			log.Printf("[SCRAPE] +Цель: %s (PINNED)", short(w))
+		} else if ok {
+			targets[w] = now
+		}
+	}
 	for _, w := range cfg.CopyWallets {
 		w = strings.TrimSpace(w)
 		if w == "" {
@@ -2338,6 +2376,7 @@ func checkAll(ctx context.Context) (hasProfit bool, needFastYoung bool) {
 		if ok {
 			removePos(j.mint)
 			trackTargetResult(j.p.Wallet, j.profitable)
+			notePinnedWalletOnWin(j.p.Wallet, j.pnl)
 		} else {
 			posMu.Lock()
 			j.p.SellFails++
@@ -2364,6 +2403,12 @@ func trackTargetResult(wallet string, win bool) {
 	} else {
 		tgtLosses[wallet]++
 		if tgtLosses[wallet] >= 2 {
+			if isPinnedWallet(wallet) && cfg.PinUnpinLosses > 0 && tgtLosses[wallet] >= cfg.PinUnpinLosses {
+				tgtLosses[wallet] = 0
+				tgtLossMu.Unlock()
+				unpinWallet(wallet, fmt.Sprintf("%d losses подряд", cfg.PinUnpinLosses))
+				return
+			}
 			tgtMu.Lock()
 			delete(targets, wallet)
 			tgtMu.Unlock()
@@ -2562,6 +2607,134 @@ func doSell(ctx context.Context, p *Position, reason string, cachedState *Bondin
 		return true
 	}
 	return false
+}
+
+func snapshotPinnedWallets() map[string]bool {
+	pinMu.Lock()
+	defer pinMu.Unlock()
+	cp := make(map[string]bool, len(pinnedWallet))
+	for w, v := range pinnedWallet {
+		if v {
+			cp[w] = true
+		}
+	}
+	return cp
+}
+
+func isPinnedWallet(w string) bool {
+	w = strings.TrimSpace(w)
+	if w == "" {
+		return false
+	}
+	pinMu.Lock()
+	defer pinMu.Unlock()
+	return pinnedWallet[w]
+}
+
+func unpinWallet(wallet string, reason string) {
+	wallet = strings.TrimSpace(wallet)
+	if wallet == "" {
+		return
+	}
+	pinMu.Lock()
+	if !pinnedWallet[wallet] {
+		pinMu.Unlock()
+		return
+	}
+	delete(pinnedWallet, wallet)
+	savePinnedWalletsLocked()
+	pinMu.Unlock()
+	log.Printf("[PIN] -Unpinned: %s (%s)", short(wallet), reason)
+	notifyWSReconn()
+}
+
+func loadPinnedWallets() {
+	if cfg.PinWalletsFile == "" {
+		return
+	}
+	f, err := os.Open(cfg.PinWalletsFile)
+	if err != nil {
+		// file might not exist on first run
+		if errors.Is(err, os.ErrNotExist) {
+			return
+		}
+		log.Printf("[PIN] load pinned wallets: %v", err)
+		return
+	}
+	defer f.Close()
+
+	sc := bufio.NewScanner(f)
+	n := 0
+	for sc.Scan() {
+		w := strings.TrimSpace(sc.Text())
+		if w == "" || strings.HasPrefix(w, "#") {
+			continue
+		}
+		if _, err := solana.PublicKeyFromBase58(w); err != nil {
+			continue
+		}
+		pinMu.Lock()
+		if !pinnedWallet[w] {
+			pinnedWallet[w] = true
+			n++
+		}
+		pinMu.Unlock()
+	}
+	if err := sc.Err(); err != nil {
+		log.Printf("[PIN] read pinned wallets: %v", err)
+	}
+	if n > 0 {
+		log.Printf("[PIN] Загружено pinned кошельков: %d", n)
+	}
+}
+
+func savePinnedWalletsLocked() {
+	if cfg.PinWalletsFile == "" {
+		return
+	}
+	tmp := cfg.PinWalletsFile + ".tmp"
+	f, err := os.Create(tmp)
+	if err != nil {
+		log.Printf("[PIN] save pinned wallets: %v", err)
+		return
+	}
+	bw := bufio.NewWriter(f)
+	for w, ok := range pinnedWallet {
+		if !ok {
+			continue
+		}
+		_, _ = bw.WriteString(w)
+		_, _ = bw.WriteString("\n")
+	}
+	_ = bw.Flush()
+	_ = f.Close()
+	_ = os.Rename(tmp, cfg.PinWalletsFile)
+}
+
+func notePinnedWalletOnWin(wallet string, pnl float64) {
+	if cfg.PinWalletMinPnl <= 0 {
+		return
+	}
+	wallet = strings.TrimSpace(wallet)
+	if wallet == "" {
+		return
+	}
+	if pnl < cfg.PinWalletMinPnl {
+		return
+	}
+	if _, err := solana.PublicKeyFromBase58(wallet); err != nil {
+		return
+	}
+	pinMu.Lock()
+	if pinnedWallet[wallet] {
+		pinMu.Unlock()
+		return
+	}
+	pinnedWallet[wallet] = true
+	savePinnedWalletsLocked()
+	pinMu.Unlock()
+	log.Printf("[PIN] +Pinned: %s (win pnl=%+.1f%%)", short(wallet), pnl*100)
+	notifyWSReconn()
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════

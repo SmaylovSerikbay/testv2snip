@@ -2677,6 +2677,18 @@ func checkAll(ctx context.Context) (hasProfit bool, needFastYoung bool) {
 		solNet := solOut - solOut/100
 		pnl := float64(solNet)/float64(s.spent) - 1.0
 		age := time.Since(s.p.Entry)
+		// Для kill-веток используем максимально свежую BC-оценку, чтобы не закрывать
+		// по устаревшему pnl (особенно на резких движениях).
+		if age >= time.Duration(cfg.TimeKillSec)*time.Second || age >= 60*time.Second ||
+			(cfg.SoftHardKillSec > 0 && age >= time.Duration(cfg.SoftHardKillSec)*time.Second) {
+			if freshState, freshBC, err := readBC(ctx, s.p.Mint); err == nil && freshState != nil {
+				state = freshState
+				bc = freshBC
+				solOut = calcSolOut(state.VTK, state.VSR, s.tokens)
+				solNet = solOut - solOut/100
+				pnl = float64(solNet)/float64(s.spent) - 1.0
+			}
+		}
 
 		if pnl > s.p.HiPnl {
 			s.p.HiPnl = pnl

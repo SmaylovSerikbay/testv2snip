@@ -2615,8 +2615,14 @@ func checkAll(ctx context.Context) (hasProfit bool, needFastYoung bool) {
 			reason = fmt.Sprintf("BADEXIT %ds pnl=%+.1f%%", int(age.Seconds()), pnl*100)
 		case pnl <= -positionSLlimit(s.p):
 			reason = fmt.Sprintf("SL %.0f%%", pnl*100)
-		case cfg.ProfitLockMinPeak > 0 && s.p.HiPnl >= cfg.ProfitLockMinPeak && pnl <= cfg.ProfitLockFloor:
-			reason = fmt.Sprintf("PROFITLOCK peak+%.1f%% now%+.1f%% (floor %+.2f%%)", s.p.HiPnl*100, pnl*100, cfg.ProfitLockFloor*100)
+		case cfg.ProfitLockMinPeak > 0 && s.p.HiPnl >= cfg.ProfitLockMinPeak:
+			lockFloor := cfg.ProfitLockFloor
+			if minNetExit > lockFloor {
+				lockFloor = minNetExit
+			}
+			if pnl <= lockFloor {
+				reason = fmt.Sprintf("PROFITLOCK peak+%.1f%% now%+.1f%% (floor %+.2f%%)", s.p.HiPnl*100, pnl*100, lockFloor*100)
+			}
 		case cfg.BreakevenMinPeak > 0 && s.p.HiPnl >= cfg.BreakevenMinPeak && pnl <= 0:
 			reason = fmt.Sprintf("BREAKEVEN peak+%.0f%%→%.0f%%", s.p.HiPnl*100, pnl*100)
 		case cfg.PeakPullbackPct > 0 && s.p.HiPnl >= cfg.TrailMinPeak && (s.p.HiPnl-pnl) >= cfg.PeakPullbackPct:

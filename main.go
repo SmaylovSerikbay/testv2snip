@@ -2741,8 +2741,15 @@ func checkAll(ctx context.Context) (hasProfit bool, needFastYoung bool) {
 			// Защита "набрал net-плюс и отдал обратно": выходим сразу у net-порога,
 			// не дожидаясь PROFITLOCK/HARDKILL.
 			reason = fmt.Sprintf("NETLOCK peak+%.1f%% now%+.1f%% (net floor %+.2f%%)", s.p.HiPnl*100, pnl*100, minNetExit*100)
-		case cfg.BadEntryImmediateSellPct > 0 && s.p.BadEntryDiffPct <= -cfg.BadEntryImmediateSellPct && age >= cfg.BadEntryImmediateMinAge:
-			reason = fmt.Sprintf("BADENTRYIMM %.0f%% (fill %.0f%%) age=%ds", cfg.BadEntryImmediateSellPct, s.p.BadEntryDiffPct, int(age.Seconds()))
+		case cfg.BadEntryImmediateSellPct > 0 &&
+			s.p.BadEntryDiffPct <= -cfg.BadEntryImmediateSellPct &&
+			age >= cfg.BadEntryImmediateMinAge &&
+			// Раньше BADENTRYIMM резал только по "fill", не проверяя реальный текущий pnl.
+			// Это могло приводить к продажам с небольшим pnl ниже 0%, когда round-trip fixed-cost
+			// гарантирует net-минус. Теперь режем только если pnl ушёл достаточно глубоко.
+			pnl <= -cfg.BadEntryImmediateSellPct/100:
+			reason = fmt.Sprintf("BADENTRYIMM %.0f%% (fill %.0f%%, pnl %.1f%%) age=%ds",
+				cfg.BadEntryImmediateSellPct, s.p.BadEntryDiffPct, pnl*100, int(age.Seconds()))
 		case s.p.BadEntry && cfg.BadExitFastSec > 0 && age >= time.Duration(cfg.BadExitFastSec)*time.Second && pnl < 0:
 			reason = fmt.Sprintf("BADEXITfast %ds pnl=%+.1f%%", int(age.Seconds()), pnl*100)
 		case cfg.FlashSLWindow > 0 && age >= cfg.FlashSLMinAge && age <= cfg.FlashSLWindow && pnl <= -flashSLThreshold(s.p):

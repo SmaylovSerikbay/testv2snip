@@ -2767,7 +2767,6 @@ func checkAll(ctx context.Context) (hasProfit bool, needFastYoung bool) {
 					log.Printf("[MON] Emergency retry: %s", short(j.mint))
 					if doSell(ctx, j.p, "EMERGENCY", state2, bc2) {
 						removePos(j.mint)
-						trackTargetResult(j.p.Wallet, false)
 					}
 				}
 			}
@@ -2962,13 +2961,17 @@ func doSell(ctx context.Context, p *Position, reason string, cachedState *Bondin
 		savedPreBal := preBal
 		savedPreBalOK := preBalOK
 		go func() {
+			accounted := false
 			confirmTx(ctx, txSig, "SELL", savedMint, func() {
 				ata := findATA(cfg.Key.PublicKey(), savedPos.Mint, savedTokProg)
 				rpcWait()
 				bal := getTokenBalance(ctx, ata)
 				if bal == 0 {
 					log.Printf("[SELL] TX не подтверждена, но токены проданы: %s", short(savedMint))
-					finalizeSellOutcome(savedPos.Wallet, savedSpent, savedSolNet, savedMint)
+					if !accounted {
+						finalizeSellOutcome(savedPos.Wallet, savedSpent, savedSolNet, savedMint)
+						accounted = true
+					}
 					return
 				}
 				addPos(savedPos.Mint, bal, savedPos.Spent, savedPos.Wallet, savedPos.TokProg)
@@ -2985,7 +2988,7 @@ func doSell(ctx context.Context, p *Position, reason string, cachedState *Bondin
 			rpcWait()
 			st, err := rpcClient().GetSignatureStatuses(ctx, false, txSig)
 			rpcNote(err)
-			if err == nil && len(st.Value) > 0 && st.Value[0] != nil && st.Value[0].Err == nil {
+			if !accounted && err == nil && len(st.Value) > 0 && st.Value[0] != nil && st.Value[0].Err == nil {
 				usedSolNet := savedSolNet
 				if savedPreBalOK {
 					if postBal, ok := walletBalanceLamports(ctx); ok && postBal >= savedPreBal {
@@ -2996,6 +2999,7 @@ func doSell(ctx context.Context, p *Position, reason string, cachedState *Bondin
 					}
 				}
 				finalizeSellOutcome(savedPos.Wallet, savedSpent, usedSolNet, savedMint)
+				accounted = true
 			}
 		}()
 		return true

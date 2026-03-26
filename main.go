@@ -93,8 +93,11 @@ type Config struct {
 	// Защита от "TIMEKILL -12%": такие минуса пусть режет FLASHSL/SL, а не timekill.
 	TimeKillMaxLoss float64
 	// SOFT_HARDKILL: после N сек закрыть позицию, если pnl ниже "чистого" порога (minNetExit),
-	// но не хуже TimeKillMaxLoss. Это защищает от долгой передержки до SL.
+	// но не хуже SoftHardKillMaxLoss. Это защищает от долгой передержки до SL.
 	SoftHardKillSec int
+	// Отдельный лимит минуса для SOFTHARD/HARDKILL (доля; 0.10 = −10%).
+	// Нужен, чтобы позиция не зависала между TimeKillMaxLoss и SL.
+	SoftHardKillMaxLoss float64
 	// Минимальный pnl для "профитных" выходов (TRAIL/PEAKPB/TIMEKILL в плюсе) с учётом fixed-cost.
 	// 0 = авторасчёт из priority+jito + буфер NET_EXIT_BUFFER_PCT.
 	MinNetExitPct float64 // доля (0.06 = +6%)
@@ -824,6 +827,7 @@ func loadCfg() Config {
 		TimeKillMin:              0.05,
 		TimeKillMaxLoss:          0.02,
 		SoftHardKillSec:          90,
+		SoftHardKillMaxLoss:      0.10,
 		MinNetExitPct:            0,
 		NetExitBufPct:            0.005, // +0.5% поверх fixed-cost
 		MaxTargets:               50,
@@ -961,6 +965,7 @@ func loadCfg() Config {
 	c.TimeKillMin = evF("TIMEKILL_MIN_PCT", c.TimeKillMin*100) / 100
 	c.TimeKillMaxLoss = evF("TIMEKILL_MAX_LOSS_PCT", c.TimeKillMaxLoss*100) / 100
 	c.SoftHardKillSec = int(evU("SOFT_HARDKILL_SEC", uint64(c.SoftHardKillSec)))
+	c.SoftHardKillMaxLoss = evF("SOFT_HARDKILL_MAX_LOSS_PCT", c.SoftHardKillMaxLoss*100) / 100
 	if v := strings.TrimSpace(os.Getenv("MIN_NET_EXIT_PCT")); v == "0" {
 		c.MinNetExitPct = 0
 	} else if v != "" {
@@ -2659,10 +2664,10 @@ func checkAll(ctx context.Context) (hasProfit bool, needFastYoung bool) {
 			reason = fmt.Sprintf("SL(trail) %.0f%%", pnl*100)
 		case age >= time.Duration(cfg.TimeKillSec)*time.Second && pnl < cfg.TimeKillMin && (pnl <= 0 || pnl >= minNetExit) && pnl >= -cfg.TimeKillMaxLoss && pnl > -positionSLlimit(s.p):
 			reason = fmt.Sprintf("TIMEKILL %ds pnl=%+.1f%%(<%+.1f%%; min -%.1f%%)", int(age.Seconds()), pnl*100, cfg.TimeKillMin*100, cfg.TimeKillMaxLoss*100)
-		case cfg.SoftHardKillSec > 0 && age >= time.Duration(cfg.SoftHardKillSec)*time.Second && pnl < minNetExit && pnl >= -cfg.TimeKillMaxLoss && pnl > -positionSLlimit(s.p):
-			reason = fmt.Sprintf("SOFTHARD %ds pnl=%+.1f%%(<net %+.1f%%; min -%.1f%%)", int(age.Seconds()), pnl*100, minNetExit*100, cfg.TimeKillMaxLoss*100)
-		case age >= 60*time.Second && pnl < 0.02 && (pnl <= 0 || pnl >= minNetExit) && pnl >= -cfg.TimeKillMaxLoss && pnl > -positionSLlimit(s.p):
-			reason = fmt.Sprintf("HARDKILL %ds pnl=%+.1f%%", int(age.Seconds()), pnl*100)
+		case cfg.SoftHardKillSec > 0 && age >= time.Duration(cfg.SoftHardKillSec)*time.Second && pnl < minNetExit && pnl >= -cfg.SoftHardKillMaxLoss && pnl > -positionSLlimit(s.p):
+			reason = fmt.Sprintf("SOFTHARD %ds pnl=%+.1f%%(<net %+.1f%%; min -%.1f%%)", int(age.Seconds()), pnl*100, minNetExit*100, cfg.SoftHardKillMaxLoss*100)
+		case age >= 60*time.Second && pnl < 0.02 && (pnl <= 0 || pnl >= minNetExit) && pnl >= -cfg.SoftHardKillMaxLoss && pnl > -positionSLlimit(s.p):
+			reason = fmt.Sprintf("HARDKILL %ds pnl=%+.1f%% (min -%.1f%%)", int(age.Seconds()), pnl*100, cfg.SoftHardKillMaxLoss*100)
 		}
 		if reason == "" {
 			continue

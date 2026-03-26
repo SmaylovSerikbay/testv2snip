@@ -2635,7 +2635,7 @@ func checkAll(ctx context.Context) (hasProfit bool, needFastYoung bool) {
 			reason = fmt.Sprintf("SL(trail) %.0f%%", pnl*100)
 		case age >= time.Duration(cfg.TimeKillSec)*time.Second && pnl < cfg.TimeKillMin && (pnl <= 0 || pnl >= minNetExit) && pnl >= -cfg.TimeKillMaxLoss && pnl > -positionSLlimit(s.p):
 			reason = fmt.Sprintf("TIMEKILL %ds pnl=%+.1f%%(<%+.1f%%; min -%.1f%%)", int(age.Seconds()), pnl*100, cfg.TimeKillMin*100, cfg.TimeKillMaxLoss*100)
-		case age >= 60*time.Second && pnl < 0.02 && (pnl <= 0 || pnl >= minNetExit) && pnl > -positionSLlimit(s.p):
+		case age >= 60*time.Second && pnl < 0.02 && (pnl <= 0 || pnl >= minNetExit) && pnl >= -cfg.TimeKillMaxLoss && pnl > -positionSLlimit(s.p):
 			reason = fmt.Sprintf("HARDKILL %ds pnl=%+.1f%%", int(age.Seconds()), pnl*100)
 		}
 		if reason == "" {

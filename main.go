@@ -2053,6 +2053,26 @@ func walletBalanceLamports(ctx context.Context) (uint64, bool) {
 	return b.Value, true
 }
 
+func txPayerDeltaLamports(ctx context.Context, sig solana.Signature) (int64, bool) {
+	maxVer := uint64(0)
+	rpcWait()
+	tx, err := rpcClient().GetTransaction(ctx, sig, &rpc.GetTransactionOpts{
+		Commitment:                     rpc.CommitmentConfirmed,
+		MaxSupportedTransactionVersion: &maxVer,
+	})
+	rpcNote(err)
+	if err != nil || tx == nil || tx.Meta == nil {
+		return 0, false
+	}
+	if len(tx.Meta.PreBalances) == 0 || len(tx.Meta.PostBalances) == 0 {
+		return 0, false
+	}
+	// Для наших TX payer всегда cfg.Key и он в индексе 0.
+	pre := tx.Meta.PreBalances[0]
+	post := tx.Meta.PostBalances[0]
+	return int64(post) - int64(pre), true
+}
+
 func finalizeSellOutcome(wallet string, spent uint64, solNet uint64, mint string) {
 	if spent == 0 {
 		return
@@ -2062,7 +2082,7 @@ func finalizeSellOutcome(wallet string, spent uint64, solNet uint64, mint string
 	recordPnl(spent, solNet, mint)
 	trackTargetResult(wallet, netFrac > 0)
 	notePinnedWalletOnWin(wallet, netFrac)
-	log.Printf("[SELL][FACT] %s | actual_in=%0.6f SOL | spent=%0.6f SOL | net=%+.2f%%",
+	log.Printf("[SELL][FACT] %s | accounted_in=%0.6f SOL | spent=%0.6f SOL | net=%+.2f%%",
 		short(mint), float64(solNet)/1e9, float64(spent)/1e9, netFrac*100)
 }
 
@@ -2899,7 +2919,6 @@ func doSell(ctx context.Context, p *Position, reason string, cachedState *Bondin
 	// анти-0xbc4: быстрые ретраи с увеличением slippage (если цена резко двигается)
 	// базовый cfg.SellSlip (например 4000), затем 6000, 8000, 9500.
 	trySlips := []uint64{cfg.SellSlip, 6000, 8000, 9500}
-	preBal, preBalOK := walletBalanceLamports(ctx)
 	for attempt, slip := range trySlips {
 		if slip > 9900 {
 			slip = 9900
@@ -2958,8 +2977,6 @@ func doSell(ctx context.Context, p *Position, reason string, cachedState *Bondin
 		savedSolNet := solNet
 		savedMint := mintStr
 		savedTokProg := tokProg
-		savedPreBal := preBal
-		savedPreBalOK := preBalOK
 		go func() {
 			accounted := false
 			confirmTx(ctx, txSig, "SELL", savedMint, func() {
@@ -2990,13 +3007,11 @@ func doSell(ctx context.Context, p *Position, reason string, cachedState *Bondin
 			rpcNote(err)
 			if !accounted && err == nil && len(st.Value) > 0 && st.Value[0] != nil && st.Value[0].Err == nil {
 				usedSolNet := savedSolNet
-				if savedPreBalOK {
-					if postBal, ok := walletBalanceLamports(ctx); ok && postBal >= savedPreBal {
-						actual := postBal - savedPreBal
-						if actual > 0 {
-							usedSolNet = actual
-						}
-					}
+				if delta, ok := txPayerDeltaLamports(ctx, txSig); ok && delta > 0 {
+					log.Printf("[SELL][TXDELTA] %s | wallet_delta=%+.6f SOL", short(savedMint), float64(delta)/1e9)
+					// recordPnl ожидает "грязный" solNet до вычета fixed-cost,
+					// поэтому к net-дельте кошелька добавляем fixed round-trip.
+					usedSolNet = uint64(delta) + fixedTradeCostsLamports()
 				}
 				finalizeSellOutcome(savedPos.Wallet, savedSpent, usedSolNet, savedMint)
 				accounted = true

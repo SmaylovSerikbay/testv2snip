@@ -2673,8 +2673,20 @@ func checkAll(ctx context.Context) (hasProfit bool, needFastYoung bool) {
 	var jobs []sellJob
 	for _, s := range snaps {
 		if cfg.MonitorFastYoungSec > 0 && s.p != nil && (!cfg.Live || s.p.Confirmed) {
-			if time.Since(s.p.Entry) < time.Duration(cfg.MonitorFastYoungSec)*time.Second {
+			age := time.Since(s.p.Entry)
+			// Базовая логика: первые N секунд после входа.
+			if age < time.Duration(cfg.MonitorFastYoungSec)*time.Second {
 				needFastYoung = true
+			} else {
+				// Дополнительный хвост: если уже был net-плюс-пик,
+				// то выход из прибыли часто происходит быстро (giveback),
+				// поэтому не переключаемся на медленный тик сразу по достижению N сек.
+				// Это снижает шанс “проскочить” через net-floor между итерациями.
+				extra := 10 * time.Second
+				minNetExit := minNetExitThreshold()
+				if s.p.HiPnl >= minNetExit+0.003 && age < time.Duration(cfg.MonitorFastYoungSec)*time.Second+extra {
+					needFastYoung = true
+				}
 			}
 		}
 		// Не пытаемся продавать до подтверждения BUY и получения реального баланса ATA.

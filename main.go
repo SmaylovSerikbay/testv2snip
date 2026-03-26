@@ -657,13 +657,13 @@ func sendBuyAsJitoBundle(ctx context.Context, url string, tx *solana.Transaction
 	}
 	b64 := base64.StdEncoding.EncodeToString(bin)
 
-	// sendBundle: [tx1..txN] base64
+	// sendBundle: params: [[tx1..txN], {encoding:"base64"}]
 	reqBody, _ := json.Marshal(map[string]any{
 		"id":      1,
 		"jsonrpc": "2.0",
 		"method":  "sendBundle",
 		"params": []any{
-			[]any{b64},
+			[]string{b64},
 			map[string]any{"encoding": "base64"},
 		},
 	})
@@ -682,7 +682,11 @@ func sendBuyAsJitoBundle(ctx context.Context, url string, tx *solana.Transaction
 	defer r.Body.Close()
 	body, _ := io.ReadAll(r.Body)
 	if r.StatusCode != 200 {
-		return solana.Signature{}, fmt.Errorf("HTTP %d", r.StatusCode)
+		msg := strings.TrimSpace(string(body))
+		if len(msg) > 400 {
+			msg = msg[:400] + "…"
+		}
+		return solana.Signature{}, fmt.Errorf("HTTP %d: %s", r.StatusCode, msg)
 	}
 
 	// We return tx signature (what the rest of the code expects).

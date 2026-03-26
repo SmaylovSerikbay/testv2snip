@@ -118,6 +118,11 @@ type Config struct {
 	BCSigLagBuf  time.Duration // stop retries when signal lag exceeds MaxSignalLag minus this
 	// After BUY confirm: if token balance vs expected is worse than -this %, mark BadEntry
 	BadEntryPct float64
+	// При BadEntry — ужесточить порог полного SL (доля; 0.14 = −14%%). 0 = не ужесточать (как STOP_LOSS)
+	BadEntrySLPct float64
+	// Мин. число Buy по этому mint с глобального pump WS за окно (0 = выкл.) — меньше «одиноких» входов
+	MintMinPumpBuys       int
+	MintMinPumpBuysWindow time.Duration
 	// BREAKEVEN: выход в ноль/минус только если пик HiPnl >= этого порога (доля, 0.30 = +30%)
 	BreakevenMinPeak float64
 	// Мин. пик HiPnl (доля), с которого включаются TRAIL и PEAK_PULLBACK (раньше было жёстко +4%%)
@@ -269,6 +274,10 @@ var (
 
 	// Scraper WS-only pipeline
 	scrapeEvCh = make(chan scrapeEv, 4096)
+
+	// Счётчик Buy по mint из logsSubscribe на pump (анти «тихий» токен)
+	mintPumpBuyMu sync.Mutex
+	mintPumpBuys  = map[string][]time.Time{} // mint → время каждого Buy с глобального стрима
 )
 
 func rpcWait() { <-rpcBucket }
@@ -500,6 +509,14 @@ func main() {
 		cfg.MaxTokInfoLag.Milliseconds(), cfg.MaxSignalLag.Milliseconds())
 	log.Printf("[INIT] CopyFilters: whale>=%.2f SOL | minVSR>=%.1f SOL | mintCooldown=%v",
 		float64(cfg.MinWhaleBuyLam)/1e9, float64(cfg.MinVSRLam)/1e9, cfg.MintCD)
+	if cfg.MintMinPumpBuys > 0 {
+		log.Printf("[INIT] Mint depth: ≥%d pump-Buy по mint за %v (глобальный WS; 0 в .env = выкл.)",
+			cfg.MintMinPumpBuys, cfg.MintMinPumpBuysWindow.Round(time.Second))
+	}
+	if cfg.BadEntrySLPct > 0 {
+		log.Printf("[INIT] BAD_ENTRY_SL: при плохом входе полный стоп −%.0f%% вместо −%.0f%%",
+			cfg.BadEntrySLPct*100, cfg.SL*100)
+	}
 	if cfg.MintLossCD > 0 {
 		log.Printf("[INIT] После убытка по mint — пауза повторного входа %v (MINT_LOSS_COOLDOWN_SEC; 0=выкл.)",
 			cfg.MintLossCD.Round(time.Second))
@@ -654,6 +671,9 @@ func loadCfg() Config {
 		BCRetrySleep:          100 * time.Millisecond,
 		BCSigLagBuf:           100 * time.Millisecond,
 		BadEntryPct:           20,
+		BadEntrySLPct:         0.14,
+		MintMinPumpBuys:       0,
+		MintMinPumpBuysWindow: 12 * time.Second,
 		ScrapeSameMintMin:     5, // вариант B: было жёстко 3
 	}
 	// EXCLUSIVE HELIUS: никаких иных RPC/WSS (старые эндпойнты полностью отключены)
@@ -800,6 +820,17 @@ func loadCfg() Config {
 		if f, err := strconv.ParseFloat(v, 64); err == nil && f > 0 {
 			c.BadEntryPct = f
 		}
+	}
+	if v := strings.TrimSpace(os.Getenv("BAD_ENTRY_SL_PCT")); v == "0" {
+		c.BadEntrySLPct = 0
+	} else {
+		c.BadEntrySLPct = evF("BAD_ENTRY_SL_PCT", c.BadEntrySLPct*100) / 100
+	}
+	c.MintMinPumpBuys = int(evU("MIN_MINT_PUMP_BUYS", uint64(c.MintMinPumpBuys)))
+	if w := evU("MIN_MINT_PUMP_BUYS_WINDOW_SEC", 0); w > 0 {
+		c.MintMinPumpBuysWindow = time.Duration(w) * time.Second
+	} else if c.MintMinPumpBuys > 0 && c.MintMinPumpBuysWindow == 0 {
+		c.MintMinPumpBuysWindow = 12 * time.Second
 	}
 	return c
 }
@@ -1474,6 +1505,7 @@ func wsLoop(ctx context.Context) error {
 				continue
 			}
 			if ev := parseTradeFromLogs(lr.Value.Logs); ev != nil && ev.IsBuy {
+				noteMintPumpBuy(ev.Mint.String())
 				select {
 				case scrapeEvCh <- scrapeEv{ev: ev, recvTime: now}:
 				default:
@@ -1505,6 +1537,7 @@ func parseBuySignal(wallet string, logs []string) {
 	if ev.Sol < cfg.MinWhaleBuyLam {
 		return
 	}
+	noteMintPumpBuy(ev.Mint.String())
 
 	select {
 	case signalCh <- Signal{Mint: ev.Mint, Wallet: wallet, At: time.Now()}:
@@ -1555,6 +1588,61 @@ func setMintCooldown(mint string) {
 	cdMu.Lock()
 	cdMap[mint] = time.Now()
 	cdMu.Unlock()
+}
+
+func noteMintPumpBuy(mintStr string) {
+	if mintStr == "" {
+		return
+	}
+	keep := 60 * time.Second
+	if cfg.MintMinPumpBuysWindow > keep {
+		keep = cfg.MintMinPumpBuysWindow
+	}
+	now := time.Now()
+	cutoff := now.Add(-keep)
+	mintPumpBuyMu.Lock()
+	defer mintPumpBuyMu.Unlock()
+	lst := mintPumpBuys[mintStr]
+	i := 0
+	for _, t := range lst {
+		if t.After(cutoff) {
+			lst[i] = t
+			i++
+		}
+	}
+	lst = lst[:i]
+	lst = append(lst, now)
+	if len(lst) > 96 {
+		lst = lst[len(lst)-96:]
+	}
+	mintPumpBuys[mintStr] = lst
+}
+
+func mintPumpBuysInWindow(mintStr string, window time.Duration) int {
+	if window <= 0 {
+		return 0
+	}
+	now := time.Now()
+	cutoff := now.Add(-window)
+	mintPumpBuyMu.Lock()
+	defer mintPumpBuyMu.Unlock()
+	n := 0
+	for _, t := range mintPumpBuys[mintStr] {
+		if t.After(cutoff) {
+			n++
+		}
+	}
+	return n
+}
+
+func positionSLlimit(p *Position) float64 {
+	if p == nil {
+		return cfg.SL
+	}
+	if p.BadEntry && cfg.BadEntrySLPct > 0 && cfg.BadEntrySLPct < cfg.SL {
+		return cfg.BadEntrySLPct
+	}
+	return cfg.SL
 }
 
 func doBuy(ctx context.Context, sig Signal) {
@@ -1623,6 +1711,18 @@ func doBuy(ctx context.Context, sig Signal) {
 		circuitOpen.Store(true)
 		log.Printf("[BUY] Skip: session PnL breaker (%.2f%% от старта <= -%.0f%%) — торговля остановлена", sp, cfg.MaxSessionLoss)
 		return
+	}
+
+	if cfg.MintMinPumpBuys > 0 {
+		win := cfg.MintMinPumpBuysWindow
+		if win <= 0 {
+			win = 12 * time.Second
+		}
+		if n := mintPumpBuysInWindow(mint, win); n < cfg.MintMinPumpBuys {
+			log.Printf("[BUY] Skip: mint pump depth %d<%d за %v (мало Buy на mint с pump WS) | %s",
+				n, cfg.MintMinPumpBuys, win.Round(time.Second), short(mint))
+			return
+		}
 	}
 
 	log.Printf("[BUY] Сигнал: %s от %s", short(mint), short(sig.Wallet))
@@ -2081,7 +2181,7 @@ func checkAll(ctx context.Context) (hasProfit bool, needFastYoung bool) {
 			reason = fmt.Sprintf("QUICKTP %ds +%.0f%%", int(age.Seconds()), pnl*100)
 		case s.p.BadEntry && age >= 10*time.Second && pnl < 0:
 			reason = fmt.Sprintf("BADEXIT %ds pnl=%+.1f%%", int(age.Seconds()), pnl*100)
-		case pnl <= -cfg.SL:
+		case pnl <= -positionSLlimit(s.p):
 			reason = fmt.Sprintf("SL %.0f%%", pnl*100)
 		case cfg.BreakevenMinPeak > 0 && s.p.HiPnl >= cfg.BreakevenMinPeak && pnl <= 0:
 			reason = fmt.Sprintf("BREAKEVEN peak+%.0f%%→%.0f%%", s.p.HiPnl*100, pnl*100)
@@ -2091,9 +2191,9 @@ func checkAll(ctx context.Context) (hasProfit bool, needFastYoung bool) {
 			reason = fmt.Sprintf("TRAIL peak+%.0f%% now+%.0f%%", s.p.HiPnl*100, pnl*100)
 		case s.p.HiPnl >= cfg.TrailMinPeak && pnl < s.p.HiPnl*cfg.TrailRelMult && pnl <= 0:
 			reason = fmt.Sprintf("SL(trail) %.0f%%", pnl*100)
-		case age >= time.Duration(cfg.TimeKillSec)*time.Second && pnl < cfg.TimeKillMin && pnl > -cfg.SL:
+		case age >= time.Duration(cfg.TimeKillSec)*time.Second && pnl < cfg.TimeKillMin && pnl > -positionSLlimit(s.p):
 			reason = fmt.Sprintf("TIMEKILL %ds pnl=%+.1f%%(<%+.1f%%)", int(age.Seconds()), pnl*100, cfg.TimeKillMin*100)
-		case age >= 60*time.Second && pnl < 0.02 && pnl > -cfg.SL:
+		case age >= 60*time.Second && pnl < 0.02 && pnl > -positionSLlimit(s.p):
 			reason = fmt.Sprintf("HARDKILL %ds pnl=%+.1f%%", int(age.Seconds()), pnl*100)
 		}
 		if reason == "" {
@@ -2113,7 +2213,7 @@ func checkAll(ctx context.Context) (hasProfit bool, needFastYoung bool) {
 			posMu.Lock()
 			j.p.SellFails++
 			posMu.Unlock()
-			if j.pnl <= -cfg.SL {
+			if j.pnl <= -positionSLlimit(j.p) {
 				state2, bc2, err2 := readBC(ctx, j.p.Mint)
 				if err2 == nil {
 					log.Printf("[MON] Emergency retry: %s", short(j.mint))

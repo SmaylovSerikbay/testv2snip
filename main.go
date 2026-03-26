@@ -122,6 +122,10 @@ type Config struct {
 	BadEntryPct float64
 	// При BadEntry — ужесточить порог полного SL (доля; 0.14 = −14%%). 0 = не ужесточать (как STOP_LOSS)
 	BadEntrySLPct float64
+	// При BadEntry — раньше выходить в минус (сек; 0 = только классический BADEXIT через 10с)
+	BadExitFastSec int
+	// При BadEntry — FLASHSL по более узкому порогу (доля; 0.10 = −10%%). 0 = как FLASH_SL_MIN_PCT
+	BadEntryFlashPct float64
 	// Мин. число Buy по этому mint с глобального pump WS за окно (0 = выкл.) — меньше «одиноких» входов
 	MintMinPumpBuys       int
 	MintMinPumpBuysWindow time.Duration
@@ -524,6 +528,13 @@ func main() {
 		log.Printf("[INIT] BAD_ENTRY_SL: при плохом входе полный стоп −%.0f%% вместо −%.0f%%",
 			cfg.BadEntrySLPct*100, cfg.SL*100)
 	}
+	if cfg.BadExitFastSec > 0 {
+		log.Printf("[INIT] BADEXITfast: при BadEntry выход в минус через %ds (раньше чем 10с BADEXIT)", cfg.BadExitFastSec)
+	}
+	if cfg.BadEntryFlashPct > 0 {
+		log.Printf("[INIT] BAD_ENTRY_FLASH: при BadEntry FLASHSL по −%.0f%% (а не −%.0f%%)",
+			cfg.BadEntryFlashPct*100, cfg.FlashSLPct*100)
+	}
 	if cfg.MintLossCD > 0 {
 		log.Printf("[INIT] После убытка по mint — пауза повторного входа %v (MINT_LOSS_COOLDOWN_SEC; 0=выкл.)",
 			cfg.MintLossCD.Round(time.Second))
@@ -679,6 +690,8 @@ func loadCfg() Config {
 		BCSigLagBuf:           100 * time.Millisecond,
 		BadEntryPct:           20,
 		BadEntrySLPct:         0.14,
+		BadExitFastSec:        4,
+		BadEntryFlashPct:      0.10,
 		MintMinPumpBuys:       0,
 		MintMinPumpBuysWindow: 12 * time.Second,
 		ScrapeSameMintMin:     5, // вариант B: было жёстко 3
@@ -845,6 +858,12 @@ func loadCfg() Config {
 	} else {
 		c.BadEntrySLPct = evF("BAD_ENTRY_SL_PCT", c.BadEntrySLPct*100) / 100
 	}
+	if v := strings.TrimSpace(os.Getenv("BAD_ENTRY_FLASH_MIN_PCT")); v == "0" {
+		c.BadEntryFlashPct = 0
+	} else {
+		c.BadEntryFlashPct = evF("BAD_ENTRY_FLASH_MIN_PCT", c.BadEntryFlashPct*100) / 100
+	}
+	c.BadExitFastSec = int(evU("BAD_EXIT_FAST_SEC", uint64(c.BadExitFastSec)))
 	c.MintMinPumpBuys = int(evU("MIN_MINT_PUMP_BUYS", uint64(c.MintMinPumpBuys)))
 	if w := evU("MIN_MINT_PUMP_BUYS_WINDOW_SEC", 0); w > 0 {
 		c.MintMinPumpBuysWindow = time.Duration(w) * time.Second
@@ -1664,6 +1683,13 @@ func positionSLlimit(p *Position) float64 {
 	return cfg.SL
 }
 
+func flashSLThreshold(p *Position) float64 {
+	if p != nil && p.BadEntry && cfg.BadEntryFlashPct > 0 && cfg.BadEntryFlashPct < cfg.FlashSLPct {
+		return cfg.BadEntryFlashPct
+	}
+	return cfg.FlashSLPct
+}
+
 func doBuy(ctx context.Context, sig Signal) {
 	signalT := sig.At
 	if signalT.IsZero() {
@@ -2192,7 +2218,9 @@ func checkAll(ctx context.Context) (hasProfit bool, needFastYoung bool) {
 		switch {
 		case pnl >= cfg.TP:
 			reason = fmt.Sprintf("TP +%.0f%%", pnl*100)
-		case cfg.FlashSLWindow > 0 && age >= cfg.FlashSLMinAge && age <= cfg.FlashSLWindow && pnl <= -cfg.FlashSLPct:
+		case s.p.BadEntry && cfg.BadExitFastSec > 0 && age >= time.Duration(cfg.BadExitFastSec)*time.Second && pnl < 0:
+			reason = fmt.Sprintf("BADEXITfast %ds pnl=%+.1f%%", int(age.Seconds()), pnl*100)
+		case cfg.FlashSLWindow > 0 && age >= cfg.FlashSLMinAge && age <= cfg.FlashSLWindow && pnl <= -flashSLThreshold(s.p):
 			reason = fmt.Sprintf("FLASHSL %ds pnl=%+.1f%%", int(age.Seconds()), pnl*100)
 		case cfg.EarlySLWindow > 0 && age <= cfg.EarlySLWindow && pnl <= -cfg.EarlySLPct:
 			reason = fmt.Sprintf("EARLYSL %ds pnl=%+.1f%%", int(age.Seconds()), pnl*100)

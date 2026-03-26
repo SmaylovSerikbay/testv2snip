@@ -131,6 +131,10 @@ type Config struct {
 	MintMinPumpBuysWindow time.Duration
 	// BREAKEVEN: выход в ноль/минус только если пик HiPnl >= этого порога (доля, 0.30 = +30%)
 	BreakevenMinPeak float64
+	// PROFIT_LOCK: если позиция уже дала пик ≥ MinPeak, то не отдавать прибыль ниже Floor (доля; 0.005 = +0.5%).
+	// MinPeak=0 = выкл.
+	ProfitLockMinPeak float64
+	ProfitLockFloor   float64
 	// Мин. пик HiPnl (доля), с которого включаются TRAIL и PEAK_PULLBACK (раньше было жёстко +4%%)
 	TrailMinPeak float64
 	// Откат от пика позиции в долях (0.05 = 5 п.п.) — фиксация при медленном скатывании с графика; 0 = выкл.
@@ -566,6 +570,12 @@ func main() {
 	} else {
 		log.Printf("[INIT] BREAKEVEN выкл. (BREAKEVEN_MIN_PEAK_PCT=0)")
 	}
+	if cfg.ProfitLockMinPeak > 0 {
+		log.Printf("[INIT] PROFIT_LOCK: при пике ≥+%.0f%% держим минимум %+.2f%%",
+			cfg.ProfitLockMinPeak*100, cfg.ProfitLockFloor*100)
+	} else {
+		log.Printf("[INIT] PROFIT_LOCK выкл. (PROFIT_LOCK_MIN_PEAK_PCT=0)")
+	}
 	if cfg.ScrapeAutoTargets {
 		if len(cfg.CopyWallets) > 0 {
 			log.Printf("[INIT] Цели: авто WS-скрейп + %d доп. из COPY_WALLETS", len(cfg.CopyWallets))
@@ -660,8 +670,10 @@ func loadCfg() Config {
 		EarlySLPct:            0.08, // −8% в первые 5с — на pump часто шум; см. EARLYSL_* в .env
 		SL:                    0.25,
 		BreakevenMinPeak:      0.30,
-		TrailMinPeak:          0.03, // +3%% пика — уже следим за откатом (не ждать только +4%%)
-		PeakPullbackPct:       0.05, // −5 п.п. от пика → SELL (анти «висел в плюсе и уехал в минус»)
+		ProfitLockMinPeak:     0.06,  // +6% peak → начинаем «не отдавать»
+		ProfitLockFloor:       0.005, // держим минимум +0.5% (учёт комиссий/проскальзывания)
+		TrailMinPeak:          0.03,  // +3%% пика — уже следим за откатом (не ждать только +4%%)
+		PeakPullbackPct:       0.05,  // −5 п.п. от пика → SELL (анти «висел в плюсе и уехал в минус»)
 		TrailRelMult:          0.65,
 		ScrapeAutoTargets:     true,
 		TimeKillSec:           60,
@@ -749,6 +761,12 @@ func loadCfg() Config {
 	}
 	c.EarlySLPct = evF("EARLYSL_MIN_PCT", c.EarlySLPct*100) / 100
 	c.BreakevenMinPeak = evF("BREAKEVEN_MIN_PEAK_PCT", c.BreakevenMinPeak*100) / 100
+	if v := strings.TrimSpace(os.Getenv("PROFIT_LOCK_MIN_PEAK_PCT")); v == "0" {
+		c.ProfitLockMinPeak = 0
+	} else {
+		c.ProfitLockMinPeak = evF("PROFIT_LOCK_MIN_PEAK_PCT", c.ProfitLockMinPeak*100) / 100
+	}
+	c.ProfitLockFloor = evF("PROFIT_LOCK_FLOOR_PCT", c.ProfitLockFloor*100) / 100
 	c.TrailMinPeak = evF("TRAIL_MIN_PEAK_PCT", c.TrailMinPeak*100) / 100
 	if v := strings.TrimSpace(os.Getenv("PEAK_PULLBACK_PCT")); v == "0" {
 		c.PeakPullbackPct = 0
@@ -2239,6 +2257,8 @@ func checkAll(ctx context.Context) (hasProfit bool, needFastYoung bool) {
 			reason = fmt.Sprintf("BADEXIT %ds pnl=%+.1f%%", int(age.Seconds()), pnl*100)
 		case pnl <= -positionSLlimit(s.p):
 			reason = fmt.Sprintf("SL %.0f%%", pnl*100)
+		case cfg.ProfitLockMinPeak > 0 && s.p.HiPnl >= cfg.ProfitLockMinPeak && pnl <= cfg.ProfitLockFloor:
+			reason = fmt.Sprintf("PROFITLOCK peak+%.1f%% now%+.1f%% (floor %+.2f%%)", s.p.HiPnl*100, pnl*100, cfg.ProfitLockFloor*100)
 		case cfg.BreakevenMinPeak > 0 && s.p.HiPnl >= cfg.BreakevenMinPeak && pnl <= 0:
 			reason = fmt.Sprintf("BREAKEVEN peak+%.0f%%→%.0f%%", s.p.HiPnl*100, pnl*100)
 		case cfg.PeakPullbackPct > 0 && s.p.HiPnl >= cfg.TrailMinPeak && (s.p.HiPnl-pnl) >= cfg.PeakPullbackPct:

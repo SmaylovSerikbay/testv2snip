@@ -3162,7 +3162,8 @@ func confirmTx(ctx context.Context, txSig solana.Signature, tag, mintStr string,
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
 		rpcWait()
-		statuses, err := rpcClient().GetSignatureStatuses(ctx, false, txSig)
+		// true: ищем и вне «recent cache» — иначе часть нод/Helius не видит подпись те же 10–15с.
+		statuses, err := rpcClient().GetSignatureStatuses(ctx, true, txSig)
 		rpcNote(err)
 		if err != nil || len(statuses.Value) == 0 || statuses.Value[0] == nil {
 			time.Sleep(2 * time.Second)
@@ -3176,10 +3177,14 @@ func confirmTx(ctx context.Context, txSig solana.Signature, tag, mintStr string,
 			}
 			return
 		}
+		// Успешное исполнение: есть слот — даже если confirmationStatus пустой (кривой ответ RPC).
+		if st.Slot > 0 {
+			log.Printf("[%s] ✓ OK %s | %s", tag, txSig.String()[:12], short(mintStr))
+			return
+		}
 		okStatus := st.ConfirmationStatus == rpc.ConfirmationStatusConfirmed ||
 			st.ConfirmationStatus == rpc.ConfirmationStatusFinalized
 		// BUY: включение в блок часто видно как processed раньше, чем Helius успевает отдать confirmed.
-		// Иначе ловим ложный таймаут при живой транзакции.
 		if tag == "BUY" && !okStatus {
 			okStatus = st.ConfirmationStatus == rpc.ConfirmationStatusProcessed
 		}
@@ -3189,7 +3194,8 @@ func confirmTx(ctx context.Context, txSig solana.Signature, tag, mintStr string,
 		}
 		time.Sleep(2 * time.Second)
 	}
-	log.Printf("[%s] ⚠ Не подтверждена за %ds: %s | %s", tag, int(timeout.Seconds()), txSig.String()[:12], short(mintStr))
+	log.Printf("[%s] ⚠ Не подтверждена за %ds: %s | %s (RPC не видит подпись — часто TX не попала в блок; accept Jito ≠ inclusion)",
+		tag, int(timeout.Seconds()), txSig.String()[:12], short(mintStr))
 	if onFail != nil {
 		onFail()
 	}
@@ -3816,7 +3822,7 @@ func doSell(ctx context.Context, p *Position, reason string, cachedState *Bondin
 				log.Printf("[SELL] Позиция восстановлена: %s (fails=%d, bal=%d)", short(savedMint), savedPos.SellFails+1, bal)
 			})
 			rpcWait()
-			st, err := rpcClient().GetSignatureStatuses(ctx, false, txSig)
+			st, err := rpcClient().GetSignatureStatuses(ctx, true, txSig)
 			rpcNote(err)
 			if !accounted && err == nil && len(st.Value) > 0 && st.Value[0] != nil && st.Value[0].Err == nil {
 				usedSolNet := savedSolNet

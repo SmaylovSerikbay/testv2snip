@@ -126,6 +126,11 @@ type Config struct {
 	// Анти-скэм: проверка концентрации холдеров по RPC getTokenLargestAccounts (0 = выкл.)
 	HolderMaxPct float64 // порог в долях, напр. 0.10 = 10%
 	HolderTopN   int     // сколько крупнейших аккаунтов смотреть (по умолчанию 20)
+	// Быстрый режим holder-check: если ликвидность >= этого порога, пропускаем holder RPC проверку.
+	// 0 = всегда проверять (как раньше).
+	HolderCheckMinVSR uint64
+	// TTL кеша баланса в hot-path BUY (ms): снижает preSend, но баланс может быть слегка устаревшим.
+	WalletBalCacheTTL time.Duration
 	// Трейлинг сессии: если реализованный PnL сессии когда-то был ≥ Min (%% от старта), при откате от пика на Giveback п.п. — стоп новых BUY (как CIRCUIT).
 	SessionTrailMinPeak  float64 // %% от баланса при старте, 0 = выкл.
 	SessionTrailGiveback float64 // п.п. ниже пика сессии
@@ -853,6 +858,8 @@ func loadCfg() Config {
 		ScrapeSameMintMin:        5,    // вариант B: было жёстко 3
 		HolderMaxPct:             0.10, // 10%: анти-концентрация холдеров
 		HolderTopN:               20,
+		HolderCheckMinVSR:        80_000_000_000, // >=80 SOL: holder-check skip ради скорости
+		WalletBalCacheTTL:        5 * time.Second,
 		PinWalletMinPnl:          0.08, // +8% и выше — закрепляем кошелёк
 		PinWalletsFile:           "pinned_wallets.txt",
 		PinUnpinLosses:           2,
@@ -981,6 +988,10 @@ func loadCfg() Config {
 	}
 	if n := evU("HOLDER_TOPN", 0); n > 0 {
 		c.HolderTopN = int(n)
+	}
+	c.HolderCheckMinVSR = evU("HOLDER_CHECK_MIN_VSR_LAMPORTS", c.HolderCheckMinVSR)
+	if ms := evU("WALLET_BAL_CACHE_TTL_MS", 0); ms > 0 {
+		c.WalletBalCacheTTL = time.Duration(ms) * time.Millisecond
 	}
 	if s := evU("MINT_MIN_AGE_SEC", 0); s > 0 {
 		c.MintMinAge = time.Duration(s) * time.Second
@@ -2128,7 +2139,7 @@ func doBuy(ctx context.Context, sig Signal) {
 	go func() {
 		defer pwg.Done()
 		t0 := time.Now()
-		if v, ok := getWalletBalCache(2 * time.Second); ok {
+		if v, ok := getWalletBalCache(cfg.WalletBalCacheTTL); ok {
 			preBal = v
 			preBalOK = true
 			balHit = true
@@ -2222,7 +2233,7 @@ func doBuy(ctx context.Context, sig Signal) {
 		return
 	}
 
-	if cfg.HolderMaxPct > 0 {
+	if cfg.HolderMaxPct > 0 && (cfg.HolderCheckMinVSR == 0 || state.VSR < cfg.HolderCheckMinVSR) {
 		// Exclude bonding-curve ATA from holder concentration check
 		excl := findATA(bc, sig.Mint, tokProg)
 		hctx, cancel := context.WithTimeout(ctx, 400*time.Millisecond)
@@ -2236,6 +2247,8 @@ func doBuy(ctx context.Context, sig Signal) {
 			setMintCooldown(mint)
 			return
 		}
+	} else if cfg.HolderMaxPct > 0 {
+		holderMs = -1 // skipped by fast-path (high VSR)
 	}
 
 	if state.RTK > 0 && state.Supply > 0 && float64(state.RTK)/float64(state.Supply) < 0.05 {
@@ -2395,7 +2408,7 @@ func doBuy(ctx context.Context, sig Signal) {
 	log.Printf("[BUY] TX: %s | %s | %.4f SOL | preSend=%dms sendRTT=%dms total=%dms",
 		txSig.String()[:12], short(mint), float64(cfg.BuyLamp)/1e9,
 		lastPreSendLagMs, lastSendRTTMs, totalLagMs)
-	log.Printf("[BUY][TIMING] %s | bal=%dms(hit=%t) tok=%dms(hit=%t) bc=%dms ata=%dms(hit=%t) holders=%dms",
+	log.Printf("[BUY][TIMING] %s | bal=%dms(hit=%t) tok=%dms(hit=%t) bc=%dms ata=%dms(hit=%t) holders=%dms (-1=skipped)",
 		short(mint), preBalMs, balHit, tokInfoMs, tokHit, preBCMs, preATAMs, ataHit, holderMs)
 	addPos(sig.Mint, tokOut, cfg.BuyLamp, sig.Wallet, tokProg)
 	statBuys.Add(1)

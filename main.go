@@ -92,10 +92,14 @@ type Config struct {
 	// TIMEKILL: не закрывать, если pnl уже хуже этого минуса (доля; 0.02 = −2%).
 	// Защита от "TIMEKILL -12%": такие минуса пусть режет FLASHSL/SL, а не timekill.
 	TimeKillMaxLoss float64
-	MaxTargets      int
-	MaxPositions    int
-	ScrapeIvl       time.Duration
-	MonitorMs       int
+	// Минимальный pnl для "профитных" выходов (TRAIL/PEAKPB/TIMEKILL в плюсе) с учётом fixed-cost.
+	// 0 = авторасчёт из priority+jito + буфер NET_EXIT_BUFFER_PCT.
+	MinNetExitPct float64 // доля (0.06 = +6%)
+	NetExitBufPct float64 // доля (0.005 = +0.5%)
+	MaxTargets    int
+	MaxPositions  int
+	ScrapeIvl     time.Duration
+	MonitorMs     int
 	// Пока позиция «молодая» (сек после Entry) — держать быстрый тик монитора (иначе при обвале ждём до MONITOR_MS).
 	MonitorFastYoungSec int
 	// FLASHSL: в первые N сек при pnl <= -X% — резать хвост (0 = выкл.)
@@ -391,6 +395,15 @@ func getMintTokenProgramCached(ctx context.Context, mint solana.PublicKey) solan
 	return v
 }
 
+func getMintTokenProgramCachedWithHit(ctx context.Context, mint solana.PublicKey) (solana.PublicKey, bool) {
+	if v, ok := mintProgCached(mint); ok && !v.IsZero() {
+		return v, true
+	}
+	v := getMintTokenProgram(ctx, mint)
+	setMintProgCache(mint, v)
+	return v, false
+}
+
 func ataKnownKey(user, mint, tokProg solana.PublicKey) string {
 	return user.String() + "|" + mint.String() + "|" + tokProg.String()
 }
@@ -415,6 +428,22 @@ func userATAExistsCached(ctx context.Context, user, mint, tokProg solana.PublicK
 		markUserATAKnown(user, mint, tokProg)
 	}
 	return ok
+}
+
+func userATAExistsCachedWithHit(ctx context.Context, user, mint, tokProg solana.PublicKey) (bool, bool) {
+	key := ataKnownKey(user, mint, tokProg)
+	ataKnownMu.RLock()
+	if ataKnownUser[key] {
+		ataKnownMu.RUnlock()
+		return true, true
+	}
+	ataKnownMu.RUnlock()
+	ata := findATA(user, mint, tokProg)
+	ok := accountExists(ctx, ata)
+	if ok {
+		markUserATAKnown(user, mint, tokProg)
+	}
+	return ok, false
 }
 
 func requestWSRestart() {
@@ -674,6 +703,8 @@ func main() {
 	} else {
 		log.Printf("[INIT] BREAKEVEN выкл. (BREAKEVEN_MIN_PEAK_PCT=0)")
 	}
+	log.Printf("[INIT] NET_EXIT floor: +%.2f%% (auto fixed-cost+buffer; MIN_NET_EXIT_PCT override)",
+		minNetExitThreshold()*100)
 	if cfg.ProfitLockMinPeak > 0 {
 		log.Printf("[INIT] PROFIT_LOCK: при пике ≥+%.0f%% держим минимум %+.2f%%",
 			cfg.ProfitLockMinPeak*100, cfg.ProfitLockFloor*100)
@@ -784,6 +815,8 @@ func loadCfg() Config {
 		TimeKillSec:              60,
 		TimeKillMin:              0.05,
 		TimeKillMaxLoss:          0.02,
+		MinNetExitPct:            0,
+		NetExitBufPct:            0.005, // +0.5% поверх fixed-cost
 		MaxTargets:               50,
 		MaxPositions:             2,
 		ScrapeIvl:                3 * time.Minute,
@@ -916,6 +949,12 @@ func loadCfg() Config {
 	c.TimeKillSec = int(evU("TIMEKILL_SEC", uint64(c.TimeKillSec)))
 	c.TimeKillMin = evF("TIMEKILL_MIN_PCT", c.TimeKillMin*100) / 100
 	c.TimeKillMaxLoss = evF("TIMEKILL_MAX_LOSS_PCT", c.TimeKillMaxLoss*100) / 100
+	if v := strings.TrimSpace(os.Getenv("MIN_NET_EXIT_PCT")); v == "0" {
+		c.MinNetExitPct = 0
+	} else if v != "" {
+		c.MinNetExitPct = evF("MIN_NET_EXIT_PCT", 0) / 100
+	}
+	c.NetExitBufPct = evF("NET_EXIT_BUFFER_PCT", c.NetExitBufPct*100) / 100
 	c.MaxTargets = int(evU("MAX_TARGETS", uint64(c.MaxTargets)))
 	c.MaxPositions = int(evU("MAX_POSITIONS", uint64(c.MaxPositions)))
 	if s := evU("WALLET_COOLDOWN_SEC", 0); s > 0 {
@@ -1957,6 +1996,20 @@ func flashSLThreshold(p *Position) float64 {
 	return cfg.FlashSLPct
 }
 
+func minNetExitThreshold() float64 {
+	// Fixed-cost часть в долях от ставки: priority (buy+sell) + jito tip (buy+sell)
+	auto := 0.0
+	if cfg.BuyLamp > 0 {
+		fixedLam := cfg.PrioLamp + cfg.PrioLampSell + 2*cfg.JitoTipLamp
+		auto = float64(fixedLam) / float64(cfg.BuyLamp)
+	}
+	auto += cfg.NetExitBufPct
+	if cfg.MinNetExitPct > auto {
+		return cfg.MinNetExitPct
+	}
+	return auto
+}
+
 func doBuy(ctx context.Context, sig Signal) {
 	signalT := sig.At
 	if signalT.IsZero() {
@@ -2062,14 +2115,24 @@ func doBuy(ctx context.Context, sig Signal) {
 		preState  *BondingCurve
 		preBC     solana.PublicKey
 		preBCErr  error
+		preBalMs  int64
+		preBCMs   int64
+		preATAMs  int64
+		holderMs  int64
+		balHit    bool
+		tokHit    bool
+		ataHit    bool
 	)
 	var pwg sync.WaitGroup
 	pwg.Add(3)
 	go func() {
 		defer pwg.Done()
+		t0 := time.Now()
 		if v, ok := getWalletBalCache(2 * time.Second); ok {
 			preBal = v
 			preBalOK = true
+			balHit = true
+			preBalMs = time.Since(t0).Milliseconds()
 			return
 		}
 		rpcWait()
@@ -2080,16 +2143,19 @@ func doBuy(ctx context.Context, sig Signal) {
 			preBalOK = true
 			setWalletBalCache(b.Value)
 		}
+		preBalMs = time.Since(t0).Milliseconds()
 	}()
 	go func() {
 		defer pwg.Done()
 		t0 := time.Now()
-		preTokPrg = getMintTokenProgramCached(ctx, sig.Mint)
+		preTokPrg, tokHit = getMintTokenProgramCachedWithHit(ctx, sig.Mint)
 		tokInfoMs = time.Since(t0).Milliseconds()
 	}()
 	go func() {
 		defer pwg.Done()
+		t0 := time.Now()
 		preState, preBC, preBCErr = readBC(ctx, sig.Mint)
+		preBCMs = time.Since(t0).Milliseconds()
 	}()
 	pwg.Wait()
 	if cfg.MaxTokInfoLag > 0 && time.Duration(tokInfoMs)*time.Millisecond > cfg.MaxTokInfoLag {
@@ -2119,7 +2185,9 @@ func doBuy(ctx context.Context, sig Signal) {
 	if tokProg == Token2022 {
 		log.Printf("[BUY] Token-2022: %s", short(mint))
 	}
-	preATAOK = userATAExistsCached(ctx, cfg.Key.PublicKey(), sig.Mint, tokProg)
+	ataT0 := time.Now()
+	preATAOK, ataHit = userATAExistsCachedWithHit(ctx, cfg.Key.PublicKey(), sig.Mint, tokProg)
+	preATAMs = time.Since(ataT0).Milliseconds()
 
 	state, bc := preState, preBC
 	// retry for freshest mints: sometimes bonding curve account isn't readable immediately
@@ -2158,7 +2226,9 @@ func doBuy(ctx context.Context, sig Signal) {
 		// Exclude bonding-curve ATA from holder concentration check
 		excl := findATA(bc, sig.Mint, tokProg)
 		hctx, cancel := context.WithTimeout(ctx, 400*time.Millisecond)
+		h0 := time.Now()
 		maxPct, maxAcc, herr := holderConcentrationPct(hctx, sig.Mint, tokProg, excl, cfg.HolderTopN)
+		holderMs = time.Since(h0).Milliseconds()
 		cancel()
 		if herr == nil && maxPct >= cfg.HolderMaxPct {
 			log.Printf("[BUY] Skip: whale concentration %.1f%% >= %.1f%% (acc %s) | %s",
@@ -2325,6 +2395,8 @@ func doBuy(ctx context.Context, sig Signal) {
 	log.Printf("[BUY] TX: %s | %s | %.4f SOL | preSend=%dms sendRTT=%dms total=%dms",
 		txSig.String()[:12], short(mint), float64(cfg.BuyLamp)/1e9,
 		lastPreSendLagMs, lastSendRTTMs, totalLagMs)
+	log.Printf("[BUY][TIMING] %s | bal=%dms(hit=%t) tok=%dms(hit=%t) bc=%dms ata=%dms(hit=%t) holders=%dms",
+		short(mint), preBalMs, balHit, tokInfoMs, tokHit, preBCMs, preATAMs, ataHit, holderMs)
 	addPos(sig.Mint, tokOut, cfg.BuyLamp, sig.Wallet, tokProg)
 	statBuys.Add(1)
 
@@ -2510,6 +2582,7 @@ func checkAll(ctx context.Context) (hasProfit bool, needFastYoung bool) {
 		if pnl > 0.02 {
 			hasProfit = true
 		}
+		minNetExit := minNetExitThreshold()
 
 		var reason string
 		switch {
@@ -2534,12 +2607,14 @@ func checkAll(ctx context.Context) (hasProfit bool, needFastYoung bool) {
 		case cfg.BreakevenMinPeak > 0 && s.p.HiPnl >= cfg.BreakevenMinPeak && pnl <= 0:
 			reason = fmt.Sprintf("BREAKEVEN peak+%.0f%%→%.0f%%", s.p.HiPnl*100, pnl*100)
 		case cfg.PeakPullbackPct > 0 && s.p.HiPnl >= cfg.TrailMinPeak && (s.p.HiPnl-pnl) >= cfg.PeakPullbackPct:
-			reason = fmt.Sprintf("PEAKPB peak+%.1f%% now%+.1f%% (откат %.1fп.п.)", s.p.HiPnl*100, pnl*100, (s.p.HiPnl-pnl)*100)
-		case s.p.HiPnl >= cfg.TrailMinPeak && pnl < s.p.HiPnl*cfg.TrailRelMult && pnl > 0:
+			if pnl >= minNetExit {
+				reason = fmt.Sprintf("PEAKPB peak+%.1f%% now%+.1f%% (откат %.1fп.п.)", s.p.HiPnl*100, pnl*100, (s.p.HiPnl-pnl)*100)
+			}
+		case s.p.HiPnl >= cfg.TrailMinPeak && pnl < s.p.HiPnl*cfg.TrailRelMult && pnl >= minNetExit:
 			reason = fmt.Sprintf("TRAIL peak+%.0f%% now+%.0f%%", s.p.HiPnl*100, pnl*100)
 		case s.p.HiPnl >= cfg.TrailMinPeak && pnl < s.p.HiPnl*cfg.TrailRelMult && pnl <= 0:
 			reason = fmt.Sprintf("SL(trail) %.0f%%", pnl*100)
-		case age >= time.Duration(cfg.TimeKillSec)*time.Second && pnl < cfg.TimeKillMin && pnl >= -cfg.TimeKillMaxLoss && pnl > -positionSLlimit(s.p):
+		case age >= time.Duration(cfg.TimeKillSec)*time.Second && pnl < cfg.TimeKillMin && (pnl <= 0 || pnl >= minNetExit) && pnl >= -cfg.TimeKillMaxLoss && pnl > -positionSLlimit(s.p):
 			reason = fmt.Sprintf("TIMEKILL %ds pnl=%+.1f%%(<%+.1f%%; min -%.1f%%)", int(age.Seconds()), pnl*100, cfg.TimeKillMin*100, cfg.TimeKillMaxLoss*100)
 		case age >= 60*time.Second && pnl < 0.02 && pnl > -positionSLlimit(s.p):
 			reason = fmt.Sprintf("HARDKILL %ds pnl=%+.1f%%", int(age.Seconds()), pnl*100)

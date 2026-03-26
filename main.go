@@ -3009,9 +3009,11 @@ func doSell(ctx context.Context, p *Position, reason string, cachedState *Bondin
 				usedSolNet := savedSolNet
 				if delta, ok := txPayerDeltaLamports(ctx, txSig); ok && delta > 0 {
 					log.Printf("[SELL][TXDELTA] %s | wallet_delta=%+.6f SOL", short(savedMint), float64(delta)/1e9)
-					// recordPnl ожидает "грязный" solNet до вычета fixed-cost,
-					// поэтому к net-дельте кошелька добавляем fixed round-trip.
-					usedSolNet = uint64(delta) + fixedTradeCostsLamports()
+					// delta уже "после" sell-fees/tip этой транзакции.
+					// Чтобы корректно попасть в модель recordPnl (которая сама вычитает round-trip fixed),
+					// нужно вернуть только sell-fixed часть, а не весь round-trip.
+					sellFixed := cfg.PrioLampSell + cfg.JitoTipLamp
+					usedSolNet = uint64(delta) + sellFixed
 				}
 				finalizeSellOutcome(savedPos.Wallet, savedSpent, usedSolNet, savedMint)
 				accounted = true

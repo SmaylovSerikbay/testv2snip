@@ -87,6 +87,9 @@ type Config struct {
 	SL              float64
 	TimeKillSec     int
 	TimeKillMin     float64
+	// TIMEKILL: не закрывать, если pnl уже хуже этого минуса (доля; 0.02 = −2%).
+	// Защита от "TIMEKILL -12%": такие минуса пусть режет FLASHSL/SL, а не timekill.
+	TimeKillMaxLoss float64
 	MaxTargets      int
 	MaxPositions    int
 	ScrapeIvl       time.Duration
@@ -683,6 +686,7 @@ func loadCfg() Config {
 		ScrapeAutoTargets:        true,
 		TimeKillSec:              60,
 		TimeKillMin:              0.05,
+		TimeKillMaxLoss:          0.02,
 		MaxTargets:               50,
 		MaxPositions:             2,
 		ScrapeIvl:                3 * time.Minute,
@@ -808,6 +812,7 @@ func loadCfg() Config {
 	}
 	c.TimeKillSec = int(evU("TIMEKILL_SEC", uint64(c.TimeKillSec)))
 	c.TimeKillMin = evF("TIMEKILL_MIN_PCT", c.TimeKillMin*100) / 100
+	c.TimeKillMaxLoss = evF("TIMEKILL_MAX_LOSS_PCT", c.TimeKillMaxLoss*100) / 100
 	c.MaxTargets = int(evU("MAX_TARGETS", uint64(c.MaxTargets)))
 	c.MaxPositions = int(evU("MAX_POSITIONS", uint64(c.MaxPositions)))
 	if s := evU("WALLET_COOLDOWN_SEC", 0); s > 0 {
@@ -2285,8 +2290,8 @@ func checkAll(ctx context.Context) (hasProfit bool, needFastYoung bool) {
 			reason = fmt.Sprintf("TRAIL peak+%.0f%% now+%.0f%%", s.p.HiPnl*100, pnl*100)
 		case s.p.HiPnl >= cfg.TrailMinPeak && pnl < s.p.HiPnl*cfg.TrailRelMult && pnl <= 0:
 			reason = fmt.Sprintf("SL(trail) %.0f%%", pnl*100)
-		case age >= time.Duration(cfg.TimeKillSec)*time.Second && pnl < cfg.TimeKillMin && pnl > -positionSLlimit(s.p):
-			reason = fmt.Sprintf("TIMEKILL %ds pnl=%+.1f%%(<%+.1f%%)", int(age.Seconds()), pnl*100, cfg.TimeKillMin*100)
+		case age >= time.Duration(cfg.TimeKillSec)*time.Second && pnl < cfg.TimeKillMin && pnl >= -cfg.TimeKillMaxLoss && pnl > -positionSLlimit(s.p):
+			reason = fmt.Sprintf("TIMEKILL %ds pnl=%+.1f%%(<%+.1f%%; min -%.1f%%)", int(age.Seconds()), pnl*100, cfg.TimeKillMin*100, cfg.TimeKillMaxLoss*100)
 		case age >= 60*time.Second && pnl < 0.02 && pnl > -positionSLlimit(s.p):
 			reason = fmt.Sprintf("HARDKILL %ds pnl=%+.1f%%", int(age.Seconds()), pnl*100)
 		}

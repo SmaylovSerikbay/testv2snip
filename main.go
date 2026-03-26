@@ -2016,8 +2016,11 @@ func flashSLThreshold(p *Position) float64 {
 		th = cfg.BadEntryFlashPct
 	}
 	// Если вход уже подтвердился с заметным плохим fill (>=3%),
-	// режем раньше, чтобы не ждать стандартный FLASHSL на -10%.
-	if p != nil && p.BadEntryDiffPct <= -3 && th > 0.06 {
+	// режем раньше, чтобы не ждать стандартный FLASHSL.
+	// Важно: НЕ делаем порог агрессивнее, чем это явно настроено cfg.BadEntryFlashPct.
+	// Раньше было принудительное ужесточение до -6%, из-за чего FLASHSL мог срабатывать
+	// слишком рано даже при включённом BAD_ENTRY_FLASH_MIN_PCT.
+	if p != nil && cfg.BadEntryFlashPct <= 0 && p.BadEntryDiffPct <= -3 && th > 0.06 {
 		th = 0.06
 	}
 	return th

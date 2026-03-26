@@ -2092,11 +2092,11 @@ func doBuy(ctx context.Context, sig Signal) {
 				p.Confirmed = true
 				if old != real {
 					diff := float64(real)/float64(old)*100 - 100
+					p.BadEntryDiffPct = diff
 					log.Printf("[BUY] Баланс скорр.: %s | %d → %d tok (%.0f%%)",
 						short(mint), old, real, diff)
 					if diff < -cfg.BadEntryPct {
 						p.BadEntry = true
-						p.BadEntryDiffPct = diff
 						log.Printf("[BUY] ⚠ Плохой вход (%.0f%%) порог -%.0f%%, быстрый выход через 10с", diff, cfg.BadEntryPct)
 					}
 				}
@@ -2261,7 +2261,7 @@ func checkAll(ctx context.Context) (hasProfit bool, needFastYoung bool) {
 		switch {
 		case pnl >= cfg.TP:
 			reason = fmt.Sprintf("TP +%.0f%%", pnl*100)
-		case s.p.BadEntry && cfg.BadEntryImmediateSellPct > 0 && s.p.BadEntryDiffPct <= -cfg.BadEntryImmediateSellPct && age >= cfg.BadEntryImmediateMinAge:
+		case cfg.BadEntryImmediateSellPct > 0 && s.p.BadEntryDiffPct <= -cfg.BadEntryImmediateSellPct && age >= cfg.BadEntryImmediateMinAge:
 			reason = fmt.Sprintf("BADENTRYIMM %.0f%% (fill %.0f%%) age=%ds", cfg.BadEntryImmediateSellPct, s.p.BadEntryDiffPct, int(age.Seconds()))
 		case s.p.BadEntry && cfg.BadExitFastSec > 0 && age >= time.Duration(cfg.BadExitFastSec)*time.Second && pnl < 0:
 			reason = fmt.Sprintf("BADEXITfast %ds pnl=%+.1f%%", int(age.Seconds()), pnl*100)

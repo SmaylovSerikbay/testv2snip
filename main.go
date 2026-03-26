@@ -545,7 +545,7 @@ func sendTx(ctx context.Context, tx *solana.Transaction, rpcFallback bool) (sola
 	// BUY: optionally send as Jito bundle (sendBundle) for validator-side atomic inclusion.
 	// This is not the same as RPC pre-sim; BE decides inclusion close to block production.
 	if cfg.JitoBundleBuy && !rpcFallback && len(cfg.JitoBundleURLs) > 0 {
-		log.Printf("[TX] BUY via bundle race (%d urls)", len(cfg.JitoBundleURLs))
+		log.Printf("[TX] BUY via bundle (%d urls, по очереди)", len(cfg.JitoBundleURLs))
 		sig, usedURL, err := sendBuyAsJitoBundleRace(ctx, cfg.JitoBundleURLs, tx)
 		if err == nil {
 			log.Printf("[TX] BUY bundle accepted | url=%s | tx=%s", usedURL, sig.String()[:12])
@@ -737,30 +737,20 @@ func sendBuyAsJitoBundle(ctx context.Context, url string, tx *solana.Transaction
 }
 
 func sendBuyAsJitoBundleRace(ctx context.Context, urls []string, tx *solana.Transaction) (solana.Signature, string, error) {
-	type res struct {
-		url string
-		sig solana.Signature
-		err error
-	}
-	ch := make(chan res, len(urls))
+	// Последовательные попытки: параллельная гонка на 3–4 регионах даёт лишнюю нагрузку на Jito
+	// и чаще ловит HTTP 429 (глобальный rate limit), не ускоряя включение бандла.
+	var firstErr error
 	for _, u := range urls {
 		u := strings.TrimSpace(u)
 		if u == "" {
 			continue
 		}
-		go func(url string) {
-			sig, err := sendBuyAsJitoBundle(ctx, url, tx)
-			ch <- res{url: url, sig: sig, err: err}
-		}(u)
-	}
-	var firstErr error
-	for i := 0; i < len(urls); i++ {
-		r := <-ch
-		if r.err == nil {
-			return r.sig, r.url, nil
+		sig, err := sendBuyAsJitoBundle(ctx, u, tx)
+		if err == nil {
+			return sig, u, nil
 		}
 		if firstErr == nil {
-			firstErr = r.err
+			firstErr = err
 		}
 	}
 	if firstErr == nil {
@@ -3061,7 +3051,7 @@ func doBuy(ctx context.Context, sig Signal) {
 			// Важно: не делаем вывод по одному чтению.
 			// При Jito-bundle/нагрузке RPC часто запаздывает по confirmed, хотя токены уже видны на processed.
 			var bal uint64
-			deadline := time.Now().Add(8 * time.Second)
+			deadline := time.Now().Add(20 * time.Second)
 			for time.Now().Before(deadline) {
 				bal = getTokenBalanceWithCommitment(ctx, ata, rpc.CommitmentProcessed)
 				if bal > 0 {
@@ -3186,8 +3176,14 @@ func confirmTx(ctx context.Context, txSig solana.Signature, tag, mintStr string,
 			}
 			return
 		}
-		if st.ConfirmationStatus == rpc.ConfirmationStatusConfirmed ||
-			st.ConfirmationStatus == rpc.ConfirmationStatusFinalized {
+		okStatus := st.ConfirmationStatus == rpc.ConfirmationStatusConfirmed ||
+			st.ConfirmationStatus == rpc.ConfirmationStatusFinalized
+		// BUY: включение в блок часто видно как processed раньше, чем Helius успевает отдать confirmed.
+		// Иначе ловим ложный таймаут при живой транзакции.
+		if tag == "BUY" && !okStatus {
+			okStatus = st.ConfirmationStatus == rpc.ConfirmationStatusProcessed
+		}
+		if okStatus {
 			log.Printf("[%s] ✓ OK %s | %s", tag, txSig.String()[:12], short(mintStr))
 			return
 		}

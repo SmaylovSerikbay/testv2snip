@@ -544,6 +544,7 @@ func requestWSRestart() {
 func sendTx(ctx context.Context, tx *solana.Transaction, rpcFallback bool) (solana.Signature, error) {
 	// BUY: optionally send as Jito bundle (sendBundle) for validator-side atomic inclusion.
 	// This is not the same as RPC pre-sim; BE decides inclusion close to block production.
+	// При ошибке bundle (в т.ч. 429) этот же вызов не шлёт второй раз через JITO_HTTP_SEND — только fallthrough ниже при других ошибках.
 	if cfg.JitoBundleBuy && !rpcFallback && len(cfg.JitoBundleURLs) > 0 {
 		log.Printf("[TX] BUY via bundle (%d urls, по очереди)", len(cfg.JitoBundleURLs))
 		sig, usedURL, err := sendBuyAsJitoBundleRace(ctx, cfg.JitoBundleURLs, tx)
@@ -747,29 +748,46 @@ func isJitoRateLimitErr(err error) bool {
 }
 
 func sendBuyAsJitoBundleRace(ctx context.Context, urls []string, tx *solana.Transaction) (solana.Signature, string, error) {
-	// Последовательные попытки: несколько регионов подряд = лишние запросы и чаще HTTP 429.
-	// При rate limit не перебираем остальные URL (глобальный лимит Jito).
-	var firstErr error
-	for _, u := range urls {
-		u := strings.TrimSpace(u)
-		if u == "" {
-			continue
-		}
-		sig, err := sendBuyAsJitoBundle(ctx, u, tx)
-		if err == nil {
-			return sig, u, nil
+	// Один проход по URL: при 429 на регионе не перебираем остальные (часто тот же глобальный лимит).
+	oneRound := func() (solana.Signature, string, error) {
+		var firstErr error
+		for _, u := range urls {
+			u := strings.TrimSpace(u)
+			if u == "" {
+				continue
+			}
+			sig, err := sendBuyAsJitoBundle(ctx, u, tx)
+			if err == nil {
+				return sig, u, nil
+			}
+			if firstErr == nil {
+				firstErr = err
+			}
+			if isJitoRateLimitErr(err) {
+				return solana.Signature{}, "", err
+			}
 		}
 		if firstErr == nil {
-			firstErr = err
+			firstErr = errors.New("no bundle urls")
 		}
-		if isJitoRateLimitErr(err) {
-			return solana.Signature{}, "", err
+		return solana.Signature{}, "", firstErr
+	}
+
+	sig, u, err := oneRound()
+	if err == nil {
+		return sig, u, nil
+	}
+	// Один повтор после паузы — иногда 429 кратковременный; не спамим регионами.
+	if isJitoRateLimitErr(err) {
+		log.Printf("[TX] Jito bundle 429 — повтор через 800ms")
+		select {
+		case <-ctx.Done():
+			return solana.Signature{}, "", ctx.Err()
+		case <-time.After(800 * time.Millisecond):
 		}
+		return oneRound()
 	}
-	if firstErr == nil {
-		firstErr = errors.New("no bundle urls")
-	}
-	return solana.Signature{}, "", firstErr
+	return sig, u, err
 }
 
 func isSlippageErr(err error) bool {
@@ -1081,7 +1099,7 @@ func loadCfg() Config {
 		SellSlip:                 4000,      // 40% sell slippage
 		PrioLamp:                 800_000, // 0.0008 SOL buy priority (конкуренция за слот)
 		PrioLampSell:             1_500_000, // 0.0015 SOL sell priority
-		JitoTipLamp:              800_000, // 0.0008 SOL Jito tip (bundles / inclusion)
+		JitoTipLamp:              1_000_000, // 0.001 SOL Jito tip (bundles / inclusion)
 		TP:                       0.40,
 		QuickTPPct:               0.22, // +22% за первые 15с — иначе ждём основной TP
 		EarlySLWindow:            5 * time.Second,

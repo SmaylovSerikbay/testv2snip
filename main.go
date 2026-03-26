@@ -120,6 +120,10 @@ type Config struct {
 	WalletCD       time.Duration
 	MaxTokInfoLag  time.Duration // if token info fetch exceeds this, skip buy
 	MaxSignalLag   time.Duration // if total lag from signal to send exceeds this, skip buy
+	// Pre-simulate BUY tx before sending to avoid paid fails (Custom:6000 etc.).
+	PreSimBuy       bool
+	PreSimTimeout   time.Duration
+	PreSimLagBudget time.Duration // don't simulate if remaining lag budget is less than this
 	MinWhaleBuyLam uint64        // min whale buy size to follow (lamports)
 	MinVSRLam      uint64        // min virtual SOL reserve (lamports)
 	// Минимальный «возраст» mint по нашему WS-стриму (без RPC): если mint впервые увидели меньше N сек назад — skip BUY.
@@ -185,11 +189,11 @@ type Config struct {
 	CopySellExit      bool
 	CopySellMinAgeSec int
 	// VSR Speed exit: выход по затуханию притока ликвидности на кривую.
-	VSRSExit             bool
-	VSRSWindowSec        int     // окно для оценки скорости VSR (сек)
-	VSRSMinUpSOLPerSec   float64 // если скорость ниже этого порога — считаем "затухло"
-	VSRSMinPeakPnlPct    float64 // активировать только если пик pnl был ≥ этого (%%)
-	VSRSMinAgeSec        int     // не применять раньше этого возраста позиции (сек)
+	VSRSExit           bool
+	VSRSWindowSec      int     // окно для оценки скорости VSR (сек)
+	VSRSMinUpSOLPerSec float64 // если скорость ниже этого порога — считаем "затухло"
+	VSRSMinPeakPnlPct  float64 // активировать только если пик pnl был ≥ этого (%%)
+	VSRSMinAgeSec      int     // не применять раньше этого возраста позиции (сек)
 	// Порог "утверждения" кандидата.
 	CandMinAge         time.Duration
 	CandMinTrades      int
@@ -300,8 +304,8 @@ var (
 	// Token-bucket rate limiter: allows bursts, ~8 req/s sustained
 	rpcBucket chan struct{}
 
-	signalCh   = make(chan Signal, 64)
-	wsReconnCh = make(chan struct{}, 1)
+	signalCh      = make(chan Signal, 64)
+	wsReconnCh    = make(chan struct{}, 1)
 	monitorWakeCh = make(chan struct{}, 1)
 
 	tgtMu   sync.RWMutex
@@ -384,8 +388,8 @@ var (
 	// Fee protection: если серия BUY FAIL (Custom:6000 / slippage), делаем короткую паузу,
 	// чтобы не продолжать платить комиссии за заведомо неподходящие constraints.
 	buyPauseUntil atomic.Int64 // unix ms
-	buyFailMu      sync.Mutex
-	buyFailTimes   []time.Time
+	buyFailMu     sync.Mutex
+	buyFailTimes  []time.Time
 
 	rpcCalls atomic.Int64
 	rpcErrs  atomic.Int64
@@ -553,6 +557,34 @@ func sendTx(ctx context.Context, tx *solana.Transaction, rpcFallback bool) (sola
 	return sig, err
 }
 
+func preSimBuyTx(ctx context.Context, tx *solana.Transaction) error {
+	to := cfg.PreSimTimeout
+	if to <= 0 {
+		to = 140 * time.Millisecond
+	}
+	sctx, cancel := context.WithTimeout(ctx, to)
+	defer cancel()
+
+	// Simulate exactly what we are about to send.
+	rpcWait()
+	out, err := rpcClient().SimulateTransactionWithOpts(sctx, tx, &rpc.SimulateTransactionOpts{
+		SigVerify:              false,
+		ReplaceRecentBlockhash: false,
+		Commitment:             rpc.CommitmentProcessed,
+	})
+	rpcNote(err)
+	if err != nil {
+		return err
+	}
+	if out == nil || out.Value == nil {
+		return errors.New("nil simulation result")
+	}
+	if out.Value.Err != nil {
+		return fmt.Errorf("sim err: %v", out.Value.Err)
+	}
+	return nil
+}
+
 func sendTxViaJitoHTTP(ctx context.Context, url string, tx *solana.Transaction) (solana.Signature, error) {
 	bin, err := tx.MarshalBinary()
 	if err != nil {
@@ -637,9 +669,9 @@ func registerBuyFailure(now time.Time, err error) {
 	// Пауза только от последовательных неудачных входов:
 	// ограничивает "платить комиссии за очевидно неподходящие constraints".
 	const (
-		window   = 30 * time.Second
+		window    = 30 * time.Second
 		threshold = 3
-		pause    = 10 * time.Second
+		pause     = 10 * time.Second
 	)
 
 	buyFailMu.Lock()
@@ -945,6 +977,9 @@ func loadCfg() Config {
 		WalletCD:                 5 * time.Second,
 		MaxTokInfoLag:            500 * time.Millisecond,
 		MaxSignalLag:             250 * time.Millisecond,
+		PreSimBuy:                false,
+		PreSimTimeout:            140 * time.Millisecond,
+		PreSimLagBudget:          80 * time.Millisecond,
 		JitoHTTPURL:              "https://mainnet.block-engine.jito.wtf/api/v1/transactions",
 		JitoHTTPTimeout:          400 * time.Millisecond,
 		MinWhaleBuyLam:           200_000_000,    // 0.2 SOL
@@ -1106,6 +1141,13 @@ func loadCfg() Config {
 	}
 	if ms := evU("MAX_SIGNAL_LAG_MS", 0); ms > 0 {
 		c.MaxSignalLag = time.Duration(ms) * time.Millisecond
+	}
+	c.PreSimBuy = ev("PRE_SIMULATE_BUY", "0") == "1"
+	if ms := evU("PRE_SIM_TIMEOUT_MS", 0); ms > 0 {
+		c.PreSimTimeout = time.Duration(ms) * time.Millisecond
+	}
+	if ms := evU("PRE_SIM_LAG_BUDGET_MS", 0); ms > 0 {
+		c.PreSimLagBudget = time.Duration(ms) * time.Millisecond
 	}
 	if v := os.Getenv("MIN_WHALE_BUY_SOL"); v != "" {
 		if f, err := strconv.ParseFloat(v, 64); err == nil && f > 0 {
@@ -2703,6 +2745,32 @@ func doBuy(ctx context.Context, sig Signal) {
 		if buildErr != nil {
 			log.Printf("[BUY] Build/Sign: %v", buildErr)
 			return
+		}
+		// Pre-simulate BUY to avoid paid fails (Custom:6000 etc.).
+		if cfg.PreSimBuy {
+			// Don't waste time simulating if we are too close to lag limit.
+			if cfg.MaxSignalLag > 0 && cfg.PreSimLagBudget > 0 {
+				if time.Since(signalT) > cfg.MaxSignalLag-cfg.PreSimLagBudget {
+					log.Printf("[BUY] Skip: pre-sim lag budget exceeded | %s", short(mint))
+					return
+				}
+			}
+			if simErr := preSimBuyTx(ctx, tx); simErr != nil {
+				// Treat slippage/constraints as retryable without paying fees.
+				if (isBuyCustomErr6042(simErr) || isSlippageErr(simErr)) && attempt < len(trySlips)-1 {
+					log.Printf("[BUY] pre-sim retry %d/%d | %s | slip=%dbps | err=%v",
+						attempt+1, len(trySlips), short(mint), slip, simErr)
+					// refresh curve estimate for next attempt
+					if freshState, _, e2 := readBC(ctx, sig.Mint); e2 == nil && freshState != nil && !freshState.Done {
+						state = freshState
+						tokOutCur = calcTokOut(state.VTK, state.VSR, cfg.BuyLamp-fee)
+						tokOut = tokOutCur
+					}
+					continue
+				}
+				log.Printf("[BUY] Skip: pre-sim failed | %s | err=%v", short(mint), simErr)
+				return
+			}
 		}
 		if cfg.MaxSignalLag > 0 && time.Since(signalT) > cfg.MaxSignalLag {
 			log.Printf("[BUY] Skip: signal lag %dms > %dms (pre-send) | %s", time.Since(signalT).Milliseconds(), cfg.MaxSignalLag.Milliseconds(), short(mint))

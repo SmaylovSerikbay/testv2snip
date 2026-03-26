@@ -80,6 +80,7 @@ type Config struct {
 	PrioLampSell    uint64 // priority fee for SELL (lamports)
 	JitoTipLamp     uint64 // optional: lamports tip via SystemProgram transfer
 	JitoTipAcc      solana.PublicKey
+	JitoTipAccs     []solana.PublicKey // optional: pool of official Jito tip accounts
 	JitoHTTP        bool
 	JitoHTTPURL     string
 	JitoHTTPTimeout time.Duration
@@ -1056,6 +1057,17 @@ func loadCfg() Config {
 		JitoHTTPTimeout:          400 * time.Millisecond,
 		JitoBundleBuy:            false,
 		JitoBundleURL:            "https://mainnet.block-engine.jito.wtf/api/v1/bundles",
+		// Official Jito tip accounts (fallback pool). Pick one to write-lock for bundle eligibility.
+		JitoTipAccs: []solana.PublicKey{
+			solana.MustPublicKeyFromBase58("ADaUMid9yfUytqMBgopwjb2DTLSokTSzL1zt6iGPaS49"),
+			solana.MustPublicKeyFromBase58("Cw8CFyM9FkoMi7K7Crf6HNQqf4uEMzpKw6QNghXLvLkY"),
+			solana.MustPublicKeyFromBase58("HFqU5x63VTqvQss8hp11i4wVV8bD44PvwucfZ2bU7gRe"),
+			solana.MustPublicKeyFromBase58("DfXygSm4jCyNCybVYYK6DwvWqjKee8pbDmJGcLWNDXjh"),
+			solana.MustPublicKeyFromBase58("96gYZGLnJYVFmbjzopPSU6QiEV5fGqZNyN9nmNhvrZU5"),
+			solana.MustPublicKeyFromBase58("ADuUkR4vqLUMWXxW9gh6D6L8pMSawimctcNZ5pGwDcEt"),
+			solana.MustPublicKeyFromBase58("3AVi9Tg9Uo68tJfuvoKvqKNWKkC5wPdSSdeBnizKZ6jT"),
+			solana.MustPublicKeyFromBase58("DttWaMuVvTiduZRnguLF7jNxTgiMBZ1hyAumKUiL2KRL"),
+		},
 		MinWhaleBuyLam:           200_000_000,    // 0.2 SOL
 		MinVSRLam:                20_000_000_000, // 20 SOL liquidity floor
 		MintMinAge:               0,
@@ -3928,7 +3940,15 @@ func cuPriceIx(micro uint64) solana.Instruction {
 }
 
 func jitoTipIx(payer solana.PublicKey) solana.Instruction {
-	if cfg.JitoTipLamp == 0 || cfg.JitoTipAcc.IsZero() {
+	if cfg.JitoTipLamp == 0 {
+		return nil
+	}
+	acc := cfg.JitoTipAcc
+	// For bundles we must write-lock an official tip account to be eligible for auction.
+	if (cfg.JitoBundleBuy || cfg.JitoHTTP) && acc.IsZero() && len(cfg.JitoTipAccs) > 0 {
+		acc = cfg.JitoTipAccs[int(time.Now().UnixNano())%len(cfg.JitoTipAccs)]
+	}
+	if acc.IsZero() {
 		return nil
 	}
 	// SystemProgram::Transfer (index 2), lamports u64 LE
@@ -3939,7 +3959,7 @@ func jitoTipIx(payer solana.PublicKey) solana.Instruction {
 		pid: solana.SystemProgramID,
 		accs: []*solana.AccountMeta{
 			{PublicKey: payer, IsSigner: true, IsWritable: true},
-			{PublicKey: cfg.JitoTipAcc, IsWritable: true},
+			{PublicKey: acc, IsWritable: true},
 		},
 		dat: d,
 	}

@@ -2011,10 +2011,16 @@ func positionSLlimit(p *Position) float64 {
 }
 
 func flashSLThreshold(p *Position) float64 {
-	if p != nil && p.BadEntry && cfg.BadEntryFlashPct > 0 && cfg.BadEntryFlashPct < cfg.FlashSLPct {
-		return cfg.BadEntryFlashPct
+	th := cfg.FlashSLPct
+	if p != nil && p.BadEntry && cfg.BadEntryFlashPct > 0 && cfg.BadEntryFlashPct < th {
+		th = cfg.BadEntryFlashPct
 	}
-	return cfg.FlashSLPct
+	// Если вход уже подтвердился с заметным плохим fill (>=3%),
+	// режем раньше, чтобы не ждать стандартный FLASHSL на -10%.
+	if p != nil && p.BadEntryDiffPct <= -3 && th > 0.06 {
+		th = 0.06
+	}
+	return th
 }
 
 func minNetExitThreshold() float64 {
@@ -2469,9 +2475,14 @@ func doBuy(ctx context.Context, sig Signal) {
 					p.BadEntryDiffPct = diff
 					log.Printf("[BUY] Баланс скорр.: %s | %d → %d tok (%.0f%%)",
 						short(mint), old, real, diff)
-					if diff < -cfg.BadEntryPct {
+					// Защита от слишком "мягкого" порога: для pump-рынка fill хуже ~4% уже риск.
+					badEntryTrigger := cfg.BadEntryPct
+					if badEntryTrigger <= 0 || badEntryTrigger > 4 {
+						badEntryTrigger = 4
+					}
+					if diff < -badEntryTrigger {
 						p.BadEntry = true
-						log.Printf("[BUY] ⚠ Плохой вход (%.0f%%) порог -%.0f%%, быстрый выход через 10с", diff, cfg.BadEntryPct)
+						log.Printf("[BUY] ⚠ Плохой вход (%.0f%%) порог -%.0f%%, быстрый выход через 10с", diff, badEntryTrigger)
 					}
 				}
 			}

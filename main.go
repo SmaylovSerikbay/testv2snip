@@ -16,6 +16,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -177,6 +178,15 @@ type Config struct {
 	CopyWallets []string
 	// SCRAPE_AUTO_TARGETS=0 — только COPY_WALLETS; 1 (дефолт) — бот сам набирает цели по WS
 	ScrapeAutoTargets bool
+	// Observe/Approve: сначала собираем статистику по кошелькам, и только потом добавляем их в цели.
+	// OBSERVE_ONLY=1 — торгуем только по PINNED/COPY_WALLETS/уже утверждённым целям.
+	ObserveOnly bool
+	// Порог "утверждения" кандидата.
+	CandMinAge         time.Duration
+	CandMinTrades      int
+	CandMinProfitPct   float64 // доля, 0.30 = +30%
+	CandMinTotalBuyLam uint64  // суммарный объём покупок за окно (lamports)
+	CandRequireWin2x   bool    // требовать флаг 2x/24h
 	// Мин. покупок в один и тот же mint для эвристики «same-mint»; 0 = не использовать (только profitOK / крупный бай)
 	ScrapeSameMintMin int
 	// PIN: сохранять профитные кошельки в файл и всегда наблюдать за ними (переживает рестарт)
@@ -228,6 +238,22 @@ type walletStats struct {
 	totalSellSOL uint64
 	trades       int
 	win24h2x     bool
+}
+
+// walletPerf — статистика результата копирования по цели (по нашим сделкам).
+// Используется для авто-ранжирования/отсева целей.
+type walletPerf struct {
+	Trades int
+	Wins   int
+	Losses int
+
+	NetLamports int64 // Σ(netOut - spent - fixed round-trip) по закрытым сделкам (как recordPnl)
+
+	BuyFailCount int // за окно
+	MutedUntil   time.Time
+
+	LastTrade time.Time
+	LastFail  time.Time
 }
 
 func getWS(freq map[string]*walletStats, wallet string) *walletStats {
@@ -304,6 +330,18 @@ var (
 	// Per-target buy cooldown (prevent spam from single wallet)
 	tgtCDMu  sync.Mutex
 	tgtCDMap = map[string]time.Time{}
+
+	// Per-target performance (ranking / auto-filter)
+	perfMu   sync.Mutex
+	walletPF = map[string]*walletPerf{} // wallet -> perf
+
+	// Candidate pool: наблюдаем и утверждаем перед добавлением в targets
+	candMu     sync.Mutex
+	candidates = map[string]struct {
+		firstSeen time.Time
+		lastSeen  time.Time
+		stats     walletStats
+	}{} // wallet -> rolling stats snapshot
 
 	mintProgMu    sync.RWMutex
 	mintProgCache = map[string]solana.PublicKey{}
@@ -783,6 +821,9 @@ func main() {
 			log.Printf("[INIT] ⚠ SCRAPE_AUTO_TARGETS=0 и пустой COPY_WALLETS — добавь адреса или вручную включи SCRAPE_AUTO_TARGETS=1")
 		}
 	}
+	if cfg.ObserveOnly {
+		log.Printf("[INIT] OBSERVE_ONLY=1: новые кошельки сначала кандидаты; в targets попадут только после утверждения (CAND_*) или если PINNED/COPY_WALLETS")
+	}
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -910,6 +951,12 @@ func loadCfg() Config {
 		BadEntrySLPct:            0.14,
 		BadExitFastSec:           4,
 		BadEntryFlashPct:         0.10,
+		ObserveOnly:              false,
+		CandMinAge:               10 * time.Minute,
+		CandMinTrades:            5,
+		CandMinProfitPct:         0.30,
+		CandMinTotalBuyLam:       5_000_000_000, // 5 SOL
+		CandRequireWin2x:         false,
 		MintMinPumpBuys:          0,
 		MintMinPumpBuysWindow:    12 * time.Second,
 		ScrapeSameMintMin:        5,    // вариант B: было жёстко 3
@@ -997,6 +1044,7 @@ func loadCfg() Config {
 		c.TrailRelMult = 0.65
 	}
 	c.ScrapeAutoTargets = ev("SCRAPE_AUTO_TARGETS", "1") != "0"
+	c.ObserveOnly = ev("OBSERVE_ONLY", "0") == "1"
 	if v := strings.TrimSpace(os.Getenv("COPY_WALLETS")); v != "" {
 		for _, part := range strings.Split(v, ",") {
 			part = strings.TrimSpace(part)
@@ -1055,6 +1103,17 @@ func loadCfg() Config {
 	if s := evU("MINT_MIN_AGE_SEC", 0); s > 0 {
 		c.MintMinAge = time.Duration(s) * time.Second
 	}
+	if s := evU("CAND_MIN_AGE_SEC", 0); s > 0 {
+		c.CandMinAge = time.Duration(s) * time.Second
+	}
+	c.CandMinTrades = int(evU("CAND_MIN_TRADES", uint64(c.CandMinTrades)))
+	c.CandMinProfitPct = evF("CAND_MIN_PROFIT_PCT", c.CandMinProfitPct*100) / 100
+	if v := os.Getenv("CAND_MIN_TOTAL_BUY_SOL"); v != "" {
+		if f, err := strconv.ParseFloat(v, 64); err == nil && f > 0 {
+			c.CandMinTotalBuyLam = uint64(f * 1e9)
+		}
+	}
+	c.CandRequireWin2x = ev("CAND_REQUIRE_2X24H", "0") == "1"
 	if v := strings.TrimSpace(os.Getenv("MINT_REBUY_COOLDOWN_AFTER_WIN_SEC")); v == "0" {
 		c.MintWinCD = 0
 	} else if v != "" {
@@ -1357,16 +1416,42 @@ func scrape(ctx context.Context) {
 			if !sameMintOK && !profitOK && !ws.win24h2x {
 				continue
 			}
+
+			// 1) всегда записываем как кандидата (наблюдаем без торговли)
+			candMu.Lock()
+			cit, exists := candidates[w]
+			if !exists || cit.firstSeen.IsZero() {
+				cit.firstSeen = now
+			}
+			cit.lastSeen = now
+			cit.stats = *ws
+			candidates[w] = cit
+			candMu.Unlock()
+
+			// 2) утверждаем и добавляем в цели только если кандидат прошёл пороги
+			age := now.Sub(cit.firstSeen)
+			profit := 0.0
+			if ws.totalBuySOL > 0 {
+				profit = float64(ws.totalSellSOL)/float64(ws.totalBuySOL) - 1.0
+			}
+			approved := age >= cfg.CandMinAge &&
+				ws.trades >= cfg.CandMinTrades &&
+				ws.totalBuySOL >= cfg.CandMinTotalBuyLam &&
+				profit >= cfg.CandMinProfitPct &&
+				(!cfg.CandRequireWin2x || ws.win24h2x)
+
+			if !approved {
+				continue
+			}
 			if _, ok := targets[w]; !ok && len(targets) < cfg.MaxTargets {
 				targets[w] = now
 				added++
-				reason := fmt.Sprintf("%d same-mint buys", maxMintBuys)
+				reason := fmt.Sprintf("approved: age=%s trades=%d profit=%.0f%% buy=%.1f SOL",
+					age.Round(time.Second), ws.trades, profit*100, float64(ws.totalBuySOL)/1e9)
 				if ws.win24h2x {
-					reason = "2x/24h"
-				} else if profitOK {
-					reason = fmt.Sprintf("profit>30%% (%d trades)", ws.trades)
+					reason += " +2x/24h"
 				}
-				log.Printf("[SCRAPE] +Цель: %s (%s)", short(w), reason)
+				log.Printf("[APPROVE] +Цель: %s (%s)", short(w), reason)
 			} else if ok {
 				targets[w] = now
 			}
@@ -2138,9 +2223,13 @@ func finalizeSellOutcome(wallet string, spent uint64, solNet uint64, mint string
 	}
 	netOut := int64(solNet) - int64(fixedTradeCostsLamports())
 	netFrac := float64(netOut)/float64(spent) - 1.0
+	// deltaLamports в той же модели, что recordPnl: (solNet-spent)-fixed
+	deltaLamports := (int64(solNet) - int64(spent)) - int64(fixedTradeCostsLamports())
 	recordPnl(spent, solNet, mint)
 	trackTargetResult(wallet, netFrac > 0)
+	noteWalletTradeOutcome(wallet, deltaLamports, netFrac > 0)
 	notePinnedWalletOnWin(wallet, netFrac)
+	pruneTargetsToMax()
 	log.Printf("[SELL][FACT] %s | accounted_in=%0.6f SOL | spent=%0.6f SOL | net=%+.2f%%",
 		short(mint), float64(solNet)/1e9, float64(spent)/1e9, netFrac*100)
 }
@@ -2246,6 +2335,28 @@ func doBuy(ctx context.Context, sig Signal) {
 			log.Printf("[BUY] Skip: mint too fresh (firstSeen %ds < %ds) | %s",
 				int(age.Seconds()), int(cfg.MintMinAge.Seconds()), short(mint))
 			return
+		}
+	}
+
+	// Observe-only: торгуем только по утверждённым целям (или pinned/copy_wallets).
+	if cfg.ObserveOnly {
+		if !isPinnedWallet(sig.Wallet) {
+			isCopy := false
+			for _, w := range cfg.CopyWallets {
+				if strings.TrimSpace(w) == strings.TrimSpace(sig.Wallet) {
+					isCopy = true
+					break
+				}
+			}
+			if !isCopy {
+				tgtMu.RLock()
+				_, ok := targets[sig.Wallet]
+				tgtMu.RUnlock()
+				if !ok {
+					log.Printf("[BUY] Skip: target not approved (OBSERVE_ONLY) | %s from %s", short(mint), short(sig.Wallet))
+					return
+				}
+			}
 		}
 	}
 
@@ -2547,6 +2658,8 @@ func doBuy(ctx context.Context, sig Signal) {
 		}
 		log.Printf("[BUY] ✗ %s | %s", errMsg, short(mint))
 		registerBuyFailure(time.Now(), err)
+		noteWalletBuyFail(sig.Wallet, err)
+		pruneTargetsToMax()
 		return
 	}
 	totalLagMs := time.Since(signalT).Milliseconds()
@@ -2935,6 +3048,164 @@ func trackTargetResult(wallet string, win bool) {
 		}
 	}
 	tgtLossMu.Unlock()
+}
+
+func getWalletPerfLocked(wallet string) *walletPerf {
+	if wallet == "" {
+		return nil
+	}
+	p := walletPF[wallet]
+	if p == nil {
+		p = &walletPerf{}
+		walletPF[wallet] = p
+	}
+	return p
+}
+
+func noteWalletTradeOutcome(wallet string, deltaLamports int64, win bool) {
+	wallet = strings.TrimSpace(wallet)
+	if wallet == "" {
+		return
+	}
+	perfMu.Lock()
+	p := getWalletPerfLocked(wallet)
+	if p != nil {
+		p.Trades++
+		if win {
+			p.Wins++
+		} else {
+			p.Losses++
+		}
+		p.NetLamports += deltaLamports
+		p.LastTrade = time.Now()
+	}
+	perfMu.Unlock()
+}
+
+func noteWalletBuyFail(wallet string, err error) {
+	wallet = strings.TrimSpace(wallet)
+	if wallet == "" {
+		return
+	}
+	// учитываем только slippage/constraint-ошибки — они чаще означают "слишком ранний вход"
+	if !(isBuyCustomErr6042(err) || isSlippageErr(err)) {
+		return
+	}
+	now := time.Now()
+	perfMu.Lock()
+	p := getWalletPerfLocked(wallet)
+	if p != nil {
+		p.BuyFailCount++
+		p.LastFail = now
+		// если цель систематически даёт фейлы — временно "мутим" её
+		if p.BuyFailCount >= 3 {
+			p.BuyFailCount = 0
+			p.MutedUntil = now.Add(10 * time.Minute)
+		}
+	}
+	perfMu.Unlock()
+}
+
+func walletScore(wallet string, lastSeen time.Time) float64 {
+	perfMu.Lock()
+	p := walletPF[wallet]
+	perfMu.Unlock()
+	score := 0.0
+	if p != nil {
+		// базовая метрика — net результат в SOL
+		score += float64(p.NetLamports) / 1e9
+		// штраф за малую выборку (не доверяем 1-2 сделкам)
+		if p.Trades < 3 {
+			score -= 0.05
+		}
+		// бонус за винрейт (лёгкий)
+		if p.Trades > 0 {
+			wr := float64(p.Wins) / float64(p.Trades)
+			score += (wr - 0.5) * 0.02
+		}
+		// штраф за недавний mute (чтобы уходили вниз рейтинга)
+		if !p.MutedUntil.IsZero() && time.Now().Before(p.MutedUntil) {
+			score -= 1.0
+		}
+	}
+	// лёгкий бонус за свежесть, чтобы новые цели могли попасть в топ
+	if !lastSeen.IsZero() {
+		age := time.Since(lastSeen)
+		if age < 10*time.Minute {
+			score += 0.005
+		}
+	}
+	return score
+}
+
+func pruneTargetsToMax() {
+	if cfg.MaxTargets <= 0 {
+		return
+	}
+	pins := snapshotPinnedWallets()
+	now := time.Now()
+
+	// Удаляем замученные (mute) цели, если они не pinned
+	perfMu.Lock()
+	for w, p := range walletPF {
+		if p == nil || p.MutedUntil.IsZero() || now.After(p.MutedUntil) {
+			continue
+		}
+		if pins[w] {
+			continue
+		}
+		tgtMu.Lock()
+		if _, ok := targets[w]; ok {
+			delete(targets, w)
+			log.Printf("[TGT] -Removed: %s (muted %.0fs left)", short(w), p.MutedUntil.Sub(now).Seconds())
+		}
+		tgtMu.Unlock()
+	}
+	perfMu.Unlock()
+
+	tgtMu.Lock()
+	defer tgtMu.Unlock()
+	if len(targets) <= cfg.MaxTargets {
+		return
+	}
+
+	type it struct {
+		w    string
+		seen time.Time
+		sc   float64
+		pin  bool
+	}
+	lst := make([]it, 0, len(targets))
+	for w, seen := range targets {
+		lst = append(lst, it{w: w, seen: seen, sc: walletScore(w, seen), pin: pins[w]})
+	}
+	sort.Slice(lst, func(i, j int) bool {
+		// pinned всегда выше
+		if lst[i].pin != lst[j].pin {
+			return lst[i].pin
+		}
+		if lst[i].sc == lst[j].sc {
+			return lst[i].seen.After(lst[j].seen)
+		}
+		return lst[i].sc > lst[j].sc
+	})
+
+	keep := map[string]bool{}
+	for i := 0; i < len(lst) && len(keep) < cfg.MaxTargets; i++ {
+		keep[lst[i].w] = true
+	}
+	removed := 0
+	for w := range targets {
+		if keep[w] {
+			continue
+		}
+		delete(targets, w)
+		removed++
+	}
+	if removed > 0 {
+		log.Printf("[TGT] Pruned targets: -%d (keep top %d by score; pinned first)", removed, cfg.MaxTargets)
+		notifyWSReconn()
+	}
 }
 
 func doSell(ctx context.Context, p *Position, reason string, cachedState *BondingCurve, cachedBC solana.PublicKey) bool {

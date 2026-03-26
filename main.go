@@ -109,7 +109,10 @@ type Config struct {
 	MaxSignalLag   time.Duration // if total lag from signal to send exceeds this, skip buy
 	MinWhaleBuyLam uint64        // min whale buy size to follow (lamports)
 	MinVSRLam      uint64        // min virtual SOL reserve (lamports)
-	MintCD         time.Duration // skip re-buy same mint for this long after attempt/skip
+	// Минимальный «возраст» mint по нашему WS-стриму (без RPC): если mint впервые увидели меньше N сек назад — skip BUY.
+	// 0 = выкл.
+	MintMinAge time.Duration
+	MintCD     time.Duration // skip re-buy same mint for this long after attempt/skip
 	// После убыточного закрытия — не входить в этот mint N сек (0 = выкл.)
 	MintLossCD time.Duration
 	// Трейлинг сессии: если реализованный PnL сессии когда-то был ≥ Min (%% от старта), при откате от пика на Giveback п.п. — стоп новых BUY (как CIRCUIT).
@@ -703,6 +706,7 @@ func loadCfg() Config {
 		JitoHTTPTimeout:          400 * time.Millisecond,
 		MinWhaleBuyLam:           200_000_000,    // 0.2 SOL
 		MinVSRLam:                20_000_000_000, // 20 SOL liquidity floor
+		MintMinAge:               0,
 		MintCD:                   90 * time.Second,
 		MintLossCD:               600 * time.Second, // 10 мин после минуса по mint — не повторять вход как с 6T7m
 		SessionTrailMinPeak:      0,                 // включи в .env: SESSION_TRAIL_*
@@ -830,6 +834,9 @@ func loadCfg() Config {
 		}
 	}
 	c.MinVSRLam = evU("MIN_VSR_LAMPORTS", c.MinVSRLam)
+	if s := evU("MINT_MIN_AGE_SEC", 0); s > 0 {
+		c.MintMinAge = time.Duration(s) * time.Second
+	}
 	if v := strings.TrimSpace(os.Getenv("SCRAPE_SAME_MINT_MIN")); v == "0" {
 		c.ScrapeSameMintMin = 0
 	} else {
@@ -1713,6 +1720,22 @@ func mintPumpBuysInWindow(mintStr string, window time.Duration) int {
 	return n
 }
 
+func mintFirstSeenAge(mintStr string) (age time.Duration, ok bool) {
+	mintPumpBuyMu.Lock()
+	defer mintPumpBuyMu.Unlock()
+	lst := mintPumpBuys[mintStr]
+	if len(lst) == 0 {
+		return 0, false
+	}
+	minT := lst[0]
+	for _, t := range lst[1:] {
+		if t.Before(minT) {
+			minT = t
+		}
+	}
+	return time.Since(minT), true
+}
+
 func positionSLlimit(p *Position) float64 {
 	if p == nil {
 		return cfg.SL
@@ -1813,6 +1836,13 @@ func doBuy(ctx context.Context, sig Signal) {
 		if n := mintPumpBuysInWindow(mint, win); n < cfg.MintMinPumpBuys {
 			log.Printf("[BUY] Skip: mint pump depth %d<%d за %v (мало Buy на mint с pump WS) | %s",
 				n, cfg.MintMinPumpBuys, win.Round(time.Second), short(mint))
+			return
+		}
+	}
+	if cfg.MintMinAge > 0 {
+		if age, ok := mintFirstSeenAge(mint); ok && age < cfg.MintMinAge {
+			log.Printf("[BUY] Skip: mint too fresh (firstSeen %ds < %ds) | %s",
+				int(age.Seconds()), int(cfg.MintMinAge.Seconds()), short(mint))
 			return
 		}
 	}

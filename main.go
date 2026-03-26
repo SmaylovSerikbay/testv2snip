@@ -2893,17 +2893,6 @@ func doSell(ctx context.Context, p *Position, reason string, cachedState *Bondin
 	}
 	sellAccs = append(sellAccs, &solana.AccountMeta{PublicKey: bcV2}) // last: bonding_curve_v2
 
-	// CloseAccount — возвращает rent (~0.002 SOL) после продажи
-	closeIx := &genericIx{
-		pid: tokProg,
-		dat: []byte{9}, // CloseAccount instruction index
-		accs: []*solana.AccountMeta{
-			{PublicKey: assocUser, IsWritable: true},
-			{PublicKey: user, IsWritable: true},
-			{PublicKey: user, IsSigner: true},
-		},
-	}
-
 	cuLimit := uint32(400_000)
 
 	if !cfg.Live {
@@ -2935,7 +2924,8 @@ func doSell(ctx context.Context, p *Position, reason string, cachedState *Bondin
 		ixs = append(ixs,
 			cuPriceIx(cfg.PrioLampSell*1_000_000/uint64(cuLimit)),
 			&genericIx{pid: PumpProgram, dat: data, accs: sellAccs},
-			closeIx,
+			// Не закрываем ATA в hot-path SELL: возврат rent искажает tx-delta PnL
+			// и может давать "ложный плюс" в статистике.
 		)
 
 		bh := cachedBH(ctx) // быстрее, чем GetLatestBlockhash на каждом sell

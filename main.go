@@ -73,6 +73,8 @@ type Config struct {
 	Key             solana.PrivateKey
 	RPC             string
 	WSS             string
+	// Multi-WSS race (comma-separated URLs via env)
+	WSSURLs []string
 	BuyLamp         uint64
 	Slip            uint64 // buy slippage bps
 	SellSlip        uint64 // sell slippage bps
@@ -87,6 +89,7 @@ type Config struct {
 	// Jito Bundles (sendBundle)
 	JitoBundleBuy bool
 	JitoBundleURL string
+	JitoBundleURLs []string
 	TP              float64
 	QuickTPPct      float64       // ранний выход QUICKTP: в первые 15с при pnl >= этого порога (доля, напр. 0.22 = +22%)
 	EarlySLWindow   time.Duration // 0 = выкл.; иначе в первые N сек выход если pnl <= -EarlySLPct (анти-просадка)
@@ -217,6 +220,7 @@ type Config struct {
 type Signal struct {
 	Mint   solana.PublicKey
 	Wallet string
+	Sig    string // tx signature (dedup across multi-WSS)
 	At     time.Time // when WS signal was received
 }
 
@@ -313,6 +317,10 @@ var (
 	signalCh      = make(chan Signal, 64)
 	wsReconnCh    = make(chan struct{}, 1)
 	monitorWakeCh = make(chan struct{}, 1)
+
+	// Signal dedup (for multi-WSS race)
+	sigDedupMu sync.Mutex
+	sigDedup   = map[string]time.Time{} // signature -> seen time
 
 	tgtMu   sync.RWMutex
 	targets = map[string]time.Time{} // wallet → lastSeen
@@ -536,8 +544,8 @@ func requestWSRestart() {
 func sendTx(ctx context.Context, tx *solana.Transaction, rpcFallback bool) (solana.Signature, error) {
 	// BUY: optionally send as Jito bundle (sendBundle) for validator-side atomic inclusion.
 	// This is not the same as RPC pre-sim; BE decides inclusion close to block production.
-	if cfg.JitoBundleBuy && !rpcFallback && cfg.JitoBundleURL != "" {
-		sig, err := sendBuyAsJitoBundle(ctx, cfg.JitoBundleURL, tx)
+	if cfg.JitoBundleBuy && !rpcFallback && len(cfg.JitoBundleURLs) > 0 {
+		sig, err := sendBuyAsJitoBundleRace(ctx, cfg.JitoBundleURLs, tx)
 		if err == nil {
 			return sig, nil
 		}
@@ -715,6 +723,39 @@ func sendBuyAsJitoBundle(ctx context.Context, url string, tx *solana.Transaction
 		return solana.Signature{}, errors.New("nil tx signature")
 	}
 	return sig, nil
+}
+
+func sendBuyAsJitoBundleRace(ctx context.Context, urls []string, tx *solana.Transaction) (solana.Signature, error) {
+	type res struct {
+		url string
+		sig solana.Signature
+		err error
+	}
+	ch := make(chan res, len(urls))
+	for _, u := range urls {
+		u := strings.TrimSpace(u)
+		if u == "" {
+			continue
+		}
+		go func(url string) {
+			sig, err := sendBuyAsJitoBundle(ctx, url, tx)
+			ch <- res{url: url, sig: sig, err: err}
+		}(u)
+	}
+	var firstErr error
+	for i := 0; i < len(urls); i++ {
+		r := <-ch
+		if r.err == nil {
+			return r.sig, nil
+		}
+		if firstErr == nil {
+			firstErr = r.err
+		}
+	}
+	if firstErr == nil {
+		firstErr = errors.New("no bundle urls")
+	}
+	return solana.Signature{}, firstErr
 }
 
 func isSlippageErr(err error) bool {
@@ -1124,6 +1165,21 @@ func loadCfg() Config {
 	} else {
 		log.Fatalf("[CFG] HELIUS_API_KEY обязателен (exclusive Helius mode)")
 	}
+	// Optional multi-WSS race: additional WS endpoints (comma separated).
+	if v := strings.TrimSpace(os.Getenv("WSS_URLS")); v != "" {
+		parts := strings.Split(v, ",")
+		for _, p := range parts {
+			u := strings.TrimSpace(p)
+			if u == "" {
+				continue
+			}
+			c.WSSURLs = append(c.WSSURLs, u)
+		}
+	}
+	// Always include primary WSS as first option.
+	if c.WSS != "" {
+		c.WSSURLs = append([]string{c.WSS}, c.WSSURLs...)
+	}
 	if pk := os.Getenv("SOLANA_PRIVATE_KEY"); pk != "" {
 		k, err := solana.PrivateKeyFromBase58(pk)
 		if err != nil {
@@ -1154,6 +1210,17 @@ func loadCfg() Config {
 	} else if strings.Contains(c.JitoHTTPURL, "/api/v1/transactions") {
 		// удобный дефолт: если задан /transactions, то bundle рядом
 		c.JitoBundleURL = strings.ReplaceAll(c.JitoHTTPURL, "/api/v1/transactions", "/api/v1/bundles")
+	}
+	if v := strings.TrimSpace(os.Getenv("JITO_BUNDLE_URLS")); v != "" {
+		for _, p := range strings.Split(v, ",") {
+			u := strings.TrimSpace(p)
+			if u != "" {
+				c.JitoBundleURLs = append(c.JitoBundleURLs, u)
+			}
+		}
+	}
+	if c.JitoBundleURL != "" {
+		c.JitoBundleURLs = append([]string{c.JitoBundleURL}, c.JitoBundleURLs...)
 	}
 	if ms := evU("JITO_HTTP_TIMEOUT_MS", 0); ms > 0 {
 		c.JitoHTTPTimeout = time.Duration(ms) * time.Millisecond
@@ -1825,25 +1892,42 @@ func cachedBCState(mint solana.PublicKey) (*BondingCurve, solana.PublicKey, bool
 }
 
 func runWSListener(ctx context.Context) {
-	for {
-		if ctx.Err() != nil {
-			return
-		}
-		if err := wsLoop(ctx); err != nil {
-			if !strings.Contains(err.Error(), "use of closed") {
-				log.Printf("[WS] Ошибка: %v", err)
-			}
-		}
-		select {
-		case <-ctx.Done():
-			return
-		case <-time.After(500 * time.Millisecond):
-		}
+	// Multi-WSS: run one loop per WSS URL (race on signals; dedup by signature).
+	urls := cfg.WSSURLs
+	if len(urls) == 0 {
+		urls = []string{cfg.WSS}
 	}
+	var wg sync.WaitGroup
+	for _, u := range urls {
+		u := strings.TrimSpace(u)
+		if u == "" {
+			continue
+		}
+		wg.Add(1)
+		go func(wss string) {
+			defer wg.Done()
+			for {
+				if ctx.Err() != nil {
+					return
+				}
+				if err := wsLoop(ctx, wss); err != nil {
+					if !strings.Contains(err.Error(), "use of closed") {
+						log.Printf("[WS] Ошибка (%s): %v", short(wss), err)
+					}
+				}
+				select {
+				case <-ctx.Done():
+					return
+				case <-time.After(500 * time.Millisecond):
+				}
+			}
+		}(u)
+	}
+	wg.Wait()
 }
 
-func wsLoop(ctx context.Context) error {
-	conn, _, err := websocket.DefaultDialer.DialContext(ctx, cfg.WSS, nil)
+func wsLoop(ctx context.Context, wssURL string) error {
+	conn, _, err := websocket.DefaultDialer.DialContext(ctx, wssURL, nil)
 	if err != nil {
 		return err
 	}
@@ -2115,13 +2199,13 @@ func wsLoop(ctx context.Context) error {
 		}
 		if kind == wsSubWalletLogs {
 			// BUY signal -> trade executor; SELL signal -> shadow exit (copy-sell)
-			go parseBuySignal(wallet, lr.Value.Logs)
+			go parseBuySignal(wallet, lr.Value.Signature, lr.Value.Logs)
 			go parseSellSignal(wallet, lr.Value.Logs)
 		}
 	}
 }
 
-func parseBuySignal(wallet string, logs []string) {
+func parseBuySignal(wallet string, sig string, logs []string) {
 	isBuy := false
 	for _, l := range logs {
 		if l == "Program log: Instruction: Buy" {
@@ -2141,8 +2225,29 @@ func parseBuySignal(wallet string, logs []string) {
 	}
 	noteMintPumpBuy(ev.Mint.String())
 
+	// Dedup by signature (multi-WSS race may deliver same tx from multiple providers).
+	if sig != "" {
+		now := time.Now()
+		sigDedupMu.Lock()
+		if t, ok := sigDedup[sig]; ok && now.Sub(t) < 2*time.Minute {
+			sigDedupMu.Unlock()
+			return
+		}
+		sigDedup[sig] = now
+		// simple GC
+		if len(sigDedup) > 5000 {
+			cut := now.Add(-5 * time.Minute)
+			for k, v := range sigDedup {
+				if v.Before(cut) {
+					delete(sigDedup, k)
+				}
+			}
+		}
+		sigDedupMu.Unlock()
+	}
+
 	select {
-	case signalCh <- Signal{Mint: ev.Mint, Wallet: wallet, At: time.Now()}:
+	case signalCh <- Signal{Mint: ev.Mint, Wallet: wallet, Sig: sig, At: time.Now()}:
 	default:
 		log.Println("[WS] signalCh full — пропуск")
 	}

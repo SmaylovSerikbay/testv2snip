@@ -275,6 +275,35 @@ type Config struct {
 	// Разрешённые DEX для MIGRATION_LIVE_SWAP (lowercase ids из dexscreener: raydium, meteora, pumpswap ...).
 	// Пусто = любой DEX.
 	MigrationAllowedDexes []string
+	// Задержка перед BUY в MIGRATION_LIVE_SWAP (мс). 0 = без задержки.
+	// После миграции Raydium иногда 200–500 мс «догоняет» веса пула — иначе плохой quote / фейлы.
+	MigrationDelayMS int
+	// Динамический slippage BUY: «хайп» по pump WS (много Buy за окно) → высокий slip, иначе низкий.
+	MigrationDynamicSlip bool
+	MigrationSlipLowBps  uint64 // напр. 800 = 8%
+	MigrationSlipHighBps uint64 // напр. 4000 = 40%
+	MigrationHypeWindow  time.Duration
+	MigrationHypeMinBuys int
+	// Доп. задержка «не нулевой блок»: N * MigrationSlotMS мс после MIG_DELAY_MS (снайперский блок).
+	MigrationExtraBlocksWait int
+	MigrationSlotMS          int // длина «слота» для оценки, мс (по умолчанию ~400)
+	// Если у создателя (creator) за 24ч >= N любых транзакций (по getSignatures) — скип (анти-спам dev). 0 = выкл.
+	MigrationDevMaxSigs24h int
+	// Если за сессию по этому creator уже было >= N убыточных MIG-циклов — скип (DevPreviousRugCount, без ончейн-индекса).
+	MigrationDevSessionRugsMax int
+	// Каскад: при quote_pnl >= MigrationPartialTPPct продать MigrationPartialSellFrac позиции; остаток — trail/TP/SL.
+	MigrationPartialTPPct     float64 // доля, 0.27 = +27%; 0 = выкл.
+	MigrationPartialSellFrac  float64 // 0.5 = 50%
+	MigrationTrailPullbackPct float64 // доля от пика quote остатка; 0 = после partial только TP/SL по остатку
+	// Множители приоритета только для MIG swap (комиссия в swap-теле Jupiter).
+	MigrationBuyPrioMult  float64
+	MigrationSellPrioMult float64
+	// RPC getPriorityFeeEstimate (Helius и др.): оценка приоритета для MIG BUY; итог = max(base, estimate*mult).
+	MigrationHeliusPrioEstimate bool
+	MigrationPrioEstimateLevel  string // Min|Low|Medium|High|VeryHigh|UnsafeMax
+	MigrationPrioEstimateMult   float64
+	MigrationPrioEstimateMaxLam uint64 // верхняя граница lamports; 0 = без лимита
+	MigrationPrioEstimateTimeout time.Duration
 	// VSR Speed exit: выход по затуханию притока ликвидности на кривую.
 	VSRSExit           bool
 	VSRSWindowSec      int     // окно для оценки скорости VSR (сек)
@@ -506,6 +535,8 @@ var (
 	// MIGRATION live trading guard (1 position max)
 	migrationTradeInFlight atomic.Bool
 	migrationOpen          atomic.Int32
+	migDevRugMu            sync.Mutex
+	migDevRugN             = map[string]int{} // creator → число убыточных MIG-циклов за сессию
 
 	// MIGRATION paper stats (from [MIG][LIVE] tracking)
 	migPaperTotal  atomic.Int32
@@ -1471,8 +1502,28 @@ func loadCfg() Config {
 		MigrationMaxCheck:        30,
 		MigrationMinFirstSeenAge: 0,
 		MigrationMaxFirstSeenAge: 0,
-		MigrationMinLiqUSD:       5000,
+		MigrationMinLiqUSD:       12000,
 		MigrationAllowedDexes:    nil,
+		MigrationDelayMS:         0,
+		MigrationDynamicSlip:     true,
+		MigrationSlipLowBps:      800,
+		MigrationSlipHighBps:     4000,
+		MigrationHypeWindow:      15 * time.Second,
+		MigrationHypeMinBuys:     10,
+		MigrationExtraBlocksWait: 0,
+		MigrationSlotMS:          400,
+		MigrationDevMaxSigs24h:   0,
+		MigrationDevSessionRugsMax: 0,
+		MigrationPartialTPPct:     0,
+		MigrationPartialSellFrac:  0.5,
+		MigrationTrailPullbackPct: 0.12,
+		MigrationBuyPrioMult:      1,
+		MigrationSellPrioMult:     1,
+		MigrationHeliusPrioEstimate: false,
+		MigrationPrioEstimateLevel:  "High",
+		MigrationPrioEstimateMult:   1,
+		MigrationPrioEstimateMaxLam:   0,
+		MigrationPrioEstimateTimeout: 800 * time.Millisecond,
 		VSRSExit:                 false,
 		VSRSWindowSec:            6,
 		VSRSMinUpSOLPerSec:       0.8,
@@ -1665,6 +1716,85 @@ func loadCfg() Config {
 			}
 		}
 		c.MigrationAllowedDexes = out
+	}
+	if n := evU("MIG_DELAY_MS", 0); n > 0 {
+		if n > 60_000 {
+			n = 60_000
+		}
+		c.MigrationDelayMS = int(n)
+	}
+	c.MigrationDynamicSlip = ev("MIG_DYNAMIC_SLIP", "1") == "1"
+	if n := evU("MIG_SLIP_LOW_BPS", 0); n > 0 {
+		c.MigrationSlipLowBps = n
+	}
+	if n := evU("MIG_SLIP_HIGH_BPS", 0); n > 0 {
+		c.MigrationSlipHighBps = n
+	}
+	if s := evU("MIG_HYPE_WINDOW_SEC", 0); s > 0 {
+		c.MigrationHypeWindow = time.Duration(s) * time.Second
+	}
+	if n := evU("MIG_HYPE_MIN_BUYS", 0); n > 0 {
+		c.MigrationHypeMinBuys = int(n)
+	}
+	if n := evU("MIG_EXTRA_BLOCKS_WAIT", 0); n > 0 {
+		c.MigrationExtraBlocksWait = int(n)
+	}
+	if n := evU("MIG_SLOT_MS", 0); n > 0 {
+		c.MigrationSlotMS = int(n)
+	}
+	if n := evU("MIG_DEV_MAX_SIGS_24H", 0); n > 0 {
+		c.MigrationDevMaxSigs24h = int(n)
+	}
+	if n := evU("MIG_DEV_SESSION_RUGS_MAX", 0); n > 0 {
+		c.MigrationDevSessionRugsMax = int(n)
+	}
+	if v := strings.TrimSpace(os.Getenv("MIG_PARTIAL_TP_PCT")); v != "" && v != "0" {
+		if x, err := strconv.ParseFloat(v, 64); err == nil {
+			if x > 1 {
+				c.MigrationPartialTPPct = x / 100
+			} else {
+				c.MigrationPartialTPPct = x
+			}
+		}
+	}
+	if v := strings.TrimSpace(os.Getenv("MIG_PARTIAL_SELL_FRAC")); v != "" {
+		if x, err := strconv.ParseFloat(v, 64); err == nil && x > 0 && x < 1 {
+			c.MigrationPartialSellFrac = x
+		}
+	}
+	if v := strings.TrimSpace(os.Getenv("MIG_TRAIL_PULLBACK_PCT")); v != "" && v != "0" {
+		if x, err := strconv.ParseFloat(v, 64); err == nil {
+			if x > 1 {
+				c.MigrationTrailPullbackPct = x / 100
+			} else {
+				c.MigrationTrailPullbackPct = x
+			}
+		}
+	}
+	if v := strings.TrimSpace(os.Getenv("MIG_BUY_PRIO_MULT")); v != "" {
+		if x, err := strconv.ParseFloat(v, 64); err == nil && x > 0 {
+			c.MigrationBuyPrioMult = x
+		}
+	}
+	if v := strings.TrimSpace(os.Getenv("MIG_SELL_PRIO_MULT")); v != "" {
+		if x, err := strconv.ParseFloat(v, 64); err == nil && x > 0 {
+			c.MigrationSellPrioMult = x
+		}
+	}
+	c.MigrationHeliusPrioEstimate = ev("MIG_HELIUS_PRIO_ESTIMATE", "0") == "1"
+	if v := strings.TrimSpace(os.Getenv("MIG_PRIO_ESTIMATE_LEVEL")); v != "" {
+		c.MigrationPrioEstimateLevel = v
+	}
+	if v := strings.TrimSpace(os.Getenv("MIG_PRIO_ESTIMATE_MULT")); v != "" {
+		if x, err := strconv.ParseFloat(v, 64); err == nil && x > 0 {
+			c.MigrationPrioEstimateMult = x
+		}
+	}
+	if n := evU("MIG_PRIO_ESTIMATE_MAX_LAMPORTS", 0); n > 0 {
+		c.MigrationPrioEstimateMaxLam = n
+	}
+	if ms := evU("MIG_PRIO_ESTIMATE_TIMEOUT_MS", 0); ms > 0 {
+		c.MigrationPrioEstimateTimeout = time.Duration(ms) * time.Millisecond
 	}
 	if v := strings.TrimSpace(os.Getenv("COPY_SELL_MIN_EST_PNL_PCT")); v != "" {
 		x, err := strconv.ParseFloat(v, 64)
@@ -2624,6 +2754,194 @@ var (
 	wsolMint = solana.MustPublicKeyFromBase58("So11111111111111111111111111111111111111112")
 )
 
+func migrationPickSlipBps(mintStr string) uint64 {
+	if !cfg.MigrationDynamicSlip {
+		return cfg.Slip
+	}
+	if cfg.MigrationHypeMinBuys <= 0 || cfg.MigrationHypeWindow <= 0 {
+		if cfg.MigrationSlipLowBps > 0 {
+			return cfg.MigrationSlipLowBps
+		}
+		return cfg.Slip
+	}
+	n := mintPumpBuysInWindow(mintStr, cfg.MigrationHypeWindow)
+	if n >= cfg.MigrationHypeMinBuys {
+		if cfg.MigrationSlipHighBps > 0 {
+			return cfg.MigrationSlipHighBps
+		}
+		return cfg.Slip
+	}
+	if cfg.MigrationSlipLowBps > 0 {
+		return cfg.MigrationSlipLowBps
+	}
+	return cfg.Slip
+}
+
+func migrationPrioBuyLamports() uint64 {
+	p := float64(cfg.PrioLamp) * cfg.MigrationBuyPrioMult
+	if p < 0 {
+		return 0
+	}
+	return uint64(p)
+}
+
+func migrationPrioSellLamports() uint64 {
+	p := float64(cfg.PrioLampSell) * cfg.MigrationSellPrioMult
+	if p < 0 {
+		return 0
+	}
+	return uint64(p)
+}
+
+func creatorRecentSigCount(ctx context.Context, pk solana.PublicKey, window time.Duration) (int, error) {
+	if window <= 0 {
+		return 0, nil
+	}
+	cut := time.Now().Add(-window)
+	limitI := 1000
+	rpcWait()
+	sigs, err := rpcClient().GetSignaturesForAddressWithOpts(ctx, pk, &rpc.GetSignaturesForAddressOpts{Limit: &limitI})
+	if err != nil {
+		return 0, err
+	}
+	n := 0
+	for _, s := range sigs {
+		if s.BlockTime == nil {
+			continue
+		}
+		ts := time.Unix(int64(*s.BlockTime), 0)
+		if ts.Before(cut) {
+			break
+		}
+		n++
+	}
+	return n, nil
+}
+
+func migrationRefreshATABalance(ctx context.Context, user, mint, tokProg solana.PublicKey) uint64 {
+	ata := findATA(user, mint, tokProg)
+	rpcWait()
+	bal, err := rpcClient().GetTokenAccountBalance(ctx, ata, rpc.CommitmentConfirmed)
+	rpcNote(err)
+	if err != nil || bal == nil || bal.Value == nil {
+		return getTokenBalance(ctx, ata)
+	}
+	a, _ := strconv.ParseUint(bal.Value.Amount, 10, 64)
+	return a
+}
+
+// rpcJSONRPC — POST JSON-RPC на cfg.RPC (для getPriorityFeeEstimate и т.п.).
+func rpcJSONRPC(ctx context.Context, method string, params []interface{}) (json.RawMessage, error) {
+	rpcWait()
+	body := map[string]interface{}{
+		"jsonrpc": "2.0",
+		"id":      1,
+		"method":  method,
+		"params":  params,
+	}
+	b, err := json.Marshal(body)
+	if err != nil {
+		return nil, err
+	}
+	req, err := http.NewRequestWithContext(ctx, "POST", cfg.RPC, bytes.NewReader(b))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept", "application/json")
+	cl := &http.Client{Timeout: 12 * time.Second}
+	resp, err := cl.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	raw, _ := io.ReadAll(resp.Body)
+	var wrap struct {
+		Result json.RawMessage `json:"result"`
+		Error  *struct {
+			Code    int    `json:"code"`
+			Message string `json:"message"`
+		} `json:"error"`
+	}
+	if json.Unmarshal(raw, &wrap) != nil {
+		return nil, fmt.Errorf("bad rpc json: %s", truncateStr(string(raw), 200))
+	}
+	if wrap.Error != nil {
+		return nil, fmt.Errorf("rpc %d: %s", wrap.Error.Code, wrap.Error.Message)
+	}
+	return wrap.Result, nil
+}
+
+func truncateStr(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	return s[:n] + "…"
+}
+
+// migrationHeliusPriorityFeeEstimateBuy — getPriorityFeeEstimate по accountKeys (Helius-совместимый RPC).
+// Ответ трактуем как рекомендуемые lamports приоритета для тела Jupiter swap (см. доки провайдера).
+func migrationHeliusPriorityFeeEstimateBuy(ctx context.Context, user, mint solana.PublicKey) (uint64, error) {
+	lvl := strings.TrimSpace(cfg.MigrationPrioEstimateLevel)
+	if lvl == "" {
+		lvl = "High"
+	}
+	keys := []string{user.String(), mint.String(), wsolMint.String()}
+	params := []interface{}{
+		map[string]interface{}{
+			"accountKeys": keys,
+			"options": map[string]interface{}{
+				"priorityLevel": lvl,
+			},
+		},
+	}
+	raw, err := rpcJSONRPC(ctx, "getPriorityFeeEstimate", params)
+	if err != nil {
+		return 0, err
+	}
+	var r struct {
+		PriorityFeeEstimate float64 `json:"priorityFeeEstimate"`
+		PriorityFeeLevels   struct {
+			Min       float64 `json:"min"`
+			Low       float64 `json:"low"`
+			Medium    float64 `json:"medium"`
+			High      float64 `json:"high"`
+			VeryHigh  float64 `json:"veryHigh"`
+			UnsafeMax float64 `json:"unsafeMax"`
+		} `json:"priorityFeeLevels"`
+	}
+	if json.Unmarshal(raw, &r) != nil {
+		return 0, fmt.Errorf("parse getPriorityFeeEstimate result")
+	}
+	est := r.PriorityFeeEstimate
+	if est <= 0 {
+		l := strings.ToLower(strings.ReplaceAll(strings.TrimSpace(lvl), " ", ""))
+		switch l {
+		case "min":
+			est = r.PriorityFeeLevels.Min
+		case "low":
+			est = r.PriorityFeeLevels.Low
+		case "medium":
+			est = r.PriorityFeeLevels.Medium
+		case "high":
+			est = r.PriorityFeeLevels.High
+		case "veryhigh":
+			est = r.PriorityFeeLevels.VeryHigh
+		case "unsafemax":
+			est = r.PriorityFeeLevels.UnsafeMax
+		default:
+			est = r.PriorityFeeLevels.High
+		}
+	}
+	if est <= 0 {
+		return 0, fmt.Errorf("empty priority estimate")
+	}
+	if est > 1e11 {
+		return 0, fmt.Errorf("estimate out of range (%.0f)", est)
+	}
+	return uint64(est + 0.5), nil
+}
+
 func migrationLiveSwapLoop(ctx context.Context, mintStr string) {
 	if cfg.BuyLamp == 0 {
 		log.Printf("[MIG][SWAP] skip %s: BUY_AMOUNT_SOL=0", short(mintStr))
@@ -2634,6 +2952,42 @@ func migrationLiveSwapLoop(ctx context.Context, mintStr string) {
 		return
 	}
 	user := cfg.Key.PublicKey()
+	creatorStr := ""
+	{
+		bcCtx, bcCancel := context.WithTimeout(ctx, 6*time.Second)
+		st, _, bcErr := readBC(bcCtx, mint)
+		bcCancel()
+		if bcErr == nil && st != nil {
+			creatorStr = st.Creator.String()
+		}
+	}
+	if cfg.MigrationDevSessionRugsMax > 0 && creatorStr != "" {
+		migDevRugMu.Lock()
+		n := migDevRugN[creatorStr]
+		migDevRugMu.Unlock()
+		if n >= cfg.MigrationDevSessionRugsMax {
+			log.Printf("[MIG][SWAP] skip %s: dev session losses %d >= %d | dev=%s", short(mintStr), n, cfg.MigrationDevSessionRugsMax, short(creatorStr))
+			return
+		}
+	}
+	if cfg.MigrationDevMaxSigs24h > 0 && creatorStr != "" {
+		cpk, err := solana.PublicKeyFromBase58(creatorStr)
+		if err == nil {
+			subCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+			n, err := creatorRecentSigCount(subCtx, cpk, 24*time.Hour)
+			cancel()
+			if err != nil {
+				log.Printf("[MIG][SWAP] warn %s: dev 24h sig count failed (%v) — filter skipped", short(mintStr), err)
+			} else if n >= cfg.MigrationDevMaxSigs24h {
+				log.Printf("[MIG][SWAP] skip %s: dev txs 24h=%d >= %d (spam filter)", short(mintStr), n, cfg.MigrationDevMaxSigs24h)
+				return
+			}
+		}
+	}
+	buySlip := migrationPickSlipBps(mintStr)
+	prioBuy := migrationPrioBuyLamports()
+	prioSell := migrationPrioSellLamports()
+	prioBuyBase := prioBuy
 	if cfg.MigrationMinLiqUSD > 0 || len(cfg.MigrationAllowedDexes) > 0 {
 		_, liq, dex, ok := dexTokenBestUSD(mintStr)
 		if !ok {
@@ -2659,6 +3013,51 @@ func migrationLiveSwapLoop(ctx context.Context, mintStr string) {
 			}
 		}
 	}
+	if cfg.MigrationDelayMS > 0 {
+		d := time.Duration(cfg.MigrationDelayMS) * time.Millisecond
+		log.Printf("[MIG][SWAP] pre-buy delay %v | %s", d, short(mintStr))
+		select {
+		case <-time.After(d):
+		case <-ctx.Done():
+			log.Printf("[MIG][SWAP] cancelled during delay | %s", short(mintStr))
+			return
+		}
+	}
+	if cfg.MigrationExtraBlocksWait > 0 {
+		slotMS := cfg.MigrationSlotMS
+		if slotMS <= 0 {
+			slotMS = 400
+		}
+		d := time.Duration(cfg.MigrationExtraBlocksWait*slotMS) * time.Millisecond
+		log.Printf("[MIG][SWAP] extra block delay %v (~%d slots) | %s", d, cfg.MigrationExtraBlocksWait, short(mintStr))
+		select {
+		case <-time.After(d):
+		case <-ctx.Done():
+			log.Printf("[MIG][SWAP] cancelled during block delay | %s", short(mintStr))
+			return
+		}
+	}
+	if cfg.MigrationHeliusPrioEstimate {
+		to := cfg.MigrationPrioEstimateTimeout
+		if to <= 0 {
+			to = 800 * time.Millisecond
+		}
+		estCtx, cancel := context.WithTimeout(ctx, to)
+		est, err := migrationHeliusPriorityFeeEstimateBuy(estCtx, user, mint)
+		cancel()
+		if err != nil {
+			log.Printf("[MIG][SWAP] prio estimate: %v (use base=%d)", err, prioBuyBase)
+		} else {
+			adj := uint64(float64(est) * cfg.MigrationPrioEstimateMult)
+			if cfg.MigrationPrioEstimateMaxLam > 0 && adj > cfg.MigrationPrioEstimateMaxLam {
+				adj = cfg.MigrationPrioEstimateMaxLam
+			}
+			if adj > prioBuy {
+				log.Printf("[MIG][SWAP] prio BUY: base=%d → RPC est=%d lamports (use %d)", prioBuyBase, est, adj)
+				prioBuy = adj
+			}
+		}
+	}
 	balBefore := uint64(0)
 	rpcWait()
 	if b, err := rpcClient().GetBalance(ctx, user, rpc.CommitmentConfirmed); err == nil && b != nil {
@@ -2668,8 +3067,10 @@ func migrationLiveSwapLoop(ctx context.Context, mintStr string) {
 		rpcNote(err)
 	}
 
-	log.Printf("[MIG][SWAP] BUY start %s | amount=%.4f SOL | slip=%dbps", short(mintStr), float64(cfg.BuyLamp)/1e9, cfg.Slip)
-	sigBuy, outAmt, ok := jupSwap(ctx, user, wsolMint, mint, cfg.BuyLamp, cfg.Slip, cfg.PrioLamp)
+	log.Printf("[MIG][SWAP] BUY start %s | amount=%.4f SOL | slip=%dbps (dynamic=%v hype=%d/%s)",
+		short(mintStr), float64(cfg.BuyLamp)/1e9, buySlip, cfg.MigrationDynamicSlip,
+		mintPumpBuysInWindow(mintStr, cfg.MigrationHypeWindow), cfg.MigrationHypeWindow)
+	sigBuy, outAmt, ok := jupSwap(ctx, user, wsolMint, mint, cfg.BuyLamp, buySlip, prioBuy)
 	if !ok {
 		log.Printf("[MIG][SWAP] BUY failed %s", short(mintStr))
 		return
@@ -2691,7 +3092,7 @@ func migrationLiveSwapLoop(ctx context.Context, mintStr string) {
 			log.Printf("[MIG][SWAP] ATA balance fallback(raw) | %s | amt=%d", short(mintStr), rawAmt)
 			inAmt := rawAmt
 			log.Printf("[MIG][SWAP] SELL start %s | amount=%d | slip=%dbps", short(mintStr), inAmt, cfg.SellSlip)
-			sigSell, _, okSell := jupSwap(ctx, user, mint, wsolMint, inAmt, cfg.SellSlip, cfg.PrioLampSell)
+			sigSell, _, okSell := jupSwap(ctx, user, mint, wsolMint, inAmt, cfg.SellSlip, prioSell)
 			if !okSell {
 				log.Printf("[MIG][SWAP] SELL failed %s", short(mintStr))
 				return
@@ -2706,7 +3107,7 @@ func migrationLiveSwapLoop(ctx context.Context, mintStr string) {
 			if inAmt > 0 {
 				log.Printf("[MIG][SWAP] ATA unreadable, fallback to est_out*0.92 | %s | amt=%d", short(mintStr), inAmt)
 				log.Printf("[MIG][SWAP] SELL start %s | amount=%d | slip=%dbps", short(mintStr), inAmt, cfg.SellSlip)
-				sigSell, _, okSell := jupSwap(ctx, user, mint, wsolMint, inAmt, cfg.SellSlip, cfg.PrioLampSell)
+				sigSell, _, okSell := jupSwap(ctx, user, mint, wsolMint, inAmt, cfg.SellSlip, prioSell)
 				if !okSell {
 					log.Printf("[MIG][SWAP] SELL failed %s", short(mintStr))
 					return
@@ -2725,19 +3126,25 @@ func migrationLiveSwapLoop(ctx context.Context, mintStr string) {
 		return
 	}
 
-	// Quote-based exit: смотрим реальный обратный quote в SOL, а не "картинку" dexscreener.
-	// Это резко уменьшает ложные TP на тонкой ликвидности.
+	// Quote-based exit: реальный Jupiter quote token→SOL. Опционально partial TP + trail по остатку.
 	tp := cfg.TP
 	sl := cfg.SL
 	if tp <= 0 || sl <= 0 {
 		log.Printf("[MIG][SWAP] TP/SL disabled, no auto-exit | %s", short(mintStr))
 		return
 	}
+	partialTP := cfg.MigrationPartialTPPct
+	partialFrac := cfg.MigrationPartialSellFrac
+	trailPull := cfg.MigrationTrailPullbackPct
+	deadline := time.Now().Add(2 * time.Minute)
+	poll := 2 * time.Second
 	startOut := uint64(0)
 	maxOut := uint64(0)
 	minOut := uint64(0)
-	deadline := time.Now().Add(2 * time.Minute)
-	poll := 2 * time.Second
+	partialDone := false
+	start2 := uint64(0)
+	max2 := uint64(0)
+
 	for time.Now().Before(deadline) {
 		select {
 		case <-ctx.Done():
@@ -2745,7 +3152,11 @@ func migrationLiveSwapLoop(ctx context.Context, mintStr string) {
 		default:
 		}
 		outLam, okQ := jupQuoteOutLamports(ctx, mint, wsolMint, inAmt, cfg.SellSlip)
-		if okQ && outLam > 0 {
+		if !okQ || outLam == 0 {
+			time.Sleep(poll)
+			continue
+		}
+		if !partialDone {
 			if startOut == 0 {
 				startOut = outLam
 				maxOut, minOut = outLam, outLam
@@ -2758,6 +3169,32 @@ func migrationLiveSwapLoop(ctx context.Context, mintStr string) {
 				}
 			}
 			pnl := float64(outLam)/float64(cfg.BuyLamp) - 1
+			if partialTP > 0 && partialFrac > 0 && partialFrac < 1 && pnl >= partialTP {
+				sellAmt := uint64(float64(inAmt) * partialFrac)
+				if partialFrac >= 0.49 && partialFrac <= 0.51 {
+					sellAmt = inAmt / 2
+				}
+				if sellAmt > 0 && sellAmt < inAmt {
+					log.Printf("[MIG][SWAP] partial TP +%.1f%% → sell %.0f%% | %s", pnl*100, partialFrac*100, short(mintStr))
+					sigP, _, okP := jupSwap(ctx, user, mint, wsolMint, sellAmt, cfg.SellSlip, prioSell)
+					if !okP {
+						log.Printf("[MIG][SWAP] partial SELL failed %s", short(mintStr))
+						return
+					}
+					log.Printf("[MIG][SWAP] partial SELL sent %s | tx=%s", short(mintStr), sigP.String()[:12])
+					time.Sleep(1500 * time.Millisecond)
+					inAmt = migrationRefreshATABalance(ctx, user, mint, tokProg)
+					if inAmt == 0 {
+						log.Printf("[MIG][SWAP] zero balance after partial | %s", short(mintStr))
+						migrationOpen.Add(-1)
+						return
+					}
+					partialDone = true
+					start2 = 0
+					max2 = 0
+					continue
+				}
+			}
 			if pnl >= tp {
 				log.Printf("[MIG][SWAP] TP hit %s | quote_pnl=+%.1f%%", short(mintStr), pnl*100)
 				break
@@ -2766,12 +3203,33 @@ func migrationLiveSwapLoop(ctx context.Context, mintStr string) {
 				log.Printf("[MIG][SWAP] SL hit %s | quote_pnl=%.1f%%", short(mintStr), pnl*100)
 				break
 			}
+		} else {
+			if start2 == 0 {
+				start2 = outLam
+				max2 = outLam
+			}
+			if outLam > max2 {
+				max2 = outLam
+			}
+			if trailPull > 0 && max2 > 0 && float64(outLam) <= float64(max2)*(1.0-trailPull) {
+				log.Printf("[MIG][SWAP] trail exit (remainder) | %s", short(mintStr))
+				break
+			}
+			pnl2 := float64(outLam)/float64(start2) - 1
+			if trailPull <= 0 && pnl2 >= tp {
+				log.Printf("[MIG][SWAP] TP hit (remainder) | %s", short(mintStr))
+				break
+			}
+			if pnl2 <= -sl {
+				log.Printf("[MIG][SWAP] SL hit (remainder) | %s", short(mintStr))
+				break
+			}
 		}
 		time.Sleep(poll)
 	}
 
 	log.Printf("[MIG][SWAP] SELL start %s | amount=%d | slip=%dbps", short(mintStr), inAmt, cfg.SellSlip)
-	sigSell, _, okSell := jupSwap(ctx, user, mint, wsolMint, inAmt, cfg.SellSlip, cfg.PrioLampSell)
+	sigSell, _, okSell := jupSwap(ctx, user, mint, wsolMint, inAmt, cfg.SellSlip, prioSell)
 	if !okSell {
 		log.Printf("[MIG][SWAP] SELL failed %s", short(mintStr))
 		return
@@ -2795,6 +3253,11 @@ func migrationLiveSwapLoop(ctx context.Context, mintStr string) {
 				migRealWins.Add(1)
 			} else if delta < 0 {
 				migRealLosses.Add(1)
+				if creatorStr != "" {
+					migDevRugMu.Lock()
+					migDevRugN[creatorStr]++
+					migDevRugMu.Unlock()
+				}
 			}
 			pct := 0.0
 			if cfg.BuyLamp > 0 {

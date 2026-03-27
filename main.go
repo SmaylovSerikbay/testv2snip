@@ -273,6 +273,8 @@ type Config struct {
 	MigrationMode string
 	MigrationScanIvl time.Duration
 	MigrationMaxCheck int
+	// Таймаут только на GetAccountInfo bonding-curve в MIG-скане (мс). 0 = 700. Очередь rpcWait() в этот лимит не входит.
+	MigrationReadBCMs int
 	// Если >0: логировать/учитывать только graduation, у которых age с момента firstSeen >= этого порога.
 	// Важно: age считается от первого появления mint в watcher (память в RAM). При рестарте возраст обнулится.
 	MigrationMinFirstSeenAge time.Duration
@@ -1740,6 +1742,12 @@ func loadCfg() Config {
 	if n := evU("MIGRATION_MAX_CHECK", 0); n > 0 {
 		c.MigrationMaxCheck = int(n)
 	}
+	if n := evU("MIGRATION_READ_BC_MS", 0); n > 0 {
+		if n > 5000 {
+			n = 5000
+		}
+		c.MigrationReadBCMs = int(n)
+	}
 	if s := evU("MIGRATION_MIN_FIRSTSEEN_AGE_SEC", 0); s > 0 {
 		c.MigrationMinFirstSeenAge = time.Duration(s) * time.Second
 	}
@@ -2362,7 +2370,11 @@ func runMigrationWatcher(ctx context.Context) {
 	if maxCheck > 300 {
 		maxCheck = 300
 	}
-	log.Printf("[MIG] Mode=%s | scan=%v | maxCheck=%d", cfg.MigrationMode, ivl, maxCheck)
+	readBCms := cfg.MigrationReadBCMs
+	if readBCms <= 0 {
+		readBCms = 700
+	}
+	log.Printf("[MIG] Mode=%s | scan=%v | maxCheck=%d | readBC_HTTP=%dms (rpcWait отдельно)", cfg.MigrationMode, ivl, maxCheck, readBCms)
 
 	seenMu := sync.Mutex{}
 	seen := map[string]time.Time{} // mint -> when we reported graduation
@@ -2510,7 +2522,10 @@ func runMigrationWatcher(ctx context.Context) {
 		}
 		checked = len(cands)
 
-		perMintTimeout := 350 * time.Millisecond
+		perMintHTTP := time.Duration(readBCms) * time.Millisecond
+		if perMintHTTP < 200*time.Millisecond {
+			perMintHTTP = 200 * time.Millisecond
+		}
 		workers := 32
 		if maxCheck < workers {
 			workers = maxCheck
@@ -2533,8 +2548,8 @@ func runMigrationWatcher(ctx context.Context) {
 		}
 		if len(cands) > 0 {
 			batches := (len(cands) + workers - 1) / workers
-			// perMint — только таймаут readBC; реально rpcWait+RPC часто дольше → запас на батч.
-			minBudget := time.Duration(batches) * 850 * time.Millisecond
+			// HTTP-таймаут на mint + очередь rpcWait; запас на батч.
+			minBudget := time.Duration(batches) * (perMintHTTP + 200*time.Millisecond)
 			if minBudget > timeBudget {
 				timeBudget = minBudget
 			}
@@ -2557,8 +2572,13 @@ func runMigrationWatcher(ctx context.Context) {
 						scanSkip.Add(1)
 						continue
 					}
-					cctx, cancel := context.WithTimeout(scanCtx, perMintTimeout)
-					s, _, e3 := readBC(cctx, it.mint)
+					rpcWait()
+					if scanCtx.Err() != nil {
+						scanSkip.Add(1)
+						continue
+					}
+					cctx, cancel := context.WithTimeout(scanCtx, perMintHTTP)
+					s, _, e3 := fetchBondingCurve(cctx, it.mint)
 					cancel()
 					if e3 != nil {
 						bcRPCErr.Add(1)
@@ -6178,9 +6198,14 @@ func notePinnedWalletOnWin(wallet string, pnl float64) {
 // ═══════════════════════════════════════════════════════════════════════════════
 
 func readBC(ctx context.Context, mint solana.PublicKey) (*BondingCurve, solana.PublicKey, error) {
+	rpcWait()
+	return fetchBondingCurve(ctx, mint)
+}
+
+// fetchBondingCurve — только GetAccountInfo; вызывающий обязан вызвать rpcWait() (или держать свой rate-limit).
+func fetchBondingCurve(ctx context.Context, mint solana.PublicKey) (*BondingCurve, solana.PublicKey, error) {
 	// PDA bonding-curve уже считается так же, как в программе pump; «not found» = аккаунт ещё не на RPC.
 	bc, _, _ := solana.FindProgramAddress([][]byte{[]byte("bonding-curve"), mint.Bytes()}, PumpProgram)
-	rpcWait()
 	info, err := rpcClient().GetAccountInfoWithOpts(ctx, bc, &rpc.GetAccountInfoOpts{
 		Encoding:   solana.EncodingBase64,
 		Commitment: rpc.CommitmentConfirmed,

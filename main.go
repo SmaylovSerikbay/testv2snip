@@ -2504,8 +2504,17 @@ func runMigrationWatcher(ctx context.Context) {
 		}
 		checked = len(cands)
 
-		// Бюджет: ~90% интервала между сканами (раньше было 0.5*ivl и жёсткий cap 2s — при
-		// MIGRATION_MAX_CHECK=150 и коротком ivl часть mint не успевала readBC, graduated всегда 0).
+		perMintTimeout := 350 * time.Millisecond
+		workers := 32
+		if maxCheck < workers {
+			workers = maxCheck
+		}
+		if workers < 1 {
+			workers = 1
+		}
+
+		// База: ~90% интервала. Плюс нижняя граница по числу батчей — иначе при ivl=2s бюджет ~1.8s
+		// и хвост очереди уходит в scanSkip без readBC (у тебя было scanSkip≈30 при checked≈95).
 		timeBudget := ivl * 9 / 10
 		if timeBudget < 800*time.Millisecond {
 			timeBudget = 800 * time.Millisecond
@@ -2516,17 +2525,19 @@ func runMigrationWatcher(ctx context.Context) {
 		if timeBudget < 100*time.Millisecond {
 			timeBudget = 100 * time.Millisecond
 		}
+		if len(cands) > 0 {
+			batches := (len(cands) + workers - 1) / workers
+			// perMint — только таймаут readBC; реально rpcWait+RPC часто дольше → запас на батч.
+			minBudget := time.Duration(batches) * 850 * time.Millisecond
+			if minBudget > timeBudget {
+				timeBudget = minBudget
+			}
+		}
+		if timeBudget > 20*time.Second {
+			timeBudget = 20 * time.Second
+		}
 		scanCtx, scanCancel := context.WithTimeout(ctx, timeBudget)
 		defer scanCancel()
-		perMintTimeout := 350 * time.Millisecond
-
-		workers := 32
-		if maxCheck < workers {
-			workers = maxCheck
-		}
-		if workers < 1 {
-			workers = 1
-		}
 		jobs := make(chan cand, len(cands))
 		var wg sync.WaitGroup
 		var bcDone, skipAgeMin, skipAgeMax atomic.Int32

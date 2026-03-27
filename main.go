@@ -2652,12 +2652,8 @@ func runMigrationWatcher(ctx context.Context) {
 			jobs <- it
 		}
 		close(jobs)
-		done := make(chan struct{})
-		go func() { wg.Wait(); close(done) }()
-		select {
-		case <-done:
-		case <-scanCtx.Done():
-		}
+		// Ждём все readBC: раньше select+scanCtx обрывал ожидание и логировал неполные bcOpen/rpcErr.
+		wg.Wait()
 		// GC old
 		seenMu.Lock()
 		cut := time.Now().Add(-30 * time.Minute)
@@ -2805,21 +2801,37 @@ func trackMigrationDex(ctx context.Context, mintStr string) {
 	}
 	migPaperTotal.Add(1)
 	label := "FLAT"
+	var deltaLam int64
 	if cfg.TP > 0 && maxUpPct >= cfg.TP*100 {
 		label = "PROFIT"
 		migPaperProfit.Add(1)
-		migPaperPnlLam.Add(int64(float64(cfg.BuyLamp) * cfg.TP))
+		deltaLam = int64(float64(cfg.BuyLamp) * cfg.TP)
+		migPaperPnlLam.Add(deltaLam)
 	} else if cfg.SL > 0 && maxDnPct <= -cfg.SL*100 {
 		label = "LOSS"
 		migPaperLoss.Add(1)
-		migPaperPnlLam.Add(-int64(float64(cfg.BuyLamp) * cfg.SL))
+		deltaLam = -int64(float64(cfg.BuyLamp) * cfg.SL)
+		migPaperPnlLam.Add(deltaLam)
 	} else {
 		migPaperFlat.Add(1)
 	}
 	paperSol := float64(migPaperPnlLam.Load()) / 1e9
-	log.Printf("[MIG][LIVE] %s %s | samples=%d | px start=$%.8f max=$%.8f min=$%.8f | maxUp=%.1f%% maxDn=%.1f%% | liq start=$%.0f max=$%.0f | W/L/F=%d/%d/%d (n=%d) | paperΣ=%+.6f SOL | %s",
+	deltaSol := float64(deltaLam) / 1e9
+	// Для FLAT: наглядно «что могло бы быть» при выходе на пике (не правило Σ, только справка).
+	var peakHypSOL float64
+	if label == "FLAT" && startPx > 0 && maxPx > 0 {
+		peakHypSOL = float64(cfg.BuyLamp) * (maxPx/startPx - 1)
+	}
+	extra := ""
+	if label == "FLAT" {
+		extra = fmt.Sprintf(" | FLAT→paperΔ=0 (нужен maxUp≥+%.0f%% для +TP или maxDn≤-%.0f%% для −SL)", cfg.TP*100, cfg.SL*100)
+		if peakHypSOL != 0 {
+			extra += fmt.Sprintf(" | hyp@peak≈%+.6f SOL", peakHypSOL/1e9)
+		}
+	}
+	log.Printf("[MIG][LIVE] %s %s | samples=%d | px start=$%.8f max=$%.8f min=$%.8f | maxUp=%.1f%% maxDn=%.1f%% | liq start=$%.0f max=$%.0f | W/L/F=%d/%d/%d (n=%d) | paperΔ=%+.6f SOL paperΣ=%+.6f SOL%s | %s",
 		label, short(mintStr), samples, startPx, maxPx, minPx, maxUpPct, maxDnPct, startLiq, maxLiq,
-		migPaperProfit.Load(), migPaperLoss.Load(), migPaperFlat.Load(), migPaperTotal.Load(), paperSol, link)
+		migPaperProfit.Load(), migPaperLoss.Load(), migPaperFlat.Load(), migPaperTotal.Load(), deltaSol, paperSol, extra, link)
 }
 
 func httpPostJSON(ctx context.Context, url string, body []byte) ([]byte, error) {

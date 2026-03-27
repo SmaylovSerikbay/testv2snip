@@ -1220,12 +1220,17 @@ func checkJupiterHTTP() bool {
 	// Allow overriding base URLs (comma-separated), useful on VDS / restricted networks.
 	// Example: JUPITER_BASE_URLS=https://quote-api.jup.ag,https://api.jup.ag
 	bases := jupBaseURLs()
+	apiKey := strings.TrimSpace(os.Getenv("JUPITER_API_KEY"))
+	if apiKey == "" {
+		log.Printf("[JUP] disabled: JUPITER_API_KEY missing (Swap API теперь требует ключ)")
+		return false
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 	for _, b := range bases {
-		u := strings.TrimRight(b, "/") + "/v6/quote?inputMint=" + wsolMint.String() + "&outputMint=" +
+		u := strings.TrimRight(b, "/") + "/quote?inputMint=" + wsolMint.String() + "&outputMint=" +
 			wsolMint.String() + "&amount=1&slippageBps=1"
-		_, err := httpGetWithContext(ctx, u)
+		_, err := httpGetWithContextJup(ctx, u, apiKey)
 		if err == nil {
 			log.Printf("[JUP] OK | base=%s", b)
 			return true
@@ -1234,6 +1239,26 @@ func checkJupiterHTTP() bool {
 	}
 	log.Printf("[JUP] disabled: no reachable Jupiter base URL (DNS/egress). live swaps будут выключены.")
 	return false
+}
+
+func httpGetWithContextJup(ctx context.Context, u string, apiKey string) ([]byte, error) {
+	c := &http.Client{Timeout: 10 * time.Second}
+	req, _ := http.NewRequestWithContext(ctx, "GET", u, nil)
+	req.Header.Set("Accept", "application/json")
+	req.Header.Set("User-Agent", "Mozilla/5.0")
+	if strings.TrimSpace(apiKey) != "" {
+		req.Header.Set("x-api-key", apiKey)
+	}
+	r, err := c.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer r.Body.Close()
+	b, _ := io.ReadAll(r.Body)
+	if r.StatusCode != 200 {
+		return nil, fmt.Errorf("HTTP %d", r.StatusCode)
+	}
+	return b, nil
 }
 
 func httpGetWithContext(ctx context.Context, u string) ([]byte, error) {
@@ -1268,7 +1293,7 @@ func jupBaseURLs() []string {
 		}
 	}
 	// Default(s)
-	return []string{"https://quote-api.jup.ag"}
+	return []string{"https://api.jup.ag/swap/v1"}
 }
 
 func selftestSwap(ctx context.Context) {
@@ -2525,6 +2550,27 @@ func httpPostJSON(ctx context.Context, url string, body []byte) ([]byte, error) 
 	return b, nil
 }
 
+func httpPostJSONJup(ctx context.Context, url string, apiKey string, body []byte) ([]byte, error) {
+	c := &http.Client{Timeout: 10 * time.Second}
+	req, _ := http.NewRequestWithContext(ctx, "POST", url, bytes.NewReader(body))
+	req.Header.Set("Accept", "application/json")
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("User-Agent", "Mozilla/5.0")
+	if strings.TrimSpace(apiKey) != "" {
+		req.Header.Set("x-api-key", apiKey)
+	}
+	r, err := c.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer r.Body.Close()
+	b, _ := io.ReadAll(r.Body)
+	if r.StatusCode != 200 {
+		return nil, fmt.Errorf("HTTP %d", r.StatusCode)
+	}
+	return b, nil
+}
+
 var (
 	wsolMint = solana.MustPublicKeyFromBase58("So11111111111111111111111111111111111111112")
 )
@@ -2663,26 +2709,33 @@ func jupSwap(ctx context.Context, user solana.PublicKey, inputMint, outputMint s
 	}
 
 	bases := jupBaseURLs()
+	apiKey := strings.TrimSpace(os.Getenv("JUPITER_API_KEY"))
+	if apiKey == "" {
+		log.Printf("[MIG][SWAP] Jupiter disabled: JUPITER_API_KEY missing")
+		return solana.Signature{}, 0, false
+	}
 	var lastErr error
 	for _, base := range bases {
-		quoteURL := strings.TrimRight(base, "/") + "/v6/quote"
-		swapURL := strings.TrimRight(base, "/") + "/v6/swap"
+		quoteURL := strings.TrimRight(base, "/") + "/quote"
+		swapURL := strings.TrimRight(base, "/") + "/swap"
 
 		u := fmt.Sprintf("%s?inputMint=%s&outputMint=%s&amount=%d&slippageBps=%d&onlyDirectRoutes=false",
 			quoteURL, inputMint.String(), outputMint.String(), amount, slipBps)
-		qb, err := httpGetWithContext(ctx, u)
+		qb, err := httpGetWithContextJup(ctx, u, apiKey)
 		if err != nil {
 			lastErr = err
 			continue
 		}
-		var q struct {
+		// Quote can be either {data:[...]} (old) or the quote itself (swap/v1).
+		var quote json.RawMessage
+		var wrap struct {
 			Data []json.RawMessage `json:"data"`
 		}
-		if json.Unmarshal(qb, &q) != nil || len(q.Data) == 0 {
-			lastErr = errors.New("quote empty")
-			continue
+		if json.Unmarshal(qb, &wrap) == nil && len(wrap.Data) > 0 {
+			quote = wrap.Data[0]
+		} else {
+			quote = json.RawMessage(qb)
 		}
-		quote := q.Data[0]
 		var q1 struct {
 			OutAmount string `json:"outAmount"`
 		}
@@ -2701,7 +2754,7 @@ func jupSwap(ctx context.Context, user solana.PublicKey, inputMint, outputMint s
 			req["prioritizationFeeLamports"] = prioLam
 		}
 		rb, _ := json.Marshal(req)
-		sb, err := httpPostJSON(ctx, swapURL, rb)
+		sb, err := httpPostJSONJup(ctx, swapURL, apiKey, rb)
 		if err != nil {
 			lastErr = err
 			continue

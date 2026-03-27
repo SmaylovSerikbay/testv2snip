@@ -1739,6 +1739,26 @@ func scrape(ctx context.Context) {
 			if !sameMintOK && !profitOK && !ws.win24h2x {
 				continue
 			}
+			// Рабочий режим (OBSERVE_ONLY=0): добавляем цель сразу по базовой эвристике,
+			// чтобы бот не "вставал" после рестарта и быстро набирал targets.
+			if !cfg.ObserveOnly {
+				if _, ok := targets[w]; !ok && len(targets) < cfg.MaxTargets {
+					targets[w] = now
+					added++
+					reason := "same-mint/profit/2x"
+					if ws.win24h2x {
+						reason = "2x/24h or whale"
+					} else if sameMintOK {
+						reason = fmt.Sprintf("same-mint>=%d", cfg.ScrapeSameMintMin)
+					} else if profitOK {
+						reason = "profit>30%"
+					}
+					log.Printf("[SCRAPE] +Цель: %s (auto %s)", short(w), reason)
+				} else if ok {
+					targets[w] = now
+				}
+				continue
+			}
 
 			// 1) всегда записываем как кандидата (наблюдаем без торговли)
 			candMu.Lock()

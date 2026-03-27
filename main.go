@@ -3451,7 +3451,10 @@ func checkAll(ctx context.Context) (hasProfit bool, needFastYoung bool) {
 			reason = fmt.Sprintf("SL %.0f%%", pnl*100)
 		case cfg.ProfitLockMinPeak > 0 && s.p.HiPnl >= cfg.ProfitLockMinPeak:
 			lockFloor := cfg.ProfitLockFloor
-			if minNetExit > lockFloor {
+			// minNetExit — порог «чистого» выхода; pnl здесь по кривой. Подмешивать minNetExit в пол
+			// только если пик уже был ≥ этого уровня — иначе при поле ~+30% и pnl=+5% условие pnl<=пол
+			// выполняется сразу и PROFITLOCK режет сделку мгновенно (ложный выход).
+			if s.p.HiPnl >= minNetExit && minNetExit > lockFloor {
 				lockFloor = minNetExit
 			}
 			if pnl <= lockFloor {
@@ -4327,7 +4330,7 @@ func recordPnl(spent uint64, solNet uint64, mintOpt string) {
 		cdMu.Lock()
 		lossCdMap[mintOpt] = time.Now()
 		cdMu.Unlock()
-		log.Printf("[PNL] %s — повторный BUY этого mint заблокирован на %v (закрытие в минус)",
+		log.Printf("[PNL] %s — повторный BUY этого mint заблокирован на %v (net после priority/Jito < 0; см. SELL[FACT])",
 			short(mintOpt), cfg.MintLossCD.Round(time.Second))
 	}
 	if mintOpt != "" && delta > 0 && cfg.MintWinCD > 0 {

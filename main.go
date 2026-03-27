@@ -23,11 +23,61 @@ import (
 	"sync/atomic"
 	"time"
 
+	bin "github.com/gagliardetto/binary"
 	"github.com/gagliardetto/solana-go"
 	"github.com/gagliardetto/solana-go/rpc"
 	"github.com/gorilla/websocket"
 	"github.com/joho/godotenv"
 )
+
+const (
+	ansiReset  = "\x1b[0m"
+	ansiRed    = "\x1b[31m"
+	ansiGreen  = "\x1b[32m"
+	ansiYellow = "\x1b[33m"
+	ansiCyan   = "\x1b[36m"
+	ansiGray   = "\x1b[90m"
+)
+
+type colorWriter struct{ w io.Writer }
+
+func (cw colorWriter) Write(p []byte) (int, error) {
+	s := string(p)
+	c := ""
+
+	// Errors / warnings
+	if strings.Contains(s, " ✗ ") || strings.Contains(s, "[ERR]") || strings.Contains(s, "HTTP 429") {
+		c = ansiYellow
+	}
+	// Realized PnL lines
+	if strings.Contains(s, "[SELL][FACT]") {
+		if strings.Contains(s, " net=-") || strings.Contains(s, " net=−") {
+			c = ansiRed
+		} else if strings.Contains(s, " net=+") {
+			c = ansiGreen
+		}
+	}
+	// Migration paper tracking classification
+	if strings.Contains(s, "[MIG][LIVE] PROFIT") {
+		c = ansiGreen
+	} else if strings.Contains(s, "[MIG][LIVE] LOSS") {
+		c = ansiRed
+	} else if strings.Contains(s, "[MIG][LIVE] FLAT") {
+		c = ansiGray
+	}
+	// Graduation info
+	if strings.Contains(s, "[MIG] GRADUATED") {
+		c = ansiCyan
+	}
+
+	if c != "" {
+		_, _ = cw.w.Write([]byte(c))
+		_, _ = cw.w.Write(p)
+		_, _ = cw.w.Write([]byte(ansiReset))
+		return len(p), nil
+	}
+	return cw.w.Write(p)
+}
 
 // ═══════════════════════════════════════════════════════════════════════════════
 //  PUMP.FUN CONSTANTS
@@ -445,6 +495,19 @@ var (
 	// Счётчик Buy по mint из logsSubscribe на pump (анти «тихий» токен)
 	mintPumpBuyMu sync.Mutex
 	mintPumpBuys  = map[string][]time.Time{} // mint → время каждого Buy с глобального стрима
+	mintPumpBuyGC uint32
+
+	// MIGRATION live trading guard (1 position max)
+	migrationTradeInFlight atomic.Bool
+
+	// MIGRATION paper stats (from [MIG][LIVE] tracking)
+	migPaperTotal  atomic.Int32
+	migPaperProfit atomic.Int32
+	migPaperLoss   atomic.Int32
+	migPaperFlat   atomic.Int32
+
+	// Jupiter connectivity (HTTP API). If false, live swap is disabled automatically.
+	jupEnabled atomic.Bool
 )
 
 func rpcWait() { <-rpcBucket }
@@ -904,10 +967,22 @@ type scrapeEv struct {
 
 func main() {
 	log.SetFlags(log.Ltime | log.Lmicroseconds)
+	log.SetOutput(colorWriter{w: os.Stdout})
 	_ = godotenv.Load()
 	cfg = loadCfg()
 	loadPinnedWallets()
 	rpcCl = rpc.New(cfg.RPC)
+
+	// Jupiter HTTP health (for MIGRATION live swap). If DNS/egress is broken, disable swaps early.
+	jupEnabled.Store(checkJupiterHTTP())
+
+	// One-shot real swap self-test (safe, tiny size). Exits after completion.
+	// Usage:
+	//   $env:SWAP_SELFTEST="1"; $env:SWAP_SELFTEST_SOL="0.001"; ./copybot.exe
+	if os.Getenv("SWAP_SELFTEST") == "1" && cfg.Live && len(cfg.Key) == 64 {
+		selftestSwap(context.Background())
+		return
+	}
 
 	// Token bucket: 10 burst, refill at ~8/s
 	// увеличено: меньше очередей => меньше lag в hot-path (BUY/SELL)
@@ -1087,6 +1162,8 @@ func main() {
 	launch(runRPCHealth)
 	if cfg.MigrationMode != "off" {
 		log.Printf("[INIT] MIGRATION_MODE=%s: отключаем copy-trading (targets/executor/monitor), только наблюдение graduation", cfg.MigrationMode)
+		// В migration observe нам нужен глобальный pump WS, чтобы иметь реальный firstSeenAge по mint.
+		launch(runWSListener)
 		launch(runMigrationWatcher)
 	} else {
 		launch(runScraper)
@@ -1137,6 +1214,113 @@ func main() {
 	printStats()
 	cancel()
 	wg.Wait()
+}
+
+func checkJupiterHTTP() bool {
+	// Allow overriding base URLs (comma-separated), useful on VDS / restricted networks.
+	// Example: JUPITER_BASE_URLS=https://quote-api.jup.ag,https://api.jup.ag
+	bases := jupBaseURLs()
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	for _, b := range bases {
+		u := strings.TrimRight(b, "/") + "/v6/quote?inputMint=" + wsolMint.String() + "&outputMint=" +
+			wsolMint.String() + "&amount=1&slippageBps=1"
+		_, err := httpGetWithContext(ctx, u)
+		if err == nil {
+			log.Printf("[JUP] OK | base=%s", b)
+			return true
+		}
+		log.Printf("[JUP] FAIL | base=%s | err=%v", b, err)
+	}
+	log.Printf("[JUP] disabled: no reachable Jupiter base URL (DNS/egress). live swaps будут выключены.")
+	return false
+}
+
+func httpGetWithContext(ctx context.Context, u string) ([]byte, error) {
+	c := &http.Client{Timeout: 10 * time.Second}
+	req, _ := http.NewRequestWithContext(ctx, "GET", u, nil)
+	req.Header.Set("Accept", "application/json")
+	req.Header.Set("User-Agent", "Mozilla/5.0")
+	r, err := c.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer r.Body.Close()
+	b, _ := io.ReadAll(r.Body)
+	if r.StatusCode != 200 {
+		return nil, fmt.Errorf("HTTP %d", r.StatusCode)
+	}
+	return b, nil
+}
+
+func jupBaseURLs() []string {
+	if v := strings.TrimSpace(os.Getenv("JUPITER_BASE_URLS")); v != "" {
+		parts := strings.Split(v, ",")
+		out := make([]string, 0, len(parts))
+		for _, p := range parts {
+			p = strings.TrimSpace(p)
+			if p != "" {
+				out = append(out, p)
+			}
+		}
+		if len(out) > 0 {
+			return out
+		}
+	}
+	// Default(s)
+	return []string{"https://quote-api.jup.ag"}
+}
+
+func selftestSwap(ctx context.Context) {
+	// USDC mint (Solana)
+	usdc := solana.MustPublicKeyFromBase58("EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v")
+	user := cfg.Key.PublicKey()
+
+	amtSol := 0.001
+	if v := strings.TrimSpace(os.Getenv("SWAP_SELFTEST_SOL")); v != "" {
+		if f, err := strconv.ParseFloat(v, 64); err == nil && f > 0 {
+			amtSol = f
+		}
+	}
+	lam := uint64(amtSol * 1e9)
+	if lam < 200_000 { // dust guard
+		lam = 200_000
+	}
+	if cfg.BuyLamp > 0 && lam > cfg.BuyLamp {
+		lam = cfg.BuyLamp
+	}
+
+	log.Printf("[SELFTEST] swap SOL->USDC->SOL | amount=%.6f SOL | slip=%dbps/%dbps",
+		float64(lam)/1e9, cfg.Slip, cfg.SellSlip)
+
+	sig1, outAmt, ok := jupSwap(ctx, user, wsolMint, usdc, lam, cfg.Slip, cfg.PrioLamp)
+	if !ok {
+		log.Printf("[SELFTEST] BUY failed")
+		return
+	}
+	log.Printf("[SELFTEST] BUY sent | tx=%s | est_out=%d", sig1.String()[:12], outAmt)
+
+	time.Sleep(2 * time.Second)
+	ata := findATA(user, usdc, solana.TokenProgramID)
+	rpcWait()
+	bal, e2 := rpcClient().GetTokenAccountBalance(ctx, ata, rpc.CommitmentConfirmed)
+	rpcNote(e2)
+	if e2 != nil || bal == nil || bal.Value == nil {
+		log.Printf("[SELFTEST] cannot read USDC ATA balance")
+		return
+	}
+	inAmt, _ := strconv.ParseUint(bal.Value.Amount, 10, 64)
+	if inAmt == 0 {
+		log.Printf("[SELFTEST] zero USDC balance after buy")
+		return
+	}
+
+	sig2, _, ok2 := jupSwap(ctx, user, usdc, wsolMint, inAmt, cfg.SellSlip, cfg.PrioLampSell)
+	if !ok2 {
+		log.Printf("[SELFTEST] SELL failed")
+		return
+	}
+	log.Printf("[SELFTEST] SELL sent | tx=%s", sig2.String()[:12])
 }
 
 func loadCfg() Config {
@@ -1906,101 +2090,262 @@ func runMigrationWatcher(ctx context.Context) {
 
 	seenMu := sync.Mutex{}
 	seen := map[string]time.Time{} // mint -> when we reported graduation
+	trackMu := sync.Mutex{}
+	tracking := map[string]bool{} // mint -> tracking started (live)
 	pendingMu := sync.Mutex{}
 	pending := map[string]time.Time{} // mint -> when we first detected Done but haven't reported yet
-	firstSeenMu := sync.Mutex{}
-	firstSeen := map[string]time.Time{} // mint -> first seen in watcher (for age heuristic)
+	// firstSeen: берем из глобального pump WS (mintFirstSeenAge), чтобы age был “реальным”,
+	// а не “с момента появления в Dex latest”.
 
 	scanOnce := func() {
 		start := time.Now()
-		// Берём свежие mint'ы с DexScreener и проверяем состояние bonding curve (Done).
-		body, err := httpGet("https://api.dexscreener.com/token-profiles/latest/v1")
-		if err != nil {
-			log.Printf("[MIG] Dex/profiles: %v", err)
-			return
-		}
-		var items []struct {
+		// Берём свежие mint'ы с DexScreener (несколько источников) и проверяем bonding curve (Done).
+		type dexItem struct {
 			ChainID string `json:"chainId"`
 			Token   string `json:"tokenAddress"`
 		}
-		if json.Unmarshal(body, &items) != nil {
-			return
+		type dexSrc struct {
+			url  string
+			name string
 		}
-		checked := 0
-		found := 0
-		now := time.Now()
-		for _, it := range items {
-			if checked >= maxCheck {
-				break
-			}
-			if it.ChainID != "solana" || it.Token == "" {
+		srcs := []dexSrc{
+			{url: "https://api.dexscreener.com/token-profiles/latest/v1", name: "profiles"},
+			{url: "https://api.dexscreener.com/token-boosts/latest/v1", name: "boosts"},
+		}
+		uniq := make([]string, 0, 256)
+		seenToken := map[string]bool{}
+		// last buy time from pump WS (for freshness ordering)
+		wsLast := map[string]time.Time{}
+		for _, src := range srcs {
+			body, err := httpGet(src.url)
+			if err != nil {
+				log.Printf("[MIG] Dex/%s: %v", src.name, err)
 				continue
 			}
-			mint, e2 := solana.PublicKeyFromBase58(it.Token)
+			var items []dexItem
+			if json.Unmarshal(body, &items) != nil {
+				continue
+			}
+			for _, it := range items {
+				if it.ChainID != "solana" || it.Token == "" {
+					continue
+				}
+				if !seenToken[it.Token] {
+					seenToken[it.Token] = true
+					uniq = append(uniq, it.Token)
+				}
+			}
+		}
+		// Дополняем списком mint'ов из глобальных pump WS логов (это самый стабильный источник свежих mint).
+		type pumpMint struct {
+			mint string
+			last time.Time
+		}
+		pump := make([]pumpMint, 0, 1024)
+		mintPumpBuyMu.Lock()
+		for m, lst := range mintPumpBuys {
+			if len(lst) == 0 {
+				continue
+			}
+			last := lst[len(lst)-1]
+			wsLast[m] = last
+			pump = append(pump, pumpMint{mint: m, last: last})
+		}
+		mintPumpBuyMu.Unlock()
+		sort.Slice(pump, func(i, j int) bool { return pump[i].last.After(pump[j].last) })
+		// Сначала добавляем свежие WS mint'ы (приоритет), потом Dex.
+		lim := maxCheck * 3
+		if lim < 60 {
+			lim = 60
+		}
+		if lim > len(pump) {
+			lim = len(pump)
+		}
+		wsFirst := make([]string, 0, lim)
+		for i := 0; i < lim; i++ {
+			m := pump[i].mint
+			if m == "" || seenToken[m] {
+				continue
+			}
+			seenToken[m] = true
+			wsFirst = append(wsFirst, m)
+		}
+		if len(wsFirst) > 0 {
+			uniq = append(wsFirst, uniq...)
+		}
+		// Страховка: не раздуваем список кандидатов бесконечно (мы всё равно проверяем только maxCheck).
+		// Это держит время json/итераций предсказуемым при долгом аптайме.
+		maxCand := maxCheck * 6
+		if maxCand < 200 {
+			maxCand = 200
+		}
+		if len(uniq) > maxCand {
+			uniq = uniq[:maxCand]
+		}
+		checked := 0
+		var found atomic.Int32
+		ageKnown := 0
+		ageUnknown := 0
+		dexN := len(uniq)
+		now := time.Now()
+		// Параллелим readBC с лимитом: так scan не будет тянуться 5-10s из-за последовательных RPC.
+		type cand struct {
+			mint solana.PublicKey
+			m    string
+			age  time.Duration
+			ageOK bool
+		}
+		// Сортируем кандидатов по свежести WS (Dex-профили без WS last уйдут в конец).
+		sort.SliceStable(uniq, func(i, j int) bool {
+			ti, okI := wsLast[uniq[i]]
+			tj, okJ := wsLast[uniq[j]]
+			if okI && okJ {
+				return ti.After(tj)
+			}
+			if okI != okJ {
+				return okI // ws-first
+			}
+			return uniq[i] < uniq[j]
+		})
+
+		staleAge := 20 * time.Minute
+		cands := make([]cand, 0, maxCheck)
+		for _, tok := range uniq {
+			if len(cands) >= maxCheck {
+				break
+			}
+			mint, e2 := solana.PublicKeyFromBase58(tok)
 			if e2 != nil {
 				continue
 			}
-			checked++
-
 			m := mint.String()
-			// Track firstSeen to estimate "lifetime to graduation" (within watcher runtime).
-			firstSeenMu.Lock()
-			if _, ok := firstSeen[m]; !ok {
-				firstSeen[m] = now
-			}
-			t0 := firstSeen[m]
-			firstSeenMu.Unlock()
-
-			s, _, e3 := readBC(ctx, mint)
-			if e3 != nil || s == nil {
+			age, ageOK := mintFirstSeenAge(m)
+			// Жёстко фокусируемся на mint'ах, которые мы реально видели с рождения (WS-firstSeen).
+			if !ageOK {
+				ageUnknown++
 				continue
 			}
-			if !s.Done {
+			ageKnown++
+			// Протухшие mint'ы не держим в очереди.
+			if staleAge > 0 && age > staleAge {
 				continue
 			}
-			// If already reported, skip.
-			seenMu.Lock()
-			_, reported := seen[m]
-			seenMu.Unlock()
-			if reported {
-				continue
-			}
+			cands = append(cands, cand{mint: mint, m: m, age: age, ageOK: ageOK})
+		}
+		checked = len(cands)
 
-			// Mark as pending Done (used to avoid forgetting filtered graduations).
-			pendingMu.Lock()
-			if _, ok := pending[m]; !ok {
-				pending[m] = now
-			}
-			pendingMu.Unlock()
+		// Временной бюджет на один scan: чтобы не “вставать” на RPC и не опаздывать с детектом.
+		// Делаем общий таймаут и не ждём дольше него.
+		timeBudget := time.Duration(float64(ivl) * 0.5)
+		if timeBudget < 800*time.Millisecond {
+			timeBudget = 800 * time.Millisecond
+		}
+		if timeBudget > 2*time.Second {
+			timeBudget = 2 * time.Second
+		}
+		scanCtx, scanCancel := context.WithTimeout(ctx, timeBudget)
+		defer scanCancel()
+		perMintTimeout := 350 * time.Millisecond
 
-			age := time.Duration(0)
-			if !t0.IsZero() {
-				age = now.Sub(t0)
-			}
+		workers := 32
+		if maxCheck < workers {
+			workers = maxCheck
+		}
+		if workers < 1 {
+			workers = 1
+		}
+		jobs := make(chan cand, len(cands))
+		var wg sync.WaitGroup
+		for i := 0; i < workers; i++ {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				for it := range jobs {
+					if scanCtx.Err() != nil {
+						continue
+					}
+					cctx, cancel := context.WithTimeout(scanCtx, perMintTimeout)
+					s, _, e3 := readBC(cctx, it.mint)
+					cancel()
+					if e3 != nil || s == nil || !s.Done {
+						continue
+					}
 
-			// Optional age filters: only report when within range.
-			if cfg.MigrationMinFirstSeenAge > 0 && age < cfg.MigrationMinFirstSeenAge {
-				continue
-			}
-			if cfg.MigrationMaxFirstSeenAge > 0 && age > cfg.MigrationMaxFirstSeenAge {
-				// Too old -> drop from pending to avoid infinite memory.
-				pendingMu.Lock()
-				delete(pending, m)
-				pendingMu.Unlock()
-				continue
-			}
+					// If already reported, skip.
+					seenMu.Lock()
+					_, reported := seen[it.m]
+					seenMu.Unlock()
+					if reported {
+						continue
+					}
 
-			// Report graduation now.
-			seenMu.Lock()
-			seen[m] = now
-			seenMu.Unlock()
-			pendingMu.Lock()
-			delete(pending, m)
-			pendingMu.Unlock()
+					// Mark as pending Done (used to avoid forgetting filtered graduations).
+					pendingMu.Lock()
+					if _, ok := pending[it.m]; !ok {
+						pending[it.m] = now
+					}
+					pendingMu.Unlock()
 
-			found++
-			url := "https://dexscreener.com/solana/" + m
-			log.Printf("[MIG] GRADUATED %s | firstSeenAge=%s | %s", short(m), age.Round(time.Second), url)
+					// Optional age filters: only report when within range.
+					if cfg.MigrationMinFirstSeenAge > 0 && it.age < cfg.MigrationMinFirstSeenAge {
+						continue
+					}
+					if cfg.MigrationMaxFirstSeenAge > 0 && it.age > cfg.MigrationMaxFirstSeenAge {
+						pendingMu.Lock()
+						delete(pending, it.m)
+						pendingMu.Unlock()
+						continue
+					}
+
+					// Report graduation now.
+					seenMu.Lock()
+					seen[it.m] = now
+					seenMu.Unlock()
+					pendingMu.Lock()
+					delete(pending, it.m)
+					pendingMu.Unlock()
+
+					url := "https://dexscreener.com/solana/" + it.m
+					if it.ageOK {
+						log.Printf("[MIG] GRADUATED %s | firstSeenAge=%s | %s", short(it.m), it.age.Round(time.Second), url)
+					} else {
+						log.Printf("[MIG] GRADUATED %s | firstSeenAge=? | %s", short(it.m), url)
+					}
+					found.Add(1)
+
+					if cfg.MigrationMode == "live" {
+						trackMu.Lock()
+						if !tracking[it.m] {
+							tracking[it.m] = true
+							go trackMigrationDex(ctx, it.m)
+						}
+						trackMu.Unlock()
+
+						// Реальная сделка (SOL -> token -> SOL) через Jupiter (маршруты включают Raydium).
+						// По умолчанию выключено. Включать только когда уверен: MIGRATION_LIVE_SWAP=1.
+						if os.Getenv("MIGRATION_LIVE_SWAP") == "1" && cfg.Live && len(cfg.Key) == 64 {
+							if migrationTradeInFlight.CompareAndSwap(false, true) {
+								go func(mintStr string) {
+									defer migrationTradeInFlight.Store(false)
+									migrationLiveSwapLoop(ctx, mintStr)
+								}(it.m)
+							} else {
+								log.Printf("[MIG][LIVE] skip %s: trade already in-flight", short(it.m))
+							}
+						}
+					}
+				}
+			}()
+		}
+		for _, it := range cands {
+			jobs <- it
+		}
+		close(jobs)
+		done := make(chan struct{})
+		go func() { wg.Wait(); close(done) }()
+		select {
+		case <-done:
+		case <-scanCtx.Done():
 		}
 		// GC old
 		seenMu.Lock()
@@ -2018,15 +2363,8 @@ func runMigrationWatcher(ctx context.Context) {
 			}
 		}
 		pendingMu.Unlock()
-		// GC firstSeen too
-		firstSeenMu.Lock()
-		for k, t := range firstSeen {
-			if t.Before(cut) {
-				delete(firstSeen, k)
-			}
-		}
-		firstSeenMu.Unlock()
-		log.Printf("[MIG] scan %v | checked=%d graduated=%d", time.Since(start).Round(time.Millisecond), checked, found)
+		log.Printf("[MIG] scan %v | cand=%d checked=%d graduated=%d | firstSeenAge ok=%d ?=%d",
+			time.Since(start).Round(time.Millisecond), dexN, checked, found.Load(), ageKnown, ageUnknown)
 	}
 
 	// initial burst
@@ -2041,6 +2379,369 @@ func runMigrationWatcher(ctx context.Context) {
 			scanOnce()
 		}
 	}
+}
+
+func trackMigrationDex(ctx context.Context, mintStr string) {
+	// Track best Solana pair stats for a short window.
+	type dexResp struct {
+		Pairs []struct {
+			ChainID     string `json:"chainId"`
+			DexID       string `json:"dexId"`
+			PairAddress string `json:"pairAddress"`
+			URL         string `json:"url"`
+			PriceUSD    string `json:"priceUsd"`
+			Liquidity   struct {
+				USD float64 `json:"usd"`
+			} `json:"liquidity"`
+			Volume struct {
+				M5  float64 `json:"m5"`
+				H1  float64 `json:"h1"`
+				H24 float64 `json:"h24"`
+			} `json:"volume"`
+		} `json:"pairs"`
+	}
+	parsePrice := func(s string) float64 {
+		if s == "" {
+			return 0
+		}
+		f, _ := strconv.ParseFloat(s, 64)
+		return f
+	}
+	bestPair := func(r *dexResp) (pair string, url string, liq float64, px float64, vol5 float64, dex string, ok bool) {
+		if r == nil || len(r.Pairs) == 0 {
+			return "", "", 0, 0, 0, "", false
+		}
+		for _, p := range r.Pairs {
+			if p.ChainID != "solana" {
+				continue
+			}
+			// выбираем самую ликвидную пару
+			if p.Liquidity.USD <= liq {
+				continue
+			}
+			liq = p.Liquidity.USD
+			px = parsePrice(p.PriceUSD)
+			vol5 = p.Volume.M5
+			pair = p.PairAddress
+			url = p.URL
+			dex = p.DexID
+			ok = true
+		}
+		return
+	}
+
+	window := 2 * time.Minute
+	poll := 3 * time.Second
+	deadline := time.Now().Add(window)
+	var startPx, maxPx, minPx float64
+	var startLiq, maxLiq float64
+	var pair, dexID, link string
+	samples := 0
+
+	for time.Now().Before(deadline) {
+		select {
+		case <-ctx.Done():
+			return
+		default:
+		}
+		body, err := httpGet("https://api.dexscreener.com/latest/dex/tokens/" + mintStr)
+		if err == nil && len(body) > 0 {
+			var r dexResp
+			if json.Unmarshal(body, &r) == nil {
+				p, u, liq, px, _, dex, ok := bestPair(&r)
+				if ok && (px > 0 || liq > 0) {
+					if samples == 0 {
+						pair, link, startLiq, startPx, dexID = p, u, liq, px, dex
+						maxPx, minPx = startPx, startPx
+						maxLiq = startLiq
+						log.Printf("[MIG][LIVE] track %s | dex=%s pair=%s | px=$%.8f liq=$%.0f | %s",
+							short(mintStr), dexID, short(pair), startPx, startLiq, link)
+					} else {
+						if pair == "" {
+							pair, dexID, link = p, dex, u
+						}
+						if px > 0 {
+							if maxPx == 0 || px > maxPx {
+								maxPx = px
+							}
+							if minPx == 0 || px < minPx {
+								minPx = px
+							}
+						}
+						if liq > maxLiq {
+							maxLiq = liq
+						}
+					}
+					samples++
+				}
+			}
+		}
+		time.Sleep(poll)
+	}
+	if samples == 0 {
+		log.Printf("[MIG][LIVE] track %s | нет данных dexscreener за %s", short(mintStr), window)
+		return
+	}
+	// Итог — без «торговли», чисто статистика (для теста гипотезы).
+	maxUpPct := 0.0
+	maxDnPct := 0.0
+	if startPx > 0 && maxPx > 0 {
+		maxUpPct = (maxPx/startPx - 1) * 100
+	}
+	if startPx > 0 && minPx > 0 {
+		maxDnPct = (minPx/startPx - 1) * 100
+	}
+	migPaperTotal.Add(1)
+	label := "FLAT"
+	if cfg.TP > 0 && maxUpPct >= cfg.TP*100 {
+		label = "PROFIT"
+		migPaperProfit.Add(1)
+	} else if cfg.SL > 0 && maxDnPct <= -cfg.SL*100 {
+		label = "LOSS"
+		migPaperLoss.Add(1)
+	} else {
+		migPaperFlat.Add(1)
+	}
+	log.Printf("[MIG][LIVE] %s %s | samples=%d | px start=$%.8f max=$%.8f min=$%.8f | maxUp=%.1f%% maxDn=%.1f%% | liq start=$%.0f max=$%.0f | W/L/F=%d/%d/%d (n=%d) | %s",
+		label, short(mintStr), samples, startPx, maxPx, minPx, maxUpPct, maxDnPct, startLiq, maxLiq,
+		migPaperProfit.Load(), migPaperLoss.Load(), migPaperFlat.Load(), migPaperTotal.Load(), link)
+}
+
+func httpPostJSON(ctx context.Context, url string, body []byte) ([]byte, error) {
+	c := &http.Client{Timeout: 10 * time.Second}
+	req, _ := http.NewRequestWithContext(ctx, "POST", url, bytes.NewReader(body))
+	req.Header.Set("Accept", "application/json")
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("User-Agent", "Mozilla/5.0")
+	r, err := c.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer r.Body.Close()
+	b, _ := io.ReadAll(r.Body)
+	if r.StatusCode != 200 {
+		return nil, fmt.Errorf("HTTP %d", r.StatusCode)
+	}
+	return b, nil
+}
+
+var (
+	wsolMint = solana.MustPublicKeyFromBase58("So11111111111111111111111111111111111111112")
+)
+
+func migrationLiveSwapLoop(ctx context.Context, mintStr string) {
+	if cfg.BuyLamp == 0 {
+		log.Printf("[MIG][SWAP] skip %s: BUY_AMOUNT_SOL=0", short(mintStr))
+		return
+	}
+	mint, err := solana.PublicKeyFromBase58(mintStr)
+	if err != nil {
+		return
+	}
+	user := cfg.Key.PublicKey()
+
+	log.Printf("[MIG][SWAP] BUY start %s | amount=%.4f SOL | slip=%dbps", short(mintStr), float64(cfg.BuyLamp)/1e9, cfg.Slip)
+	sigBuy, outAmt, ok := jupSwap(ctx, user, wsolMint, mint, cfg.BuyLamp, cfg.Slip, cfg.PrioLamp)
+	if !ok {
+		log.Printf("[MIG][SWAP] BUY failed %s", short(mintStr))
+		return
+	}
+	log.Printf("[MIG][SWAP] BUY sent %s | tx=%s | est_out=%d", short(mintStr), sigBuy.String()[:12], outAmt)
+
+	// Read actual token amount from ATA (avoid “insufficient funds” on sell).
+	time.Sleep(2 * time.Second)
+	ata := findATA(user, mint, solana.TokenProgramID)
+	rpcWait()
+	bal, e2 := rpcClient().GetTokenAccountBalance(ctx, ata, rpc.CommitmentConfirmed)
+	rpcNote(e2)
+	if e2 != nil || bal == nil || bal.Value == nil {
+		log.Printf("[MIG][SWAP] cannot read ATA balance | %s", short(mintStr))
+		return
+	}
+	inAmt, _ := strconv.ParseUint(bal.Value.Amount, 10, 64)
+	if inAmt == 0 {
+		log.Printf("[MIG][SWAP] zero token balance after buy | %s", short(mintStr))
+		return
+	}
+
+	// Price-based exit via DexScreener (simple TP/SL).
+	tp := cfg.TP
+	sl := cfg.SL
+	if tp <= 0 || sl <= 0 {
+		log.Printf("[MIG][SWAP] TP/SL disabled, no auto-exit | %s", short(mintStr))
+		return
+	}
+	startPx := 0.0
+	maxPx := 0.0
+	minPx := 0.0
+	deadline := time.Now().Add(2 * time.Minute)
+	poll := 2 * time.Second
+	for time.Now().Before(deadline) {
+		select {
+		case <-ctx.Done():
+			return
+		default:
+		}
+		px, okPx := dexTokenPriceUSD(mintStr)
+		if okPx && px > 0 {
+			if startPx == 0 {
+				startPx = px
+				maxPx, minPx = px, px
+			} else {
+				if px > maxPx {
+					maxPx = px
+				}
+				if px < minPx {
+					minPx = px
+				}
+			}
+			if startPx > 0 {
+				pnl := px/startPx - 1
+				if pnl >= tp {
+					log.Printf("[MIG][SWAP] TP hit %s | pnl=+%.1f%%", short(mintStr), pnl*100)
+					break
+				}
+				if pnl <= -sl {
+					log.Printf("[MIG][SWAP] SL hit %s | pnl=%.1f%%", short(mintStr), pnl*100)
+					break
+				}
+			}
+		}
+		time.Sleep(poll)
+	}
+
+	log.Printf("[MIG][SWAP] SELL start %s | amount=%d | slip=%dbps", short(mintStr), inAmt, cfg.SellSlip)
+	sigSell, _, okSell := jupSwap(ctx, user, mint, wsolMint, inAmt, cfg.SellSlip, cfg.PrioLampSell)
+	if !okSell {
+		log.Printf("[MIG][SWAP] SELL failed %s", short(mintStr))
+		return
+	}
+	log.Printf("[MIG][SWAP] SELL sent %s | tx=%s | px start=$%.6f max=$%.6f min=$%.6f",
+		short(mintStr), sigSell.String()[:12], startPx, maxPx, minPx)
+}
+
+func dexTokenPriceUSD(mintStr string) (float64, bool) {
+	body, err := httpGet("https://api.dexscreener.com/latest/dex/tokens/" + mintStr)
+	if err != nil {
+		return 0, false
+	}
+	var r struct {
+		Pairs []struct {
+			ChainID   string `json:"chainId"`
+			PriceUSD  string `json:"priceUsd"`
+			Liquidity struct {
+				USD float64 `json:"usd"`
+			} `json:"liquidity"`
+		} `json:"pairs"`
+	}
+	if json.Unmarshal(body, &r) != nil || len(r.Pairs) == 0 {
+		return 0, false
+	}
+	bestL := 0.0
+	bestPx := 0.0
+	for _, p := range r.Pairs {
+		if p.ChainID != "solana" {
+			continue
+		}
+		if p.Liquidity.USD < bestL {
+			continue
+		}
+		bestL = p.Liquidity.USD
+		px, _ := strconv.ParseFloat(p.PriceUSD, 64)
+		bestPx = px
+	}
+	if bestPx <= 0 {
+		return 0, false
+	}
+	return bestPx, true
+}
+
+func jupSwap(ctx context.Context, user solana.PublicKey, inputMint, outputMint solana.PublicKey, amount uint64, slipBps uint64, prioLam uint64) (sig solana.Signature, outAmount uint64, ok bool) {
+	if !jupEnabled.Load() {
+		log.Printf("[MIG][SWAP] Jupiter disabled (no HTTP access)")
+		return solana.Signature{}, 0, false
+	}
+
+	bases := jupBaseURLs()
+	var lastErr error
+	for _, base := range bases {
+		quoteURL := strings.TrimRight(base, "/") + "/v6/quote"
+		swapURL := strings.TrimRight(base, "/") + "/v6/swap"
+
+		u := fmt.Sprintf("%s?inputMint=%s&outputMint=%s&amount=%d&slippageBps=%d&onlyDirectRoutes=false",
+			quoteURL, inputMint.String(), outputMint.String(), amount, slipBps)
+		qb, err := httpGetWithContext(ctx, u)
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		var q struct {
+			Data []json.RawMessage `json:"data"`
+		}
+		if json.Unmarshal(qb, &q) != nil || len(q.Data) == 0 {
+			lastErr = errors.New("quote empty")
+			continue
+		}
+		quote := q.Data[0]
+		var q1 struct {
+			OutAmount string `json:"outAmount"`
+		}
+		_ = json.Unmarshal(quote, &q1)
+		if q1.OutAmount != "" {
+			outAmount, _ = strconv.ParseUint(q1.OutAmount, 10, 64)
+		}
+
+		req := map[string]any{
+			"quoteResponse":            json.RawMessage(quote),
+			"userPublicKey":           user.String(),
+			"wrapAndUnwrapSol":        true,
+			"dynamicComputeUnitLimit": true,
+		}
+		if prioLam > 0 {
+			req["prioritizationFeeLamports"] = prioLam
+		}
+		rb, _ := json.Marshal(req)
+		sb, err := httpPostJSON(ctx, swapURL, rb)
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		var sr struct {
+			SwapTransaction string `json:"swapTransaction"`
+		}
+		if json.Unmarshal(sb, &sr) != nil || sr.SwapTransaction == "" {
+			lastErr = errors.New("bad swap response")
+			continue
+		}
+		raw, err := base64.StdEncoding.DecodeString(sr.SwapTransaction)
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		dec := bin.NewBinDecoder(raw)
+		tx, err := solana.TransactionFromDecoder(dec)
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		tx.Sign(func(k solana.PublicKey) *solana.PrivateKey {
+			if k == user {
+				pk := cfg.Key
+				return &pk
+			}
+			return nil
+		})
+		sig, err = sendTx(ctx, tx, false)
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		return sig, outAmount, true
+	}
+	if lastErr != nil {
+		log.Printf("[MIG][SWAP] failed across bases | err=%v", lastErr)
+	}
+	return solana.Signature{}, outAmount, false
 }
 
 // scrapeRPCLive removed: sequential GetTransaction polling disabled (WS-only).
@@ -2427,12 +3128,20 @@ func wsLoop(ctx context.Context, wssURL string) error {
 	}
 
 	mu.Lock()
-	addNewSubs()
+	addedTargets := addNewSubs()
 	addPumpSubOnce()
-	addBCSubs()
-	count := len(subbed)
+	addedBC := addBCSubs()
+	targetSubs := len(subbed)
+	hasPump := false
+	for _, k := range subKind {
+		if k == wsSubPumpLogs {
+			hasPump = true
+			break
+		}
+	}
 	mu.Unlock()
-	log.Printf("[WS] Подключён, подписки: %d", count)
+	log.Printf("[WS] Подключён, подписки: targets=%d (+%d) pump=%v bc=%d (+%d)",
+		targetSubs, addedTargets, hasPump, len(subbedBC), addedBC)
 
 	go func() {
 		ping := time.NewTicker(15 * time.Second)
@@ -2482,6 +3191,7 @@ func wsLoop(ctx context.Context, wssURL string) error {
 				} else if mintStr, ok := reqToMint[*m.ID]; ok {
 					if mintStr == "__PUMP__" {
 						subKind[subID] = wsSubPumpLogs
+						log.Printf("[WS] pump logs подписка подтверждена (subID=%d)", subID)
 					} else {
 						subToMint[subID] = mintStr
 						subKind[subID] = wsSubBCAccount
@@ -2836,6 +3546,22 @@ func noteMintPumpBuy(mintStr string) {
 		lst = lst[len(lst)-96:]
 	}
 	mintPumpBuys[mintStr] = lst
+
+	// GC: карта mintPumpBuys может разрастаться (новые mint постоянно).
+	// Раз в ~4096 событий удаляем mint'ы, по которым давно не было buy.
+	if atomic.AddUint32(&mintPumpBuyGC, 1)&4095 == 0 {
+		gcCut := now.Add(-keep * 3)
+		for m, ts := range mintPumpBuys {
+			if len(ts) == 0 {
+				delete(mintPumpBuys, m)
+				continue
+			}
+			last := ts[len(ts)-1]
+			if last.Before(gcCut) {
+				delete(mintPumpBuys, m)
+			}
+		}
+	}
 }
 
 func mintPumpBuysInWindow(mintStr string, window time.Duration) int {

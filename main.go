@@ -1905,7 +1905,9 @@ func runMigrationWatcher(ctx context.Context) {
 	log.Printf("[MIG] Mode=%s | scan=%v | maxCheck=%d", cfg.MigrationMode, ivl, maxCheck)
 
 	seenMu := sync.Mutex{}
-	seen := map[string]time.Time{} // mint -> first seen graduation
+	seen := map[string]time.Time{} // mint -> when we reported graduation
+	pendingMu := sync.Mutex{}
+	pending := map[string]time.Time{} // mint -> when we first detected Done but haven't reported yet
 	firstSeenMu := sync.Mutex{}
 	firstSeen := map[string]time.Time{} // mint -> first seen in watcher (for age heuristic)
 
@@ -1942,14 +1944,11 @@ func runMigrationWatcher(ctx context.Context) {
 
 			m := mint.String()
 			// Track firstSeen to estimate "lifetime to graduation" (within watcher runtime).
-			ageKnown := false
 			firstSeenMu.Lock()
-			if t0, ok := firstSeen[m]; ok {
-				ageKnown = true
-				_ = t0
-			} else {
+			if _, ok := firstSeen[m]; !ok {
 				firstSeen[m] = now
 			}
+			t0 := firstSeen[m]
 			firstSeenMu.Unlock()
 
 			s, _, e3 := readBC(ctx, mint)
@@ -1959,41 +1958,49 @@ func runMigrationWatcher(ctx context.Context) {
 			if !s.Done {
 				continue
 			}
+			// If already reported, skip.
 			seenMu.Lock()
-			_, ok := seen[m]
-			if !ok {
-				seen[m] = now
-			}
+			_, reported := seen[m]
 			seenMu.Unlock()
-			if ok {
+			if reported {
 				continue
 			}
-			// Optional age filters: apply only if we have seen the mint before (otherwise startup flood looks "age=0").
-			var age time.Duration
-			if ageKnown {
-				firstSeenMu.Lock()
-				t0 := firstSeen[m]
-				firstSeenMu.Unlock()
-				if !t0.IsZero() {
-					age = now.Sub(t0)
-				}
-				if cfg.MigrationMinFirstSeenAge > 0 && age < cfg.MigrationMinFirstSeenAge {
-					continue
-				}
-				if cfg.MigrationMaxFirstSeenAge > 0 && age > cfg.MigrationMaxFirstSeenAge {
-					continue
-				}
-			} else if cfg.MigrationMinFirstSeenAge > 0 || cfg.MigrationMaxFirstSeenAge > 0 {
-				// if filters are set and we don't know age yet, skip
+
+			// Mark as pending Done (used to avoid forgetting filtered graduations).
+			pendingMu.Lock()
+			if _, ok := pending[m]; !ok {
+				pending[m] = now
+			}
+			pendingMu.Unlock()
+
+			age := time.Duration(0)
+			if !t0.IsZero() {
+				age = now.Sub(t0)
+			}
+
+			// Optional age filters: only report when within range.
+			if cfg.MigrationMinFirstSeenAge > 0 && age < cfg.MigrationMinFirstSeenAge {
 				continue
 			}
+			if cfg.MigrationMaxFirstSeenAge > 0 && age > cfg.MigrationMaxFirstSeenAge {
+				// Too old -> drop from pending to avoid infinite memory.
+				pendingMu.Lock()
+				delete(pending, m)
+				pendingMu.Unlock()
+				continue
+			}
+
+			// Report graduation now.
+			seenMu.Lock()
+			seen[m] = now
+			seenMu.Unlock()
+			pendingMu.Lock()
+			delete(pending, m)
+			pendingMu.Unlock()
+
 			found++
 			url := "https://dexscreener.com/solana/" + m
-			if ageKnown {
-				log.Printf("[MIG] GRADUATED %s | firstSeenAge=%s | %s", short(m), age.Round(time.Second), url)
-			} else {
-				log.Printf("[MIG] GRADUATED %s | firstSeenAge=? | %s", short(m), url)
-			}
+			log.Printf("[MIG] GRADUATED %s | firstSeenAge=%s | %s", short(m), age.Round(time.Second), url)
 		}
 		// GC old
 		seenMu.Lock()
@@ -2004,6 +2011,13 @@ func runMigrationWatcher(ctx context.Context) {
 			}
 		}
 		seenMu.Unlock()
+		pendingMu.Lock()
+		for k, t := range pending {
+			if t.Before(cut) {
+				delete(pending, k)
+			}
+		}
+		pendingMu.Unlock()
 		// GC firstSeen too
 		firstSeenMu.Lock()
 		for k, t := range firstSeen {

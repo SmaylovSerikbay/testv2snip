@@ -280,8 +280,9 @@ type Config struct {
 	MigrationDelayMS int
 	// Динамический slippage BUY: «хайп» по pump WS (много Buy за окно) → высокий slip, иначе низкий.
 	MigrationDynamicSlip bool
-	MigrationSlipLowBps  uint64 // напр. 800 = 8%
-	MigrationSlipHighBps uint64 // напр. 4000 = 40%
+	MigrationSlipLowBps  uint64 // напр. 1000 = 10%
+	MigrationSlipHighBps uint64 // «хайп»; сверху режется MigrationSlipMaxBps
+	MigrationSlipMaxBps  uint64 // верхний предел BUY slip (bps); 0 = без потолка
 	MigrationHypeWindow  time.Duration
 	MigrationHypeMinBuys int
 	// Доп. задержка «не нулевой блок»: N * MigrationSlotMS мс после MIG_DELAY_MS (снайперский блок).
@@ -307,6 +308,9 @@ type Config struct {
 	// После GRADUATED Dexscreener часто секунды отстаёт: повторно опрашивать пару, пока liq=0 или пары нет.
 	MigrationDexPollAttempts   int
 	MigrationDexPollIntervalMS int
+	// Отдельные TP/SL только для MIGRATION_LIVE_SWAP (доля; 0 = брать TAKE_PROFIT_PCT / STOP_LOSS_PCT).
+	MigrationTP float64
+	MigrationSL float64
 	// VSR Speed exit: выход по затуханию притока ликвидности на кривую.
 	VSRSExit           bool
 	VSRSWindowSec      int     // окно для оценки скорости VSR (сек)
@@ -1511,8 +1515,9 @@ func loadCfg() Config {
 		MigrationAllowedDexes:    nil,
 		MigrationDelayMS:         0,
 		MigrationDynamicSlip:     true,
-		MigrationSlipLowBps:      800,
-		MigrationSlipHighBps:     4000,
+		MigrationSlipLowBps:      1000,
+		MigrationSlipHighBps:     2000,
+		MigrationSlipMaxBps:      2000,
 		MigrationHypeWindow:      15 * time.Second,
 		MigrationHypeMinBuys:     10,
 		MigrationExtraBlocksWait: 0,
@@ -1531,6 +1536,8 @@ func loadCfg() Config {
 		MigrationPrioEstimateTimeout: 800 * time.Millisecond,
 		MigrationDexPollAttempts:     55,
 		MigrationDexPollIntervalMS:  1000,
+		MigrationTP:                 0,
+		MigrationSL:                 0,
 		VSRSExit:                 false,
 		VSRSWindowSec:            6,
 		VSRSMinUpSOLPerSec:       0.8,
@@ -1736,6 +1743,27 @@ func loadCfg() Config {
 	}
 	if n := evU("MIG_SLIP_HIGH_BPS", 0); n > 0 {
 		c.MigrationSlipHighBps = n
+	}
+	if v := strings.TrimSpace(os.Getenv("MIG_SLIP_MAX_BPS")); v != "" {
+		c.MigrationSlipMaxBps = evU("MIG_SLIP_MAX_BPS", 0)
+	}
+	if v := strings.TrimSpace(os.Getenv("MIG_TAKE_PROFIT_PCT")); v != "" && v != "0" {
+		if x, err := strconv.ParseFloat(v, 64); err == nil {
+			if x > 1 {
+				c.MigrationTP = x / 100
+			} else {
+				c.MigrationTP = x
+			}
+		}
+	}
+	if v := strings.TrimSpace(os.Getenv("MIG_STOP_LOSS_PCT")); v != "" && v != "0" {
+		if x, err := strconv.ParseFloat(v, 64); err == nil {
+			if x > 1 {
+				c.MigrationSL = x / 100
+			} else {
+				c.MigrationSL = x
+			}
+		}
 	}
 	if s := evU("MIG_HYPE_WINDOW_SEC", 0); s > 0 {
 		c.MigrationHypeWindow = time.Duration(s) * time.Second
@@ -2792,25 +2820,32 @@ var (
 
 func migrationPickSlipBps(mintStr string) uint64 {
 	if !cfg.MigrationDynamicSlip {
-		return cfg.Slip
+		return migrationCapSlipBps(cfg.Slip)
 	}
 	if cfg.MigrationHypeMinBuys <= 0 || cfg.MigrationHypeWindow <= 0 {
 		if cfg.MigrationSlipLowBps > 0 {
-			return cfg.MigrationSlipLowBps
+			return migrationCapSlipBps(cfg.MigrationSlipLowBps)
 		}
-		return cfg.Slip
+		return migrationCapSlipBps(cfg.Slip)
 	}
 	n := mintPumpBuysInWindow(mintStr, cfg.MigrationHypeWindow)
 	if n >= cfg.MigrationHypeMinBuys {
 		if cfg.MigrationSlipHighBps > 0 {
-			return cfg.MigrationSlipHighBps
+			return migrationCapSlipBps(cfg.MigrationSlipHighBps)
 		}
-		return cfg.Slip
+		return migrationCapSlipBps(cfg.Slip)
 	}
 	if cfg.MigrationSlipLowBps > 0 {
-		return cfg.MigrationSlipLowBps
+		return migrationCapSlipBps(cfg.MigrationSlipLowBps)
 	}
-	return cfg.Slip
+	return migrationCapSlipBps(cfg.Slip)
+}
+
+func migrationCapSlipBps(bps uint64) uint64 {
+	if cfg.MigrationSlipMaxBps > 0 && bps > cfg.MigrationSlipMaxBps {
+		return cfg.MigrationSlipMaxBps
+	}
+	return bps
 }
 
 func migrationPrioBuyLamports() uint64 {
@@ -3229,8 +3264,20 @@ func migrationLiveSwapLoop(ctx context.Context, mintStr string) {
 	}
 
 	// Quote-based exit: реальный Jupiter quote token→SOL. Опционально partial TP + trail по остатку.
+	// FLASH_SL_* из .env относится к copy-позициям, не к MIG swap — здесь только TP/SL по quote.
 	tp := cfg.TP
 	sl := cfg.SL
+	if cfg.MigrationTP > 0 {
+		tp = cfg.MigrationTP
+	}
+	if cfg.MigrationSL > 0 {
+		sl = cfg.MigrationSL
+	}
+	tpSrc := "TAKE_PROFIT_PCT / STOP_LOSS_PCT"
+	if cfg.MigrationTP > 0 || cfg.MigrationSL > 0 {
+		tpSrc = "MIG_TAKE_PROFIT_PCT / MIG_STOP_LOSS_PCT"
+	}
+	log.Printf("[MIG][SWAP] quote exit | TP=%.1f%% SL=%.1f%% (%s)", tp*100, sl*100, tpSrc)
 	if tp <= 0 || sl <= 0 {
 		log.Printf("[MIG][SWAP] TP/SL disabled, no auto-exit | %s", short(mintStr))
 		return

@@ -308,6 +308,8 @@ type Config struct {
 	// После GRADUATED Dexscreener часто секунды отстаёт: повторно опрашивать пару, пока liq=0 или пары нет.
 	MigrationDexPollAttempts   int
 	MigrationDexPollIntervalMS int
+	// Интервал опроса Jupiter quote при TP/SL (мс); меньше — ближе к порогу выходим, но больше нагрузка на API.
+	MigrationQuotePollMS int
 	// Отдельные TP/SL только для MIGRATION_LIVE_SWAP (доля; 0 = брать TAKE_PROFIT_PCT / STOP_LOSS_PCT).
 	MigrationTP float64
 	MigrationSL float64
@@ -1543,6 +1545,7 @@ func loadCfg() Config {
 		MigrationPrioEstimateTimeout: 800 * time.Millisecond,
 		MigrationDexPollAttempts:     55,
 		MigrationDexPollIntervalMS:  1000,
+		MigrationQuotePollMS:        2000,
 		MigrationTP:                 0,
 		MigrationSL:                 0,
 		VSRSExit:                 false,
@@ -1843,6 +1846,15 @@ func loadCfg() Config {
 	}
 	if n := evU("MIG_DEX_POLL_MS", 0); n > 0 {
 		c.MigrationDexPollIntervalMS = int(n)
+	}
+	if n := evU("MIG_QUOTE_POLL_MS", 0); n > 0 {
+		if n < 250 {
+			n = 250
+		}
+		if n > 10_000 {
+			n = 10_000
+		}
+		c.MigrationQuotePollMS = int(n)
 	}
 	if v := strings.TrimSpace(os.Getenv("COPY_SELL_MIN_EST_PNL_PCT")); v != "" {
 		x, err := strconv.ParseFloat(v, 64)
@@ -3284,7 +3296,15 @@ func migrationLiveSwapLoop(ctx context.Context, mintStr string) {
 	if cfg.MigrationTP > 0 || cfg.MigrationSL > 0 {
 		tpSrc = "MIG_TAKE_PROFIT_PCT / MIG_STOP_LOSS_PCT"
 	}
-	log.Printf("[MIG][SWAP] quote exit | TP=%.1f%% SL=%.1f%% (%s)", tp*100, sl*100, tpSrc)
+	pollMS := cfg.MigrationQuotePollMS
+	if pollMS <= 0 {
+		pollMS = 2000
+	}
+	if pollMS < 250 {
+		pollMS = 250
+	}
+	poll := time.Duration(pollMS) * time.Millisecond
+	log.Printf("[MIG][SWAP] quote exit | TP=%.1f%% SL=%.1f%% poll=%dms (%s)", tp*100, sl*100, pollMS, tpSrc)
 	if tp <= 0 || sl <= 0 {
 		log.Printf("[MIG][SWAP] TP/SL disabled, no auto-exit | %s", short(mintStr))
 		return
@@ -3293,7 +3313,6 @@ func migrationLiveSwapLoop(ctx context.Context, mintStr string) {
 	partialFrac := cfg.MigrationPartialSellFrac
 	trailPull := cfg.MigrationTrailPullbackPct
 	deadline := time.Now().Add(2 * time.Minute)
-	poll := 2 * time.Second
 	startOut := uint64(0)
 	maxOut := uint64(0)
 	minOut := uint64(0)
@@ -3356,7 +3375,7 @@ func migrationLiveSwapLoop(ctx context.Context, mintStr string) {
 				break
 			}
 			if pnl <= -sl {
-				log.Printf("[MIG][SWAP] SL hit %s | quote_pnl=%.1f%%", short(mintStr), pnl*100)
+				log.Printf("[MIG][SWAP] SL hit %s | quote_pnl=%.1f%% (порог −%.1f%%; между тиками цена могла ухудшиться)", short(mintStr), pnl*100, sl*100)
 				break
 			}
 		} else {

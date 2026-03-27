@@ -1757,10 +1757,13 @@ func scrape(ctx context.Context) {
 			if ws.totalBuySOL > 0 {
 				profit = float64(ws.totalSellSOL)/float64(ws.totalBuySOL) - 1.0
 			}
+			// Для свежих кошельков из Dex часто есть только BUY без истории SELL.
+			// Не блокируем апрув только из-за profit-гейта, если sell-история ещё не накоплена.
+			profitPass := ws.totalSellSOL == 0 || profit >= cfg.CandMinProfitPct
 			approved := age >= cfg.CandMinAge &&
 				ws.trades >= cfg.CandMinTrades &&
 				ws.totalBuySOL >= cfg.CandMinTotalBuyLam &&
-				profit >= cfg.CandMinProfitPct &&
+				profitPass &&
 				(!cfg.CandRequireWin2x || ws.win24h2x)
 
 			if !approved {

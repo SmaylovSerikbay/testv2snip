@@ -1529,8 +1529,8 @@ func loadCfg() Config {
 		MigrationPrioEstimateMult:   1,
 		MigrationPrioEstimateMaxLam:   0,
 		MigrationPrioEstimateTimeout: 800 * time.Millisecond,
-		MigrationDexPollAttempts:     28,
-		MigrationDexPollIntervalMS:  600,
+		MigrationDexPollAttempts:     55,
+		MigrationDexPollIntervalMS:  1000,
 		VSRSExit:                 false,
 		VSRSWindowSec:            6,
 		VSRSMinUpSOLPerSec:       0.8,
@@ -2985,11 +2985,11 @@ func migrationDexFiltersWait(ctx context.Context, mintStr string) bool {
 	}
 	attempts := cfg.MigrationDexPollAttempts
 	if attempts <= 0 {
-		attempts = 12
+		attempts = 55
 	}
 	iv := cfg.MigrationDexPollIntervalMS
 	if iv <= 0 {
-		iv = 450
+		iv = 1000
 	}
 	interval := time.Duration(iv) * time.Millisecond
 	var liq float64
@@ -3005,10 +3005,13 @@ func migrationDexFiltersWait(ctx context.Context, mintStr string) bool {
 		_, liq, dex, dexOk = dexTokenBestUSDForMigration(mintStr)
 		if !dexOk {
 			if attempt == attempts {
-				log.Printf("[MIG][SWAP] skip %s: no dex quote/liquidity after %d polls", short(mintStr), attempts)
+				log.Printf("[MIG][SWAP] skip %s: no dex quote/liquidity after %d polls (~%ds)",
+					short(mintStr), attempts, attempts*iv/1000)
 				return false
 			}
-			log.Printf("[MIG][SWAP] dex poll %d/%d: no pair yet | %s", attempt, attempts, short(mintStr))
+			if attempt == 1 || attempt%6 == 0 {
+				log.Printf("[MIG][SWAP] dex poll %d/%d: no pair yet | %s", attempt, attempts, short(mintStr))
+			}
 			select {
 			case <-time.After(interval):
 			case <-ctx.Done():
@@ -3032,10 +3035,13 @@ func migrationDexFiltersWait(ctx context.Context, mintStr string) bool {
 		}
 		// liq == 0 — индексация Dexscreener
 		if attempt == attempts {
-			log.Printf("[MIG][SWAP] skip %s: liq still 0 USD after %d polls | dex=%s", short(mintStr), attempts, dex)
+			log.Printf("[MIG][SWAP] skip %s: liq still 0 USD after %d polls (~%ds) | dex=%s",
+				short(mintStr), attempts, attempts*iv/1000, dex)
 			return false
 		}
-		log.Printf("[MIG][SWAP] dex poll %d/%d: liq=0 USD (indexing) | %s", attempt, attempts, short(mintStr))
+		if attempt == 1 || attempt%6 == 0 {
+			log.Printf("[MIG][SWAP] dex poll %d/%d: liq=0 USD (indexing) | %s", attempt, attempts, short(mintStr))
+		}
 		select {
 		case <-time.After(interval):
 		case <-ctx.Done():

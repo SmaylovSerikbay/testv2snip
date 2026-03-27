@@ -153,7 +153,8 @@ type Config struct {
 	JitoBundleURL  string
 	JitoBundleURLs []string
 	TP              float64
-	QuickTPPct      float64       // ранний выход QUICKTP: в первые 15с при pnl >= этого порога (доля, напр. 0.22 = +22%)
+	QuickTPPct      float64 // ранний выход QUICKTP: в первые QuickTPWindowSec при pnl >= порога (доля)
+	QuickTPWindowSec int    // окно QUICKTP (сек); env QUICKTP_WINDOW_SEC, по умолчанию 15
 	EarlySLWindow   time.Duration // 0 = выкл.; иначе в первые N сек выход если pnl <= -EarlySLPct (анти-просадка)
 	EarlySLPct      float64       // доля, напр. 0.15 = −15%
 	SL              float64
@@ -1095,11 +1096,11 @@ func main() {
 		log.Printf("[INIT] Ключ не задан — режим наблюдения | %s", mode)
 	}
 	if cfg.EarlySLWindow > 0 {
-		log.Printf("[INIT] Ставка %.4f SOL | TP +%.0f%% QUICKTP≤15s ≥+%.0f%% | EARLYSL первые %ds ≤-%.0f%% | SL -%.0f%% | TimeKill %ds<%+.0f%%",
-			float64(cfg.BuyLamp)/1e9, cfg.TP*100, cfg.QuickTPPct*100, int(cfg.EarlySLWindow.Seconds()), cfg.EarlySLPct*100, cfg.SL*100, cfg.TimeKillSec, cfg.TimeKillMin*100)
+		log.Printf("[INIT] Ставка %.4f SOL | TP +%.0f%% QUICKTP≤%ds ≥+%.0f%% | EARLYSL первые %ds ≤-%.0f%% | SL -%.0f%% | TimeKill %ds<%+.0f%%",
+			float64(cfg.BuyLamp)/1e9, cfg.TP*100, cfg.QuickTPWindowSec, cfg.QuickTPPct*100, int(cfg.EarlySLWindow.Seconds()), cfg.EarlySLPct*100, cfg.SL*100, cfg.TimeKillSec, cfg.TimeKillMin*100)
 	} else {
-		log.Printf("[INIT] Ставка %.4f SOL | TP +%.0f%% QUICKTP≤15s ≥+%.0f%% | EARLYSL выкл. | SL -%.0f%% | TimeKill %ds<%+.0f%%",
-			float64(cfg.BuyLamp)/1e9, cfg.TP*100, cfg.QuickTPPct*100, cfg.SL*100, cfg.TimeKillSec, cfg.TimeKillMin*100)
+		log.Printf("[INIT] Ставка %.4f SOL | TP +%.0f%% QUICKTP≤%ds ≥+%.0f%% | EARLYSL выкл. | SL -%.0f%% | TimeKill %ds<%+.0f%%",
+			float64(cfg.BuyLamp)/1e9, cfg.TP*100, cfg.QuickTPWindowSec, cfg.QuickTPPct*100, cfg.SL*100, cfg.TimeKillSec, cfg.TimeKillMin*100)
 	}
 	if cfg.PeakPullbackPct > 0 {
 		log.Printf("[INIT] PEAK_PULLBACK: при пике ≥+%.1f%% — SELL если откат от пика ≥%.1f п.п. (медленное скатывание); TRAIL множ.=%.0f%% от пика",
@@ -1448,7 +1449,8 @@ func loadCfg() Config {
 		PrioLampSell:             1_500_000, // 0.0015 SOL sell priority
 		JitoTipLamp:              1_000_000, // 0.001 SOL Jito tip (bundles / inclusion)
 		TP:                       0.40,
-		QuickTPPct:               0.22, // +22% за первые 15с — иначе ждём основной TP
+		QuickTPPct:               0.22,
+		QuickTPWindowSec:         15,
 		EarlySLWindow:            5 * time.Second,
 		EarlySLPct:               0.08, // −8% в первые 5с — на pump часто шум; см. EARLYSL_* в .env
 		SL:                       0.25,
@@ -1683,6 +1685,10 @@ func loadCfg() Config {
 	}
 	c.TP = evF("TAKE_PROFIT_PCT", c.TP*100) / 100
 	c.QuickTPPct = evF("QUICKTP_MIN_PCT", c.QuickTPPct*100) / 100
+	c.QuickTPWindowSec = int(evU("QUICKTP_WINDOW_SEC", uint64(c.QuickTPWindowSec)))
+	if c.QuickTPWindowSec <= 0 {
+		c.QuickTPWindowSec = 15
+	}
 	c.SL = evF("STOP_LOSS_PCT", c.SL*100) / 100
 	if v := os.Getenv("EARLYSL_SEC"); v != "" {
 		if v == "0" {
@@ -5585,7 +5591,7 @@ func checkAll(ctx context.Context) (hasProfit bool, needFastYoung bool) {
 			}
 		case cfg.EarlySLWindow > 0 && age <= cfg.EarlySLWindow && pnl <= -cfg.EarlySLPct:
 			reason = fmt.Sprintf("EARLYSL %ds pnl=%+.1f%%", int(age.Seconds()), pnl*100)
-		case age <= 15*time.Second && pnl >= cfg.QuickTPPct:
+		case age <= time.Duration(cfg.QuickTPWindowSec)*time.Second && pnl >= cfg.QuickTPPct:
 			reason = fmt.Sprintf("QUICKTP %ds +%.0f%%", int(age.Seconds()), pnl*100)
 		case s.p.BadEntry && age >= 10*time.Second && pnl < 0:
 			reason = fmt.Sprintf("BADEXIT %ds pnl=%+.1f%%", int(age.Seconds()), pnl*100)

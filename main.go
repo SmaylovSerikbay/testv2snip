@@ -507,6 +507,12 @@ var (
 	migPaperLoss   atomic.Int32
 	migPaperFlat   atomic.Int32
 
+	// MIGRATION real stats (actual wallet delta after BUY->SELL cycle)
+	migRealTrades  atomic.Int32
+	migRealWins    atomic.Int32
+	migRealLosses  atomic.Int32
+	migRealPnlLam  atomic.Int64
+
 	// Jupiter connectivity (HTTP API). If false, live swap is disabled automatically.
 	jupEnabled atomic.Bool
 )
@@ -2609,6 +2615,14 @@ func migrationLiveSwapLoop(ctx context.Context, mintStr string) {
 		return
 	}
 	user := cfg.Key.PublicKey()
+	balBefore := uint64(0)
+	rpcWait()
+	if b, err := rpcClient().GetBalance(ctx, user, rpc.CommitmentConfirmed); err == nil && b != nil {
+		rpcNote(nil)
+		balBefore = b.Value
+	} else {
+		rpcNote(err)
+	}
 
 	log.Printf("[MIG][SWAP] BUY start %s | amount=%.4f SOL | slip=%dbps", short(mintStr), float64(cfg.BuyLamp)/1e9, cfg.Slip)
 	sigBuy, outAmt, ok := jupSwap(ctx, user, wsolMint, mint, cfg.BuyLamp, cfg.Slip, cfg.PrioLamp)
@@ -2722,6 +2736,31 @@ func migrationLiveSwapLoop(ctx context.Context, mintStr string) {
 	migrationOpen.Add(-1)
 	log.Printf("[MIG][SWAP] SELL sent %s | tx=%s | px start=$%.6f max=$%.6f min=$%.6f",
 		short(mintStr), sigSell.String()[:12], startPx, maxPx, minPx)
+
+	// Realized wallet delta for migration cycle.
+	time.Sleep(3 * time.Second)
+	if balBefore > 0 {
+		rpcWait()
+		b2, err := rpcClient().GetBalance(ctx, user, rpc.CommitmentConfirmed)
+		rpcNote(err)
+		if err == nil && b2 != nil {
+			balAfter := b2.Value
+			delta := int64(balAfter) - int64(balBefore)
+			migRealTrades.Add(1)
+			migRealPnlLam.Add(delta)
+			if delta > 0 {
+				migRealWins.Add(1)
+			} else if delta < 0 {
+				migRealLosses.Add(1)
+			}
+			pct := 0.0
+			if cfg.BuyLamp > 0 {
+				pct = 100 * float64(delta) / float64(cfg.BuyLamp)
+			}
+			log.Printf("[MIG][REAL] %s | delta=%+.6f SOL (%.1f%% of stake) | before=%.6f after=%.6f",
+				short(mintStr), float64(delta)/1e9, pct, float64(balBefore)/1e9, float64(balAfter)/1e9)
+		}
+	}
 }
 
 func dexTokenPriceUSD(mintStr string) (float64, bool) {
@@ -5619,6 +5658,30 @@ func recordPnl(spent uint64, solNet uint64, mintOpt string) {
 }
 
 func printStats() {
+	if cfg.MigrationMode != "off" {
+		tr := migRealTrades.Load()
+		w := migRealWins.Load()
+		l := migRealLosses.Load()
+		pnlLam := migRealPnlLam.Load()
+		wr := 0.0
+		if tr > 0 {
+			wr = 100 * float64(w) / float64(tr)
+		}
+		balStr := ""
+		if len(cfg.Key) == 64 {
+			rpcWait()
+			b, err := rpcClient().GetBalance(context.Background(), cfg.Key.PublicKey(), rpc.CommitmentConfirmed)
+			rpcNote(err)
+			if err == nil {
+				setWalletBalCache(b.Value)
+				balStr = fmt.Sprintf(" | Bal=%.4f SOL", float64(b.Value)/1e9)
+			}
+		}
+		log.Printf("[STAT][MIG] Trades=%d Wins=%d Losses=%d WR=%.0f%% | Realized=%+.6f SOL | MigOpen=%d%s",
+			tr, w, l, wr, float64(pnlLam)/1e9, migrationOpen.Load(), balStr)
+		return
+	}
+
 	w := statWins.Load()
 	l := statLosses.Load()
 	total := w + l

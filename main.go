@@ -412,6 +412,9 @@ var (
 	rpcCalls atomic.Int64
 	rpcErrs  atomic.Int64
 
+	// SELL отправлен (live), но подтверждение ещё в горутине — слот MAX_POSITIONS занят до завершения.
+	pendingSellSettlements atomic.Int32
+
 	wsRestartCh = make(chan struct{}, 1)
 
 	// Scraper WS-only pipeline
@@ -2677,9 +2680,9 @@ func doBuy(ctx context.Context, sig Signal) {
 		log.Printf("[BUY] Skip: already in position | %s", short(mint))
 		return
 	}
-	if len(pos)+pendingPosBuys >= cfg.MaxPositions {
+	if len(pos)+pendingPosBuys+int(pendingSellSettlements.Load()) >= cfg.MaxPositions {
 		posMu.Unlock()
-		log.Printf("[BUY] Skip: max positions (%d/%d) | %s", len(pos)+pendingPosBuys, cfg.MaxPositions, short(mint))
+		log.Printf("[BUY] Skip: max positions (%d/%d) | %s", len(pos)+pendingPosBuys+int(pendingSellSettlements.Load()), cfg.MaxPositions, short(mint))
 		return
 	}
 	pendingPosBuys++
@@ -3846,7 +3849,9 @@ func doSell(ctx context.Context, p *Position, reason string, cachedState *Bondin
 		savedSolNet := solNet
 		savedMint := mintStr
 		savedTokProg := tokProg
+		pendingSellSettlements.Add(1)
 		go func() {
+			defer pendingSellSettlements.Add(-1)
 			accounted := false
 			confirmTx(ctx, txSig, "SELL", savedMint, func() {
 				ata := findATA(cfg.Key.PublicKey(), savedPos.Mint, savedTokProg)

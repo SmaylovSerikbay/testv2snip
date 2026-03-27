@@ -87,9 +87,10 @@ type Config struct {
 	JitoHTTPURL     string
 	JitoHTTPTimeout time.Duration
 	// Jito Bundles (sendBundle)
-	JitoBundleBuy bool
-	JitoBundleURL string
-	JitoBundleURLs []string
+	JitoBundleBuy            bool
+	JitoBundleURL            string
+	JitoBundleURLs           []string
+	JitoBundle429FallbackRPC bool // BUY: при 429/congested на sendBundle — отправить через обычный RPC
 	TP              float64
 	QuickTPPct      float64       // ранний выход QUICKTP: в первые 15с при pnl >= этого порога (доля, напр. 0.22 = +22%)
 	EarlySLWindow   time.Duration // 0 = выкл.; иначе в первые N сек выход если pnl <= -EarlySLPct (анти-просадка)
@@ -556,9 +557,22 @@ func sendTx(ctx context.Context, tx *solana.Transaction, rpcFallback bool) (sola
 			log.Printf("[TX] BUY bundle accepted | url=%s | tx=%s", usedURL, sig.String()[:12])
 			return sig, nil
 		}
-		// If bundle fails due to global rate limit / congestion, do NOT fallback to paid sendTransaction.
-		// Better to skip the entry than to pay fees and likely fail/late-fill in the same congested conditions.
-		if strings.Contains(err.Error(), "429") || strings.Contains(strings.ToLower(err.Error()), "rate limit") || strings.Contains(strings.ToLower(err.Error()), "congest") {
+		// Глобальный 429 на block-engine: опционально уйти в обычный RPC (часть входов всё же пройдёт).
+		if isJitoRateLimitErr(err) && cfg.JitoBundle429FallbackRPC {
+			log.Printf("[TX] BUY bundle 429/congested → fallback RPC SendTransaction | err=%v", err)
+			rpcWait()
+			noRetry := uint(0)
+			sig2, err2 := rpcClient().SendTransactionWithOpts(ctx, tx, rpc.TransactionOpts{
+				SkipPreflight: true,
+				MaxRetries:    &noRetry,
+			})
+			rpcNote(err2)
+			if err2 == nil {
+				log.Printf("[TX] BUY ok via RPC fallback | tx=%s", sig2.String()[:12])
+			}
+			return sig2, err2
+		}
+		if isJitoRateLimitErr(err) {
 			log.Printf("[TX] BUY bundle blocked (no fallback) | err=%v", err)
 			return solana.Signature{}, err
 		}
@@ -929,6 +943,9 @@ func main() {
 	}
 	log.Printf("[INIT] BuySlip %dbps SellSlip %dbps | PrioBuy %.4f PrioSell %.4f SOL",
 		cfg.Slip, cfg.SellSlip, float64(cfg.PrioLamp)/1e9, float64(cfg.PrioLampSell)/1e9)
+	if cfg.JitoBundleBuy && cfg.JitoBundle429FallbackRPC {
+		log.Printf("[INIT] Jito: при HTTP 429 на sendBundle — fallback BUY через RPC (Helius)")
+	}
 	if cfg.MonitorFastYoungSec > 0 {
 		log.Printf("[INIT] MaxTargets %d | MaxPos %d | Scrape %v | Monitor %dms + fast %ds после входа",
 			cfg.MaxTargets, cfg.MaxPositions, cfg.ScrapeIvl, cfg.MonitorMs, cfg.MonitorFastYoungSec)
@@ -1139,6 +1156,7 @@ func loadCfg() Config {
 		JitoHTTPURL:              "https://mainnet.block-engine.jito.wtf/api/v1/transactions",
 		JitoHTTPTimeout:          400 * time.Millisecond,
 		JitoBundleBuy:            false,
+		JitoBundle429FallbackRPC: false,
 		JitoBundleURL:            "https://mainnet.block-engine.jito.wtf/api/v1/bundles",
 		// Official Jito tip accounts (fallback pool). Pick one to write-lock for bundle eligibility.
 		JitoTipAccs: []solana.PublicKey{
@@ -1254,6 +1272,7 @@ func loadCfg() Config {
 		c.JitoHTTPURL = u
 	}
 	c.JitoBundleBuy = ev("JITO_BUNDLE_BUY", "0") == "1"
+	c.JitoBundle429FallbackRPC = ev("JITO_BUNDLE_429_FALLBACK_RPC", "0") == "1"
 	if u := os.Getenv("JITO_BUNDLE_URL"); u != "" {
 		c.JitoBundleURL = u
 	} else if strings.Contains(c.JitoHTTPURL, "/api/v1/transactions") {

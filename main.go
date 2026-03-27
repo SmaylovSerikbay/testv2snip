@@ -1311,6 +1311,8 @@ func jupBaseURLs() []string {
 }
 
 func selftestSwap(ctx context.Context) {
+	ctx, cancel := context.WithTimeout(ctx, 35*time.Second)
+	defer cancel()
 	// USDC mint (Solana)
 	usdc := solana.MustPublicKeyFromBase58("EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v")
 	user := cfg.Key.PublicKey()
@@ -1332,6 +1334,7 @@ func selftestSwap(ctx context.Context) {
 	log.Printf("[SELFTEST] swap SOL->USDC->SOL | amount=%.6f SOL | slip=%dbps/%dbps",
 		float64(lam)/1e9, cfg.Slip, cfg.SellSlip)
 
+	log.Printf("[SELFTEST] BUY quote+swap...")
 	sig1, outAmt, ok := jupSwap(ctx, user, wsolMint, usdc, lam, cfg.Slip, cfg.PrioLamp)
 	if !ok {
 		log.Printf("[SELFTEST] BUY failed")
@@ -1341,11 +1344,12 @@ func selftestSwap(ctx context.Context) {
 
 	time.Sleep(2 * time.Second)
 	ata := findATA(user, usdc, solana.TokenProgramID)
+	log.Printf("[SELFTEST] read USDC ATA balance...")
 	rpcWait()
 	bal, e2 := rpcClient().GetTokenAccountBalance(ctx, ata, rpc.CommitmentConfirmed)
 	rpcNote(e2)
 	if e2 != nil || bal == nil || bal.Value == nil {
-		log.Printf("[SELFTEST] cannot read USDC ATA balance")
+		log.Printf("[SELFTEST] cannot read USDC ATA balance | err=%v", e2)
 		return
 	}
 	inAmt, _ := strconv.ParseUint(bal.Value.Amount, 10, 64)
@@ -1354,6 +1358,7 @@ func selftestSwap(ctx context.Context) {
 		return
 	}
 
+	log.Printf("[SELFTEST] SELL quote+swap...")
 	sig2, _, ok2 := jupSwap(ctx, user, usdc, wsolMint, inAmt, cfg.SellSlip, cfg.PrioLampSell)
 	if !ok2 {
 		log.Printf("[SELFTEST] SELL failed")
@@ -2735,9 +2740,11 @@ func jupSwap(ctx context.Context, user solana.PublicKey, inputMint, outputMint s
 
 		u := fmt.Sprintf("%s?inputMint=%s&outputMint=%s&amount=%d&slippageBps=%d&onlyDirectRoutes=false",
 			quoteURL, inputMint.String(), outputMint.String(), amount, slipBps)
+		log.Printf("[MIG][SWAP] quote %s -> %s | amount=%d slip=%dbps", short(inputMint.String()), short(outputMint.String()), amount, slipBps)
 		qb, err := httpGetWithContextJup(ctx, u, apiKey)
 		if err != nil {
 			lastErr = err
+			log.Printf("[MIG][SWAP] quote err: %v", err)
 			continue
 		}
 		// Quote can be either {data:[...]} (old) or the quote itself (swap/v1).
@@ -2768,9 +2775,11 @@ func jupSwap(ctx context.Context, user solana.PublicKey, inputMint, outputMint s
 			req["prioritizationFeeLamports"] = prioLam
 		}
 		rb, _ := json.Marshal(req)
+		log.Printf("[MIG][SWAP] build swap tx...")
 		sb, err := httpPostJSONJup(ctx, swapURL, apiKey, rb)
 		if err != nil {
 			lastErr = err
+			log.Printf("[MIG][SWAP] swap err: %v", err)
 			continue
 		}
 		var sr struct {
@@ -2789,6 +2798,7 @@ func jupSwap(ctx context.Context, user solana.PublicKey, inputMint, outputMint s
 		tx, err := solana.TransactionFromDecoder(dec)
 		if err != nil {
 			lastErr = err
+			log.Printf("[MIG][SWAP] tx decode err: %v", err)
 			continue
 		}
 		tx.Sign(func(k solana.PublicKey) *solana.PrivateKey {
@@ -2800,9 +2810,11 @@ func jupSwap(ctx context.Context, user solana.PublicKey, inputMint, outputMint s
 		})
 		// Self-test should not depend on Jito bundle availability (429). Use RPC fallback.
 		rpcFallback := os.Getenv("SWAP_SELFTEST") == "1"
+		log.Printf("[MIG][SWAP] send tx (rpcFallback=%v)...", rpcFallback)
 		sig, err = sendTx(ctx, tx, rpcFallback)
 		if err != nil {
 			lastErr = err
+			log.Printf("[MIG][SWAP] send err: %v", err)
 			continue
 		}
 		return sig, outAmount, true

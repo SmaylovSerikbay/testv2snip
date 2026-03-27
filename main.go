@@ -1877,12 +1877,76 @@ func scrapeDexEndpoint(ctx context.Context, freq map[string]*walletStats, myKey,
 		if err != nil {
 			continue
 		}
-		_ = mint // kept for future optional per-token validation without RPC
+		// RPC scrape: берём несколько последних tx по mint и парсим TradeEvent из логов.
+		// Это наполняет freq реальными buyer wallets, чтобы targets могли расти до MAX_TARGETS.
+		totalBuyers += scrapeMintBuyersRPC(ctx, freq, myKey, mint, 3, 6)
 		checked++
 	}
 	if checked > 0 || totalBuyers > 0 {
 		log.Printf("[SCRAPE] Dex/%s: %d pump.fun токенов, %d покупателей", tag, checked, totalBuyers)
 	}
+}
+
+// scrapeMintBuyersRPC возвращает количество уникальных buyer-кошельков, добавленных в freq.
+// Ограничения maxTx/maxSigs нужны, чтобы не перегружать RPC.
+func scrapeMintBuyersRPC(ctx context.Context, freq map[string]*walletStats, myKey string, mint solana.PublicKey, maxTx int, maxSigs int) int {
+	// 1) Берём несколько свежих сигнатур по mint.
+	lim := maxSigs
+	if lim <= 0 {
+		lim = 5
+	}
+	if lim > 20 {
+		lim = 20
+	}
+	limitI := lim
+	rpcWait()
+	sigs, err := rpcClient().GetSignaturesForAddressWithOpts(ctx, mint, &rpc.GetSignaturesForAddressOpts{
+		Limit: &limitI,
+	})
+	rpcNote(err)
+	if err != nil || len(sigs) == 0 {
+		return 0
+	}
+
+	added := 0
+	seen := map[string]bool{}
+	maxVer := uint64(0)
+	for _, it := range sigs {
+		if maxTx > 0 && added >= maxTx {
+			break
+		}
+		sig := it.Signature
+		rpcWait()
+		tx, e3 := rpcClient().GetTransaction(ctx, sig, &rpc.GetTransactionOpts{
+			Commitment:                     rpc.CommitmentConfirmed,
+			MaxSupportedTransactionVersion: &maxVer,
+		})
+		rpcNote(e3)
+		if e3 != nil || tx == nil || tx.Meta == nil || len(tx.Meta.LogMessages) == 0 {
+			continue
+		}
+		ev := parseTradeFromLogs(tx.Meta.LogMessages)
+		if ev == nil || !ev.IsBuy || ev.User.IsZero() {
+			continue
+		}
+		w := ev.User.String()
+		if w == "" || w == myKey {
+			continue
+		}
+		if seen[w] {
+			continue
+		}
+		seen[w] = true
+		ws := getWS(freq, w)
+		ws.trades++
+		ws.mintBuys[ev.Mint.String()]++
+		ws.totalBuySOL += ev.Sol
+		if ev.Sol >= 500_000_000 {
+			ws.win24h2x = true
+		}
+		added++
+	}
+	return added
 }
 
 func notifyWSReconn() {

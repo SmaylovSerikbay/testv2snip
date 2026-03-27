@@ -2798,7 +2798,9 @@ func jupSwap(ctx context.Context, user solana.PublicKey, inputMint, outputMint s
 			}
 			return nil
 		})
-		sig, err = sendTx(ctx, tx, false)
+		// Self-test should not depend on Jito bundle availability (429). Use RPC fallback.
+		rpcFallback := os.Getenv("SWAP_SELFTEST") == "1"
+		sig, err = sendTx(ctx, tx, rpcFallback)
 		if err != nil {
 			lastErr = err
 			continue

@@ -499,6 +499,7 @@ var (
 
 	// MIGRATION live trading guard (1 position max)
 	migrationTradeInFlight atomic.Bool
+	migrationOpen          atomic.Int32
 
 	// MIGRATION paper stats (from [MIG][LIVE] tracking)
 	migPaperTotal  atomic.Int32
@@ -2368,6 +2369,10 @@ func runMigrationWatcher(ctx context.Context) {
 						// Реальная сделка (SOL -> token -> SOL) через Jupiter (маршруты включают Raydium).
 						// По умолчанию выключено. Включать только когда уверен: MIGRATION_LIVE_SWAP=1.
 						if os.Getenv("MIGRATION_LIVE_SWAP") == "1" && cfg.Live && len(cfg.Key) == 64 {
+							if migrationOpen.Load() > 0 {
+								log.Printf("[MIG][LIVE] skip %s: open migration position exists (%d)", short(it.m), migrationOpen.Load())
+								continue
+							}
 							if migrationTradeInFlight.CompareAndSwap(false, true) {
 								go func(mintStr string) {
 									defer migrationTradeInFlight.Store(false)
@@ -2612,15 +2617,48 @@ func migrationLiveSwapLoop(ctx context.Context, mintStr string) {
 		return
 	}
 	log.Printf("[MIG][SWAP] BUY sent %s | tx=%s | est_out=%d", short(mintStr), sigBuy.String()[:12], outAmt)
+	migrationOpen.Add(1)
 
 	// Read actual token amount from ATA (avoid “insufficient funds” on sell).
 	time.Sleep(2 * time.Second)
-	ata := findATA(user, mint, solana.TokenProgramID)
+	tokProg := getMintTokenProgram(ctx, mint)
+	ata := findATA(user, mint, tokProg)
 	rpcWait()
 	bal, e2 := rpcClient().GetTokenAccountBalance(ctx, ata, rpc.CommitmentConfirmed)
 	rpcNote(e2)
 	if e2 != nil || bal == nil || bal.Value == nil {
-		log.Printf("[MIG][SWAP] cannot read ATA balance | %s", short(mintStr))
+		// Fallback: parse raw account amount for ATA. If still zero, use quote outAmount with buffer.
+		rawAmt := getTokenBalance(ctx, ata)
+		if rawAmt > 0 {
+			log.Printf("[MIG][SWAP] ATA balance fallback(raw) | %s | amt=%d", short(mintStr), rawAmt)
+			inAmt := rawAmt
+			log.Printf("[MIG][SWAP] SELL start %s | amount=%d | slip=%dbps", short(mintStr), inAmt, cfg.SellSlip)
+			sigSell, _, okSell := jupSwap(ctx, user, mint, wsolMint, inAmt, cfg.SellSlip, cfg.PrioLampSell)
+			if !okSell {
+				log.Printf("[MIG][SWAP] SELL failed %s", short(mintStr))
+				return
+			}
+			migrationOpen.Add(-1)
+			log.Printf("[MIG][SWAP] SELL sent %s | tx=%s", short(mintStr), sigSell.String()[:12])
+			return
+		}
+		if outAmt > 0 {
+			// Conservative buffer from quoted out amount.
+			inAmt := uint64(float64(outAmt) * 0.92)
+			if inAmt > 0 {
+				log.Printf("[MIG][SWAP] ATA unreadable, fallback to est_out*0.92 | %s | amt=%d", short(mintStr), inAmt)
+				log.Printf("[MIG][SWAP] SELL start %s | amount=%d | slip=%dbps", short(mintStr), inAmt, cfg.SellSlip)
+				sigSell, _, okSell := jupSwap(ctx, user, mint, wsolMint, inAmt, cfg.SellSlip, cfg.PrioLampSell)
+				if !okSell {
+					log.Printf("[MIG][SWAP] SELL failed %s", short(mintStr))
+					return
+				}
+				migrationOpen.Add(-1)
+				log.Printf("[MIG][SWAP] SELL sent %s | tx=%s", short(mintStr), sigSell.String()[:12])
+				return
+			}
+		}
+		log.Printf("[MIG][SWAP] cannot read ATA balance | %s | err=%v", short(mintStr), e2)
 		return
 	}
 	inAmt, _ := strconv.ParseUint(bal.Value.Amount, 10, 64)
@@ -2681,6 +2719,7 @@ func migrationLiveSwapLoop(ctx context.Context, mintStr string) {
 		log.Printf("[MIG][SWAP] SELL failed %s", short(mintStr))
 		return
 	}
+	migrationOpen.Add(-1)
 	log.Printf("[MIG][SWAP] SELL sent %s | tx=%s | px start=$%.6f max=$%.6f min=$%.6f",
 		short(mintStr), sigSell.String()[:12], startPx, maxPx, minPx)
 }
@@ -5609,8 +5648,8 @@ func printStats() {
 	if ref > 0 {
 		sessExtra = fmt.Sprintf(" (sess %+.4f SOL)", float64(lam)/1e9)
 	}
-	log.Printf("[STAT] Wins=%d Losses=%d WR=%.0f%% | PnL=%+.2f%% от запуска%s | Open=%d | Buys=%d Sells=%d%s",
-		w, l, wr, sessPct, sessExtra, open, statBuys.Load(), statSells.Load(), balStr)
+	log.Printf("[STAT] Wins=%d Losses=%d WR=%.0f%% | PnL=%+.2f%% от запуска%s | Open=%d | MigOpen=%d | Buys=%d Sells=%d%s",
+		w, l, wr, sessPct, sessExtra, open, migrationOpen.Load(), statBuys.Load(), statSells.Load(), balStr)
 	checkSessionTrail()
 }
 

@@ -538,7 +538,9 @@ var (
 	// MIGRATION live trading guard (1 position max)
 	migrationTradeInFlight atomic.Bool
 	migrationOpen          atomic.Int32
-	migDevRugMu            sync.Mutex
+	migrationQueuedMu      sync.Mutex
+	migrationQueuedMint    string // один mint в очереди на swap после текущего
+	migDevRugMu              sync.Mutex
 	migDevRugN             = map[string]int{} // creator → число убыточных MIG-циклов за сессию
 
 	// MIGRATION paper stats (from [MIG][LIVE] tracking)
@@ -1527,8 +1529,8 @@ func loadCfg() Config {
 		MigrationPrioEstimateMult:   1,
 		MigrationPrioEstimateMaxLam:   0,
 		MigrationPrioEstimateTimeout: 800 * time.Millisecond,
-		MigrationDexPollAttempts:     12,
-		MigrationDexPollIntervalMS:  450,
+		MigrationDexPollAttempts:     28,
+		MigrationDexPollIntervalMS:  600,
 		VSRSExit:                 false,
 		VSRSWindowSec:            6,
 		VSRSMinUpSOLPerSec:       0.8,
@@ -2540,12 +2542,35 @@ func runMigrationWatcher(ctx context.Context) {
 								continue
 							}
 							if migrationTradeInFlight.CompareAndSwap(false, true) {
-								go func(mintStr string) {
+								go func(first string) {
 									defer migrationTradeInFlight.Store(false)
-									migrationLiveSwapLoop(ctx, mintStr)
+									mintStr := first
+									for {
+										migrationLiveSwapLoop(ctx, mintStr)
+										migrationQueuedMu.Lock()
+										next := migrationQueuedMint
+										migrationQueuedMint = ""
+										migrationQueuedMu.Unlock()
+										if next == "" {
+											return
+										}
+										if migrationOpen.Load() > 0 {
+											log.Printf("[MIG][LIVE] skip queued %s: MigOpen=%d", short(next), migrationOpen.Load())
+											return
+										}
+										log.Printf("[MIG][LIVE] starting queued %s", short(next))
+										mintStr = next
+									}
 								}(it.m)
 							} else {
-								log.Printf("[MIG][LIVE] skip %s: trade already in-flight", short(it.m))
+								migrationQueuedMu.Lock()
+								if migrationQueuedMint == "" {
+									migrationQueuedMint = it.m
+									log.Printf("[MIG][LIVE] queued %s (after current swap)", short(it.m))
+								} else {
+									log.Printf("[MIG][LIVE] skip %s: trade in-flight and queue full", short(it.m))
+								}
+								migrationQueuedMu.Unlock()
 							}
 						}
 					}
@@ -2977,7 +3002,7 @@ func migrationDexFiltersWait(ctx context.Context, mintStr string) bool {
 			return false
 		default:
 		}
-		_, liq, dex, dexOk = dexTokenBestUSD(mintStr)
+		_, liq, dex, dexOk = dexTokenBestUSDForMigration(mintStr)
 		if !dexOk {
 			if attempt == attempts {
 				log.Printf("[MIG][SWAP] skip %s: no dex quote/liquidity after %d polls", short(mintStr), attempts)
@@ -3377,6 +3402,72 @@ func dexTokenBestUSD(mintStr string) (priceUSD float64, liqUSD float64, dexID st
 		return 0, bestL, bestDex, false
 	}
 	return bestPx, bestL, bestDex, true
+}
+
+// dexTokenBestUSDForMigration — не выбирать «лучшей» парой pumpfun с liq=0, пока в API нет DEX-пула с ликвидностью.
+func dexTokenBestUSDForMigration(mintStr string) (priceUSD float64, liqUSD float64, dexID string, ok bool) {
+	body, err := httpGet("https://api.dexscreener.com/latest/dex/tokens/" + mintStr)
+	if err != nil {
+		return 0, 0, "", false
+	}
+	var r struct {
+		Pairs []struct {
+			ChainID   string `json:"chainId"`
+			DexID     string `json:"dexId"`
+			PriceUSD  string `json:"priceUsd"`
+			Liquidity struct {
+				USD float64 `json:"usd"`
+			} `json:"liquidity"`
+		} `json:"pairs"`
+	}
+	if json.Unmarshal(body, &r) != nil || len(r.Pairs) == 0 {
+		return 0, 0, "", false
+	}
+	// 1) Любая solana-пара с liq>0 (часто сразу pumpswap/raydium).
+	bestL := -1.0
+	var bestPx float64
+	var bestDex string
+	for _, p := range r.Pairs {
+		if p.ChainID != "solana" {
+			continue
+		}
+		if p.Liquidity.USD <= 0 {
+			continue
+		}
+		if bestL >= 0 && p.Liquidity.USD < bestL {
+			continue
+		}
+		bestL = p.Liquidity.USD
+		bestDex = p.DexID
+		px, _ := strconv.ParseFloat(p.PriceUSD, 64)
+		bestPx = px
+	}
+	if bestL > 0 && bestPx > 0 {
+		return bestPx, bestL, bestDex, true
+	}
+	// 2) Пока только «призрак» pumpfun с liq=0 — смотрим любую не-pumpfun (ожидаем индексацию pumpswap).
+	bestL2 := 0.0
+	bestPx2 := 0.0
+	bestDex2 := ""
+	for _, p := range r.Pairs {
+		if p.ChainID != "solana" {
+			continue
+		}
+		if strings.ToLower(strings.TrimSpace(p.DexID)) == "pumpfun" {
+			continue
+		}
+		if p.Liquidity.USD < bestL2 {
+			continue
+		}
+		bestL2 = p.Liquidity.USD
+		bestDex2 = p.DexID
+		px, _ := strconv.ParseFloat(p.PriceUSD, 64)
+		bestPx2 = px
+	}
+	if bestDex2 != "" && bestPx2 > 0 {
+		return bestPx2, bestL2, bestDex2, true
+	}
+	return 0, 0, "", false
 }
 
 func dexTokenPriceUSD(mintStr string) (float64, bool) {

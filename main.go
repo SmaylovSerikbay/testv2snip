@@ -86,6 +86,10 @@ type Config struct {
 	JitoHTTP        bool
 	JitoHTTPURL     string
 	JitoHTTPTimeout time.Duration
+	// If >0: after bundle 429, pause new BUY attempts for N seconds.
+	Jito429Pause time.Duration
+	// If true: on bundle 429, fall back to Jito HTTP sendTransaction (still no RPC fallback).
+	Jito429FallbackToHTTP bool
 	// Jito Bundles (sendBundle)
 	JitoBundleBuy  bool
 	JitoBundleURL  string
@@ -568,6 +572,24 @@ func sendTx(ctx context.Context, tx *solana.Transaction, rpcFallback bool) (sola
 			return sig, nil
 		}
 		if isJitoRateLimitErr(err) {
+			if cfg.Jito429Pause > 0 {
+				until := time.Now().Add(cfg.Jito429Pause).UnixMilli()
+				// don't shrink existing pause window
+				for {
+					cur := buyPauseUntil.Load()
+					if cur >= until {
+						break
+					}
+					if buyPauseUntil.CompareAndSwap(cur, until) {
+						break
+					}
+				}
+				log.Printf("[TX] Jito 429: пауза BUY на %ds", int(cfg.Jito429Pause.Seconds()))
+			}
+			if cfg.Jito429FallbackToHTTP && cfg.JitoHTTPURL != "" {
+				log.Printf("[TX] BUY bundle 429 → fallback to jito-http sendTransaction")
+				return sendTxViaJitoHTTP(ctx, cfg.JitoHTTPURL, tx)
+			}
 			log.Printf("[TX] BUY bundle blocked (no fallback) | err=%v", err)
 			return solana.Signature{}, err
 		}
@@ -1147,6 +1169,8 @@ func loadCfg() Config {
 		BuyConfirmTimeout:        30 * time.Second,
 		JitoHTTPURL:              "https://mainnet.block-engine.jito.wtf/api/v1/transactions",
 		JitoHTTPTimeout:          400 * time.Millisecond,
+		Jito429Pause:             0,
+		Jito429FallbackToHTTP:    false,
 		JitoBundleBuy: false,
 		JitoBundleURL: "https://mainnet.block-engine.jito.wtf/api/v1/bundles",
 		// Official Jito tip accounts (fallback pool). Pick one to write-lock for bundle eligibility.
@@ -1260,6 +1284,10 @@ func loadCfg() Config {
 	c.MaxSessionLoss = evF("MAX_SESSION_LOSS_PCT", c.MaxSessionLoss)
 	c.JitoTipLamp = evU("JITO_TIP_LAMPORTS", c.JitoTipLamp)
 	c.JitoHTTP = ev("JITO_HTTP_SEND", "0") == "1"
+	if s := evU("JITO_429_PAUSE_SEC", 0); s > 0 {
+		c.Jito429Pause = time.Duration(s) * time.Second
+	}
+	c.Jito429FallbackToHTTP = ev("JITO_429_FALLBACK_JITO_HTTP", "0") == "1"
 	if u := os.Getenv("JITO_HTTP_URL"); u != "" {
 		c.JitoHTTPURL = u
 	}

@@ -304,6 +304,9 @@ type Config struct {
 	MigrationPrioEstimateMult   float64
 	MigrationPrioEstimateMaxLam uint64 // верхняя граница lamports; 0 = без лимита
 	MigrationPrioEstimateTimeout time.Duration
+	// После GRADUATED Dexscreener часто секунды отстаёт: повторно опрашивать пару, пока liq=0 или пары нет.
+	MigrationDexPollAttempts   int
+	MigrationDexPollIntervalMS int
 	// VSR Speed exit: выход по затуханию притока ликвидности на кривую.
 	VSRSExit           bool
 	VSRSWindowSec      int     // окно для оценки скорости VSR (сек)
@@ -1524,6 +1527,8 @@ func loadCfg() Config {
 		MigrationPrioEstimateMult:   1,
 		MigrationPrioEstimateMaxLam:   0,
 		MigrationPrioEstimateTimeout: 800 * time.Millisecond,
+		MigrationDexPollAttempts:     12,
+		MigrationDexPollIntervalMS:  450,
 		VSRSExit:                 false,
 		VSRSWindowSec:            6,
 		VSRSMinUpSOLPerSec:       0.8,
@@ -1795,6 +1800,12 @@ func loadCfg() Config {
 	}
 	if ms := evU("MIG_PRIO_ESTIMATE_TIMEOUT_MS", 0); ms > 0 {
 		c.MigrationPrioEstimateTimeout = time.Duration(ms) * time.Millisecond
+	}
+	if n := evU("MIG_DEX_POLL_ATTEMPTS", 0); n > 0 {
+		c.MigrationDexPollAttempts = int(n)
+	}
+	if n := evU("MIG_DEX_POLL_MS", 0); n > 0 {
+		c.MigrationDexPollIntervalMS = int(n)
 	}
 	if v := strings.TrimSpace(os.Getenv("COPY_SELL_MIN_EST_PNL_PCT")); v != "" {
 		x, err := strconv.ParseFloat(v, 64)
@@ -2942,6 +2953,88 @@ func migrationHeliusPriorityFeeEstimateBuy(ctx context.Context, user, mint solan
 	return uint64(est + 0.5), nil
 }
 
+// migrationDexFiltersWait — Dexscreener сразу после миграции часто отдаёт пустой ответ или liq=0; коротко поллим, пока не появится порог.
+func migrationDexFiltersWait(ctx context.Context, mintStr string) bool {
+	if cfg.MigrationMinLiqUSD <= 0 && len(cfg.MigrationAllowedDexes) == 0 {
+		return true
+	}
+	attempts := cfg.MigrationDexPollAttempts
+	if attempts <= 0 {
+		attempts = 12
+	}
+	iv := cfg.MigrationDexPollIntervalMS
+	if iv <= 0 {
+		iv = 450
+	}
+	interval := time.Duration(iv) * time.Millisecond
+	var liq float64
+	var dex string
+	var dexOk bool
+	for attempt := 1; attempt <= attempts; attempt++ {
+		select {
+		case <-ctx.Done():
+			log.Printf("[MIG][SWAP] cancelled during dex poll | %s", short(mintStr))
+			return false
+		default:
+		}
+		_, liq, dex, dexOk = dexTokenBestUSD(mintStr)
+		if !dexOk {
+			if attempt == attempts {
+				log.Printf("[MIG][SWAP] skip %s: no dex quote/liquidity after %d polls", short(mintStr), attempts)
+				return false
+			}
+			log.Printf("[MIG][SWAP] dex poll %d/%d: no pair yet | %s", attempt, attempts, short(mintStr))
+			select {
+			case <-time.After(interval):
+			case <-ctx.Done():
+				log.Printf("[MIG][SWAP] cancelled during dex poll | %s", short(mintStr))
+				return false
+			}
+			continue
+		}
+		if cfg.MigrationMinLiqUSD <= 0 {
+			break
+		}
+		if liq >= cfg.MigrationMinLiqUSD {
+			if attempt > 1 {
+				log.Printf("[MIG][SWAP] dex ok after %d polls | %s | liq=%.0f USD dex=%s", attempt, short(mintStr), liq, dex)
+			}
+			break
+		}
+		if liq > 0 && liq < cfg.MigrationMinLiqUSD {
+			log.Printf("[MIG][SWAP] skip %s: low liq %.0f < %.0f USD | dex=%s", short(mintStr), liq, cfg.MigrationMinLiqUSD, dex)
+			return false
+		}
+		// liq == 0 — индексация Dexscreener
+		if attempt == attempts {
+			log.Printf("[MIG][SWAP] skip %s: liq still 0 USD after %d polls | dex=%s", short(mintStr), attempts, dex)
+			return false
+		}
+		log.Printf("[MIG][SWAP] dex poll %d/%d: liq=0 USD (indexing) | %s", attempt, attempts, short(mintStr))
+		select {
+		case <-time.After(interval):
+		case <-ctx.Done():
+			log.Printf("[MIG][SWAP] cancelled during dex poll | %s", short(mintStr))
+			return false
+		}
+	}
+	if len(cfg.MigrationAllowedDexes) > 0 {
+		okDex := false
+		dd := strings.ToLower(strings.TrimSpace(dex))
+		for _, a := range cfg.MigrationAllowedDexes {
+			if dd == strings.ToLower(strings.TrimSpace(a)) {
+				okDex = true
+				break
+			}
+		}
+		if !okDex {
+			log.Printf("[MIG][SWAP] skip %s: dex=%s not allowed (%s)", short(mintStr), dex, strings.Join(cfg.MigrationAllowedDexes, ","))
+			return false
+		}
+	}
+	return true
+}
+
 func migrationLiveSwapLoop(ctx context.Context, mintStr string) {
 	if cfg.BuyLamp == 0 {
 		log.Printf("[MIG][SWAP] skip %s: BUY_AMOUNT_SOL=0", short(mintStr))
@@ -2988,30 +3081,8 @@ func migrationLiveSwapLoop(ctx context.Context, mintStr string) {
 	prioBuy := migrationPrioBuyLamports()
 	prioSell := migrationPrioSellLamports()
 	prioBuyBase := prioBuy
-	if cfg.MigrationMinLiqUSD > 0 || len(cfg.MigrationAllowedDexes) > 0 {
-		_, liq, dex, ok := dexTokenBestUSD(mintStr)
-		if !ok {
-			log.Printf("[MIG][SWAP] skip %s: no dex quote/liquidity", short(mintStr))
-			return
-		}
-		if cfg.MigrationMinLiqUSD > 0 && liq < cfg.MigrationMinLiqUSD {
-			log.Printf("[MIG][SWAP] skip %s: low liq %.0f < %.0f USD", short(mintStr), liq, cfg.MigrationMinLiqUSD)
-			return
-		}
-		if len(cfg.MigrationAllowedDexes) > 0 {
-			okDex := false
-			dd := strings.ToLower(strings.TrimSpace(dex))
-			for _, a := range cfg.MigrationAllowedDexes {
-				if dd == strings.ToLower(strings.TrimSpace(a)) {
-					okDex = true
-					break
-				}
-			}
-			if !okDex {
-				log.Printf("[MIG][SWAP] skip %s: dex=%s not allowed (%s)", short(mintStr), dex, strings.Join(cfg.MigrationAllowedDexes, ","))
-				return
-			}
-		}
+	if !migrationDexFiltersWait(ctx, mintStr) {
+		return
 	}
 	if cfg.MigrationDelayMS > 0 {
 		d := time.Duration(cfg.MigrationDelayMS) * time.Millisecond

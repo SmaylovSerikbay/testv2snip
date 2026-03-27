@@ -209,6 +209,11 @@ type Config struct {
 	// т.е. «сразу после него» по любому BUY, который проходит фильтр MIN_WHALE_BUY_SOL.
 	// Опаснее (меньше селекции целей), но самый быстрый способ не «терять время на набор targets».
 	DirectPumpCopy bool
+	// MIGRATION_MODE: off|observe|live. В observe бот только детектит graduation (BondingCurve.Done) и логирует.
+	// В live — (пока) только логирует и не торгует; покупка на DEX добавляется после утверждения стратегии.
+	MigrationMode string
+	MigrationScanIvl time.Duration
+	MigrationMaxCheck int
 	// VSR Speed exit: выход по затуханию притока ликвидности на кривую.
 	VSRSExit           bool
 	VSRSWindowSec      int     // окно для оценки скорости VSR (сек)
@@ -1075,10 +1080,15 @@ func main() {
 
 	launch(runBlockhashLoop)
 	launch(runRPCHealth)
-	launch(runScraper)
-	launch(runWSListener)
-	launch(runExecutor)
-	launch(runMonitor)
+	if cfg.MigrationMode != "off" {
+		log.Printf("[INIT] MIGRATION_MODE=%s: отключаем copy-trading (targets/executor/monitor), только наблюдение graduation", cfg.MigrationMode)
+		launch(runMigrationWatcher)
+	} else {
+		launch(runScraper)
+		launch(runWSListener)
+		launch(runExecutor)
+		launch(runMonitor)
+	}
 	launch(runStats)
 
 	osSig := make(chan os.Signal, 1)
@@ -1210,6 +1220,9 @@ func loadCfg() Config {
 		CopySellExit:             false,
 		CopySellMinAgeSec:        3,
 		DirectPumpCopy:           false,
+		MigrationMode:            "off",
+		MigrationScanIvl:         10 * time.Second,
+		MigrationMaxCheck:        30,
 		VSRSExit:                 false,
 		VSRSWindowSec:            6,
 		VSRSMinUpSOLPerSec:       0.8,
@@ -1374,6 +1387,18 @@ func loadCfg() Config {
 	c.CopySellExit = ev("COPY_SELL_EXIT", "0") == "1"
 	c.CopySellMinAgeSec = int(evU("COPY_SELL_MIN_AGE_SEC", uint64(c.CopySellMinAgeSec)))
 	c.DirectPumpCopy = ev("DIRECT_PUMP_COPY", "0") == "1"
+	if v := strings.TrimSpace(os.Getenv("MIGRATION_MODE")); v != "" {
+		v = strings.ToLower(v)
+		if v == "off" || v == "observe" || v == "live" {
+			c.MigrationMode = v
+		}
+	}
+	if s := evU("MIGRATION_SCAN_SEC", 0); s > 0 {
+		c.MigrationScanIvl = time.Duration(s) * time.Second
+	}
+	if n := evU("MIGRATION_MAX_CHECK", 0); n > 0 {
+		c.MigrationMaxCheck = int(n)
+	}
 	if v := strings.TrimSpace(os.Getenv("COPY_SELL_MIN_EST_PNL_PCT")); v != "" {
 		x, err := strconv.ParseFloat(v, 64)
 		if err == nil {
@@ -1846,6 +1871,105 @@ func scrape(ctx context.Context) {
 	}
 	log.Printf("[SCRAPE] %v | unique_wallets=%d +%d -%d = %d целей",
 		time.Since(start).Round(time.Millisecond), len(freq), added, stale, total)
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  MIGRATION WATCHER — observe graduation (BondingCurve.Done)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+func runMigrationWatcher(ctx context.Context) {
+	ivl := cfg.MigrationScanIvl
+	if ivl <= 0 {
+		ivl = 10 * time.Second
+	}
+	maxCheck := cfg.MigrationMaxCheck
+	if maxCheck <= 0 {
+		maxCheck = 30
+	}
+	if maxCheck > 200 {
+		maxCheck = 200
+	}
+	log.Printf("[MIG] Mode=%s | scan=%v | maxCheck=%d", cfg.MigrationMode, ivl, maxCheck)
+
+	seenMu := sync.Mutex{}
+	seen := map[string]time.Time{} // mint -> first seen graduation
+
+	scanOnce := func() {
+		start := time.Now()
+		// Берём свежие mint'ы с DexScreener и проверяем состояние bonding curve (Done).
+		body, err := httpGet("https://api.dexscreener.com/token-profiles/latest/v1")
+		if err != nil {
+			log.Printf("[MIG] Dex/profiles: %v", err)
+			return
+		}
+		var items []struct {
+			ChainID string `json:"chainId"`
+			Token   string `json:"tokenAddress"`
+		}
+		if json.Unmarshal(body, &items) != nil {
+			return
+		}
+		checked := 0
+		found := 0
+		for _, it := range items {
+			if checked >= maxCheck {
+				break
+			}
+			if it.ChainID != "solana" || it.Token == "" {
+				continue
+			}
+			mint, e2 := solana.PublicKeyFromBase58(it.Token)
+			if e2 != nil {
+				continue
+			}
+			checked++
+
+			s, _, e3 := readBC(ctx, mint)
+			if e3 != nil || s == nil {
+				continue
+			}
+			if !s.Done {
+				continue
+			}
+
+			m := mint.String()
+			seenMu.Lock()
+			_, ok := seen[m]
+			if !ok {
+				seen[m] = time.Now()
+			}
+			seenMu.Unlock()
+			if ok {
+				continue
+			}
+			found++
+			url := "https://dexscreener.com/solana/" + m
+			log.Printf("[MIG] GRADUATED %s | %s", short(m), url)
+		}
+		// GC old
+		seenMu.Lock()
+		cut := time.Now().Add(-30 * time.Minute)
+		for k, t := range seen {
+			if t.Before(cut) {
+				delete(seen, k)
+			}
+		}
+		seenMu.Unlock()
+		log.Printf("[MIG] scan %v | checked=%d graduated=%d", time.Since(start).Round(time.Millisecond), checked, found)
+	}
+
+	// initial burst
+	scanOnce()
+	t := time.NewTicker(ivl)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+			scanOnce()
+		}
+	}
 }
 
 // scrapeRPCLive removed: sequential GetTransaction polling disabled (WS-only).

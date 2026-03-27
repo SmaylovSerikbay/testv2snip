@@ -1227,9 +1227,16 @@ func checkJupiterHTTP() bool {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
+	// Use a real quote (SOL -> USDC) to avoid 400 on invalid pairs/params.
+	usdc := solana.MustPublicKeyFromBase58("EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v")
 	for _, b := range bases {
-		u := strings.TrimRight(b, "/") + "/quote?inputMint=" + wsolMint.String() + "&outputMint=" +
-			wsolMint.String() + "&amount=1&slippageBps=1"
+		u := fmt.Sprintf("%s/quote?inputMint=%s&outputMint=%s&amount=%d&slippageBps=%d&onlyDirectRoutes=false",
+			strings.TrimRight(b, "/"),
+			wsolMint.String(),
+			usdc.String(),
+			uint64(1_000_000), // 0.001 SOL
+			uint64(50),
+		)
 		_, err := httpGetWithContextJup(ctx, u, apiKey)
 		if err == nil {
 			log.Printf("[JUP] OK | base=%s", b)
@@ -1256,6 +1263,13 @@ func httpGetWithContextJup(ctx context.Context, u string, apiKey string) ([]byte
 	defer r.Body.Close()
 	b, _ := io.ReadAll(r.Body)
 	if r.StatusCode != 200 {
+		msg := string(b)
+		if len(msg) > 200 {
+			msg = msg[:200] + "…"
+		}
+		if msg != "" {
+			return nil, fmt.Errorf("HTTP %d: %s", r.StatusCode, msg)
+		}
 		return nil, fmt.Errorf("HTTP %d", r.StatusCode)
 	}
 	return b, nil

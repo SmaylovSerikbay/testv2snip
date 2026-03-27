@@ -2530,18 +2530,25 @@ func runMigrationWatcher(ctx context.Context) {
 		jobs := make(chan cand, len(cands))
 		var wg sync.WaitGroup
 		var bcDone, skipAgeMin, skipAgeMax atomic.Int32
+		var bcRPCErr, bcOpen, scanSkip atomic.Int32
 		for i := 0; i < workers; i++ {
 			wg.Add(1)
 			go func() {
 				defer wg.Done()
 				for it := range jobs {
 					if scanCtx.Err() != nil {
+						scanSkip.Add(1)
 						continue
 					}
 					cctx, cancel := context.WithTimeout(scanCtx, perMintTimeout)
 					s, _, e3 := readBC(cctx, it.mint)
 					cancel()
-					if e3 != nil || s == nil || !s.Done {
+					if e3 != nil {
+						bcRPCErr.Add(1)
+						continue
+					}
+					if !s.Done {
+						bcOpen.Add(1)
 						continue
 					}
 					bcDone.Add(1)
@@ -2667,9 +2674,9 @@ func runMigrationWatcher(ctx context.Context) {
 			}
 		}
 		pendingMu.Unlock()
-		log.Printf("[MIG] scan %v | cand=%d checked=%d graduated=%d | firstSeenAge ok=%d ?=%d | bcDone=%d skipAge<min=%d skipAge>max=%d",
+		log.Printf("[MIG] scan %v | cand=%d checked=%d graduated=%d | firstSeenAge ok=%d ?=%d | bcDone=%d bcOpen=%d rpcErr=%d scanSkip=%d | skipAge<min=%d skipAge>max=%d",
 			time.Since(start).Round(time.Millisecond), dexN, checked, found.Load(), ageKnown, ageUnknown,
-			bcDone.Load(), skipAgeMin.Load(), skipAgeMax.Load())
+			bcDone.Load(), bcOpen.Load(), bcRPCErr.Load(), scanSkip.Load(), skipAgeMin.Load(), skipAgeMax.Load())
 	}
 
 	// initial burst

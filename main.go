@@ -201,6 +201,10 @@ type Config struct {
 	// Та же шкала, что в логе [SELL] est_pnl. Пусто = без фильтра (как раньше).
 	CopySellMinEstPnlEnabled bool
 	CopySellMinEstPnlPct     float64
+	// DIRECT_PUMP_COPY=1: торговать напрямую по глобальному pump WS (без targets),
+	// т.е. «сразу после него» по любому BUY, который проходит фильтр MIN_WHALE_BUY_SOL.
+	// Опаснее (меньше селекции целей), но самый быстрый способ не «терять время на набор targets».
+	DirectPumpCopy bool
 	// VSR Speed exit: выход по затуханию притока ликвидности на кривую.
 	VSRSExit           bool
 	VSRSWindowSec      int     // окно для оценки скорости VSR (сек)
@@ -1181,6 +1185,7 @@ func loadCfg() Config {
 		CandRequireWin2x:         false,
 		CopySellExit:             false,
 		CopySellMinAgeSec:        3,
+		DirectPumpCopy:           false,
 		VSRSExit:                 false,
 		VSRSWindowSec:            6,
 		VSRSMinUpSOLPerSec:       0.8,
@@ -1340,6 +1345,7 @@ func loadCfg() Config {
 	c.ObserveOnly = ev("OBSERVE_ONLY", "0") == "1"
 	c.CopySellExit = ev("COPY_SELL_EXIT", "0") == "1"
 	c.CopySellMinAgeSec = int(evU("COPY_SELL_MIN_AGE_SEC", uint64(c.CopySellMinAgeSec)))
+	c.DirectPumpCopy = ev("DIRECT_PUMP_COPY", "0") == "1"
 	if v := strings.TrimSpace(os.Getenv("COPY_SELL_MIN_EST_PNL_PCT")); v != "" {
 		x, err := strconv.ParseFloat(v, 64)
 		if err == nil {
@@ -2335,6 +2341,18 @@ func wsLoop(ctx context.Context, wssURL string) error {
 				case scrapeEvCh <- scrapeEv{ev: ev, recvTime: now}:
 				default:
 				}
+				// Быстрый режим: торгуем напрямую по глобальному pump WS (без targets).
+				if cfg.DirectPumpCopy && ev.Sol >= cfg.MinWhaleBuyLam && !ev.User.IsZero() {
+					w := ev.User.String()
+					// myKey из scrape() тут недоступен, поэтому сверяемся с cfg.Key (если задан).
+					self := ""
+					if len(cfg.Key) == 64 {
+						self = cfg.Key.PublicKey().String()
+					}
+					if w != "" && w != self {
+						pushDirectPumpBuySignal(w, lr.Value.Signature, ev.Mint, now)
+					}
+				}
 			}
 			continue
 		}
@@ -2389,6 +2407,24 @@ func parseBuySignal(wallet string, sig string, logs []string) {
 
 	select {
 	case signalCh <- Signal{Mint: ev.Mint, Wallet: wallet, Sig: sig, At: time.Now()}:
+	default:
+		log.Println("[WS] signalCh full — пропуск")
+	}
+}
+
+func pushDirectPumpBuySignal(wallet string, sig string, mint solana.PublicKey, at time.Time) {
+	// Применяем тот же dedup по подписи, что и parseBuySignal (multi-WSS / повтор из разных источников).
+	if sig != "" {
+		sigDedupMu.Lock()
+		if t, ok := sigDedup[sig]; ok && at.Sub(t) < 2*time.Minute {
+			sigDedupMu.Unlock()
+			return
+		}
+		sigDedup[sig] = at
+		sigDedupMu.Unlock()
+	}
+	select {
+	case signalCh <- Signal{Mint: mint, Wallet: wallet, Sig: sig, At: at}:
 	default:
 		log.Println("[WS] signalCh full — пропуск")
 	}

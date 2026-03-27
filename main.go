@@ -1215,6 +1215,13 @@ func main() {
 	launch(runRPCHealth)
 	if cfg.MigrationMode != "off" {
 		log.Printf("[INIT] MIGRATION_MODE=%s: отключаем copy-trading (targets/executor/monitor), только наблюдение graduation", cfg.MigrationMode)
+		if cfg.MigrationMode == "live" && os.Getenv("MIGRATION_LIVE_SWAP") == "1" && cfg.Live && cfg.BuyLamp > 0 {
+			// Quote TP по Jupiter ≠ дельта кошелька: на микро-ставке фикс. комиссии доминируют.
+			if cfg.BuyLamp < 20_000_000 {
+				log.Printf("[INIT] ⚠ MIG live swap: BUY_AMOUNT=%.4f SOL < 0.02 — типичный круг (prio+Jito+slip) часто съедает большую часть; для net PnL смотри 0.02–0.05+ SOL",
+					float64(cfg.BuyLamp)/1e9)
+			}
+		}
 		// В migration observe нам нужен глобальный pump WS, чтобы иметь реальный firstSeenAge по mint.
 		launch(runWSListener)
 		launch(runMigrationWatcher)

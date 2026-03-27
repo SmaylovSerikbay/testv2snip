@@ -973,17 +973,6 @@ func main() {
 	loadPinnedWallets()
 	rpcCl = rpc.New(cfg.RPC)
 
-	// Jupiter HTTP health (for MIGRATION live swap). If DNS/egress is broken, disable swaps early.
-	jupEnabled.Store(checkJupiterHTTP())
-
-	// One-shot real swap self-test (safe, tiny size). Exits after completion.
-	// Usage:
-	//   $env:SWAP_SELFTEST="1"; $env:SWAP_SELFTEST_SOL="0.001"; ./copybot.exe
-	if os.Getenv("SWAP_SELFTEST") == "1" && cfg.Live && len(cfg.Key) == 64 {
-		selftestSwap(context.Background())
-		return
-	}
-
 	// Token bucket: 10 burst, refill at ~8/s
 	// увеличено: меньше очередей => меньше lag в hot-path (BUY/SELL)
 	rpcBucket = make(chan struct{}, 30)
@@ -999,6 +988,17 @@ func main() {
 			}
 		}
 	}()
+
+	// Jupiter HTTP health (for MIGRATION live swap). If DNS/egress is broken, disable swaps early.
+	jupEnabled.Store(checkJupiterHTTP())
+
+	// One-shot real swap self-test (safe, tiny size). Exits after completion.
+	// Usage:
+	//   SWAP_SELFTEST=1 SWAP_SELFTEST_SOL=0.001 ./copybot
+	if os.Getenv("SWAP_SELFTEST") == "1" && cfg.Live && len(cfg.Key) == 64 {
+		selftestSwap(context.Background())
+		return
+	}
 
 	// Read fee_recipient from on-chain Global account
 	{

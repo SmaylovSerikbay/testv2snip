@@ -65,6 +65,14 @@ func (cw colorWriter) Write(p []byte) (int, error) {
 	} else if strings.Contains(s, "[MIG][LIVE] FLAT") {
 		c = ansiGray
 	}
+	// Бумажный Σ по MIG (тест): зелёный в плюсе, красный в минусе
+	if strings.Contains(s, "[STAT][MIG]") {
+		if strings.Contains(s, "PaperΣ=-") {
+			c = ansiRed
+		} else if strings.Contains(s, "PaperΣ=+") {
+			c = ansiGreen
+		}
+	}
 	// Graduation info
 	if strings.Contains(s, "[MIG] GRADUATED") {
 		c = ansiCyan
@@ -554,6 +562,8 @@ var (
 	migPaperProfit atomic.Int32
 	migPaperLoss   atomic.Int32
 	migPaperFlat   atomic.Int32
+	// Σ бумажного PnL (лампорты): +BUY*TP при PROFIT, −BUY*SL при LOSS, 0 при FLAT (как cfg.TP/cfg.SL в trackMigrationDex).
+	migPaperPnlLam atomic.Int64
 
 	// MIGRATION real stats (actual wallet delta after BUY->SELL cycle)
 	migRealTrades  atomic.Int32
@@ -2343,8 +2353,8 @@ func runMigrationWatcher(ctx context.Context) {
 	if maxCheck <= 0 {
 		maxCheck = 30
 	}
-	if maxCheck > 200 {
-		maxCheck = 200
+	if maxCheck > 300 {
+		maxCheck = 300
 	}
 	log.Printf("[MIG] Mode=%s | scan=%v | maxCheck=%d", cfg.MigrationMode, ivl, maxCheck)
 
@@ -2494,14 +2504,17 @@ func runMigrationWatcher(ctx context.Context) {
 		}
 		checked = len(cands)
 
-		// Временной бюджет на один scan: чтобы не “вставать” на RPC и не опаздывать с детектом.
-		// Делаем общий таймаут и не ждём дольше него.
-		timeBudget := time.Duration(float64(ivl) * 0.5)
+		// Бюджет: ~90% интервала между сканами (раньше было 0.5*ivl и жёсткий cap 2s — при
+		// MIGRATION_MAX_CHECK=150 и коротком ivl часть mint не успевала readBC, graduated всегда 0).
+		timeBudget := ivl * 9 / 10
 		if timeBudget < 800*time.Millisecond {
 			timeBudget = 800 * time.Millisecond
 		}
-		if timeBudget > 2*time.Second {
-			timeBudget = 2 * time.Second
+		if timeBudget >= ivl {
+			timeBudget = ivl - 50*time.Millisecond
+		}
+		if timeBudget < 100*time.Millisecond {
+			timeBudget = 100 * time.Millisecond
 		}
 		scanCtx, scanCancel := context.WithTimeout(ctx, timeBudget)
 		defer scanCancel()
@@ -2516,6 +2529,7 @@ func runMigrationWatcher(ctx context.Context) {
 		}
 		jobs := make(chan cand, len(cands))
 		var wg sync.WaitGroup
+		var bcDone, skipAgeMin, skipAgeMax atomic.Int32
 		for i := 0; i < workers; i++ {
 			wg.Add(1)
 			go func() {
@@ -2530,6 +2544,7 @@ func runMigrationWatcher(ctx context.Context) {
 					if e3 != nil || s == nil || !s.Done {
 						continue
 					}
+					bcDone.Add(1)
 
 					// If already reported, skip.
 					seenMu.Lock()
@@ -2548,9 +2563,11 @@ func runMigrationWatcher(ctx context.Context) {
 
 					// Optional age filters: only report when within range.
 					if cfg.MigrationMinFirstSeenAge > 0 && it.age < cfg.MigrationMinFirstSeenAge {
+						skipAgeMin.Add(1)
 						continue
 					}
 					if cfg.MigrationMaxFirstSeenAge > 0 && it.age > cfg.MigrationMaxFirstSeenAge {
+						skipAgeMax.Add(1)
 						pendingMu.Lock()
 						delete(pending, it.m)
 						pendingMu.Unlock()
@@ -2650,8 +2667,9 @@ func runMigrationWatcher(ctx context.Context) {
 			}
 		}
 		pendingMu.Unlock()
-		log.Printf("[MIG] scan %v | cand=%d checked=%d graduated=%d | firstSeenAge ok=%d ?=%d",
-			time.Since(start).Round(time.Millisecond), dexN, checked, found.Load(), ageKnown, ageUnknown)
+		log.Printf("[MIG] scan %v | cand=%d checked=%d graduated=%d | firstSeenAge ok=%d ?=%d | bcDone=%d skipAge<min=%d skipAge>max=%d",
+			time.Since(start).Round(time.Millisecond), dexN, checked, found.Load(), ageKnown, ageUnknown,
+			bcDone.Load(), skipAgeMin.Load(), skipAgeMax.Load())
 	}
 
 	// initial burst
@@ -2783,15 +2801,18 @@ func trackMigrationDex(ctx context.Context, mintStr string) {
 	if cfg.TP > 0 && maxUpPct >= cfg.TP*100 {
 		label = "PROFIT"
 		migPaperProfit.Add(1)
+		migPaperPnlLam.Add(int64(float64(cfg.BuyLamp) * cfg.TP))
 	} else if cfg.SL > 0 && maxDnPct <= -cfg.SL*100 {
 		label = "LOSS"
 		migPaperLoss.Add(1)
+		migPaperPnlLam.Add(-int64(float64(cfg.BuyLamp) * cfg.SL))
 	} else {
 		migPaperFlat.Add(1)
 	}
-	log.Printf("[MIG][LIVE] %s %s | samples=%d | px start=$%.8f max=$%.8f min=$%.8f | maxUp=%.1f%% maxDn=%.1f%% | liq start=$%.0f max=$%.0f | W/L/F=%d/%d/%d (n=%d) | %s",
+	paperSol := float64(migPaperPnlLam.Load()) / 1e9
+	log.Printf("[MIG][LIVE] %s %s | samples=%d | px start=$%.8f max=$%.8f min=$%.8f | maxUp=%.1f%% maxDn=%.1f%% | liq start=$%.0f max=$%.0f | W/L/F=%d/%d/%d (n=%d) | paperΣ=%+.6f SOL | %s",
 		label, short(mintStr), samples, startPx, maxPx, minPx, maxUpPct, maxDnPct, startLiq, maxLiq,
-		migPaperProfit.Load(), migPaperLoss.Load(), migPaperFlat.Load(), migPaperTotal.Load(), link)
+		migPaperProfit.Load(), migPaperLoss.Load(), migPaperFlat.Load(), migPaperTotal.Load(), paperSol, link)
 }
 
 func httpPostJSON(ctx context.Context, url string, body []byte) ([]byte, error) {
@@ -6473,8 +6494,13 @@ func printStats() {
 				balStr = fmt.Sprintf(" | Bal=%.4f SOL", float64(b.Value)/1e9)
 			}
 		}
-		log.Printf("[STAT][MIG] Trades=%d Wins=%d Losses=%d WR=%.0f%% | Realized=%+.6f SOL | MigOpen=%d%s",
-			tr, w, l, wr, float64(pnlLam)/1e9, migrationOpen.Load(), balStr)
+		pt := migPaperTotal.Load()
+		pw := migPaperProfit.Load()
+		pl := migPaperLoss.Load()
+		pf := migPaperFlat.Load()
+		paperLam := migPaperPnlLam.Load()
+		log.Printf("[STAT][MIG] Trades=%d Wins=%d Losses=%d WR=%.0f%% | Realized=%+.6f SOL | MigOpen=%d | Paper(test) n=%d W/L/F=%d/%d/%d PaperΣ=%+.6f SOL%s",
+			tr, w, l, wr, float64(pnlLam)/1e9, migrationOpen.Load(), pt, pw, pl, pf, float64(paperLam)/1e9, balStr)
 		return
 	}
 

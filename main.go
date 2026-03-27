@@ -214,6 +214,11 @@ type Config struct {
 	MigrationMode string
 	MigrationScanIvl time.Duration
 	MigrationMaxCheck int
+	// Если >0: логировать/учитывать только graduation, у которых age с момента firstSeen >= этого порога.
+	// Важно: age считается от первого появления mint в watcher (память в RAM). При рестарте возраст обнулится.
+	MigrationMinFirstSeenAge time.Duration
+	// Если >0: верхняя граница age с момента firstSeen (отсечь “долго тянувшиеся”).
+	MigrationMaxFirstSeenAge time.Duration
 	// VSR Speed exit: выход по затуханию притока ликвидности на кривую.
 	VSRSExit           bool
 	VSRSWindowSec      int     // окно для оценки скорости VSR (сек)
@@ -1223,6 +1228,8 @@ func loadCfg() Config {
 		MigrationMode:            "off",
 		MigrationScanIvl:         10 * time.Second,
 		MigrationMaxCheck:        30,
+		MigrationMinFirstSeenAge: 0,
+		MigrationMaxFirstSeenAge: 0,
 		VSRSExit:                 false,
 		VSRSWindowSec:            6,
 		VSRSMinUpSOLPerSec:       0.8,
@@ -1398,6 +1405,12 @@ func loadCfg() Config {
 	}
 	if n := evU("MIGRATION_MAX_CHECK", 0); n > 0 {
 		c.MigrationMaxCheck = int(n)
+	}
+	if s := evU("MIGRATION_MIN_FIRSTSEEN_AGE_SEC", 0); s > 0 {
+		c.MigrationMinFirstSeenAge = time.Duration(s) * time.Second
+	}
+	if s := evU("MIGRATION_MAX_FIRSTSEEN_AGE_SEC", 0); s > 0 {
+		c.MigrationMaxFirstSeenAge = time.Duration(s) * time.Second
 	}
 	if v := strings.TrimSpace(os.Getenv("COPY_SELL_MIN_EST_PNL_PCT")); v != "" {
 		x, err := strconv.ParseFloat(v, 64)
@@ -1893,6 +1906,8 @@ func runMigrationWatcher(ctx context.Context) {
 
 	seenMu := sync.Mutex{}
 	seen := map[string]time.Time{} // mint -> first seen graduation
+	firstSeenMu := sync.Mutex{}
+	firstSeen := map[string]time.Time{} // mint -> first seen in watcher (for age heuristic)
 
 	scanOnce := func() {
 		start := time.Now()
@@ -1911,6 +1926,7 @@ func runMigrationWatcher(ctx context.Context) {
 		}
 		checked := 0
 		found := 0
+		now := time.Now()
 		for _, it := range items {
 			if checked >= maxCheck {
 				break
@@ -1924,6 +1940,18 @@ func runMigrationWatcher(ctx context.Context) {
 			}
 			checked++
 
+			m := mint.String()
+			// Track firstSeen to estimate "lifetime to graduation" (within watcher runtime).
+			ageKnown := false
+			firstSeenMu.Lock()
+			if t0, ok := firstSeen[m]; ok {
+				ageKnown = true
+				_ = t0
+			} else {
+				firstSeen[m] = now
+			}
+			firstSeenMu.Unlock()
+
 			s, _, e3 := readBC(ctx, mint)
 			if e3 != nil || s == nil {
 				continue
@@ -1931,20 +1959,41 @@ func runMigrationWatcher(ctx context.Context) {
 			if !s.Done {
 				continue
 			}
-
-			m := mint.String()
 			seenMu.Lock()
 			_, ok := seen[m]
 			if !ok {
-				seen[m] = time.Now()
+				seen[m] = now
 			}
 			seenMu.Unlock()
 			if ok {
 				continue
 			}
+			// Optional age filters: apply only if we have seen the mint before (otherwise startup flood looks "age=0").
+			var age time.Duration
+			if ageKnown {
+				firstSeenMu.Lock()
+				t0 := firstSeen[m]
+				firstSeenMu.Unlock()
+				if !t0.IsZero() {
+					age = now.Sub(t0)
+				}
+				if cfg.MigrationMinFirstSeenAge > 0 && age < cfg.MigrationMinFirstSeenAge {
+					continue
+				}
+				if cfg.MigrationMaxFirstSeenAge > 0 && age > cfg.MigrationMaxFirstSeenAge {
+					continue
+				}
+			} else if cfg.MigrationMinFirstSeenAge > 0 || cfg.MigrationMaxFirstSeenAge > 0 {
+				// if filters are set and we don't know age yet, skip
+				continue
+			}
 			found++
 			url := "https://dexscreener.com/solana/" + m
-			log.Printf("[MIG] GRADUATED %s | %s", short(m), url)
+			if ageKnown {
+				log.Printf("[MIG] GRADUATED %s | firstSeenAge=%s | %s", short(m), age.Round(time.Second), url)
+			} else {
+				log.Printf("[MIG] GRADUATED %s | firstSeenAge=? | %s", short(m), url)
+			}
 		}
 		// GC old
 		seenMu.Lock()
@@ -1955,6 +2004,14 @@ func runMigrationWatcher(ctx context.Context) {
 			}
 		}
 		seenMu.Unlock()
+		// GC firstSeen too
+		firstSeenMu.Lock()
+		for k, t := range firstSeen {
+			if t.Before(cut) {
+				delete(firstSeen, k)
+			}
+		}
+		firstSeenMu.Unlock()
 		log.Printf("[MIG] scan %v | checked=%d graduated=%d", time.Since(start).Round(time.Millisecond), checked, found)
 	}
 

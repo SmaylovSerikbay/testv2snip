@@ -2808,10 +2808,26 @@ func jupSwap(ctx context.Context, user solana.PublicKey, inputMint, outputMint s
 			}
 			return nil
 		})
-		// Self-test should not depend on Jito bundle availability (429). Use RPC fallback.
-		rpcFallback := os.Getenv("SWAP_SELFTEST") == "1"
-		log.Printf("[MIG][SWAP] send tx (rpcFallback=%v)...", rpcFallback)
-		sig, err = sendTx(ctx, tx, rpcFallback)
+		// Для MIGRATION swap НЕ используем bundle: он имеет жёсткий rate-limit 1 req/s/region и часто даёт 429.
+		// Пробуем Jito HTTP sendTransaction (если включено) и при ошибке — RPC fallback.
+		log.Printf("[MIG][SWAP] send tx (swap path, no-bundle)...")
+		if cfg.JitoHTTP && cfg.JitoHTTPURL != "" {
+			sig, err = sendTxViaJitoHTTP(ctx, cfg.JitoHTTPURL, tx)
+			if err != nil {
+				log.Printf("[MIG][SWAP] jito-http failed → RPC fallback | %v", err)
+			}
+		} else {
+			err = errors.New("jito-http disabled")
+		}
+		if err != nil {
+			rpcWait()
+			noRetry := uint(0)
+			sig, err = rpcClient().SendTransactionWithOpts(ctx, tx, rpc.TransactionOpts{
+				SkipPreflight: true,
+				MaxRetries:    &noRetry,
+			})
+			rpcNote(err)
+		}
 		if err != nil {
 			lastErr = err
 			log.Printf("[MIG][SWAP] send err: %v", err)

@@ -269,6 +269,12 @@ type Config struct {
 	MigrationMinFirstSeenAge time.Duration
 	// Если >0: верхняя граница age с момента firstSeen (отсечь “долго тянувшиеся”).
 	MigrationMaxFirstSeenAge time.Duration
+	// Минимальная ликвидность пары (USD) для реального MIGRATION_LIVE_SWAP.
+	// 0 = не фильтровать.
+	MigrationMinLiqUSD float64
+	// Разрешённые DEX для MIGRATION_LIVE_SWAP (lowercase ids из dexscreener: raydium, meteora, pumpswap ...).
+	// Пусто = любой DEX.
+	MigrationAllowedDexes []string
 	// VSR Speed exit: выход по затуханию притока ликвидности на кривую.
 	VSRSExit           bool
 	VSRSWindowSec      int     // окно для оценки скорости VSR (сек)
@@ -1465,6 +1471,8 @@ func loadCfg() Config {
 		MigrationMaxCheck:        30,
 		MigrationMinFirstSeenAge: 0,
 		MigrationMaxFirstSeenAge: 0,
+		MigrationMinLiqUSD:       5000,
+		MigrationAllowedDexes:    nil,
 		VSRSExit:                 false,
 		VSRSWindowSec:            6,
 		VSRSMinUpSOLPerSec:       0.8,
@@ -1646,6 +1654,17 @@ func loadCfg() Config {
 	}
 	if s := evU("MIGRATION_MAX_FIRSTSEEN_AGE_SEC", 0); s > 0 {
 		c.MigrationMaxFirstSeenAge = time.Duration(s) * time.Second
+	}
+	c.MigrationMinLiqUSD = evF("MIG_MIN_LIQ_USD", c.MigrationMinLiqUSD)
+	if v := strings.TrimSpace(os.Getenv("MIG_ALLOWED_DEXES")); v != "" {
+		out := make([]string, 0, 4)
+		for _, p := range strings.Split(v, ",") {
+			p = strings.ToLower(strings.TrimSpace(p))
+			if p != "" {
+				out = append(out, p)
+			}
+		}
+		c.MigrationAllowedDexes = out
 	}
 	if v := strings.TrimSpace(os.Getenv("COPY_SELL_MIN_EST_PNL_PCT")); v != "" {
 		x, err := strconv.ParseFloat(v, 64)
@@ -2615,6 +2634,31 @@ func migrationLiveSwapLoop(ctx context.Context, mintStr string) {
 		return
 	}
 	user := cfg.Key.PublicKey()
+	if cfg.MigrationMinLiqUSD > 0 || len(cfg.MigrationAllowedDexes) > 0 {
+		_, liq, dex, ok := dexTokenBestUSD(mintStr)
+		if !ok {
+			log.Printf("[MIG][SWAP] skip %s: no dex quote/liquidity", short(mintStr))
+			return
+		}
+		if cfg.MigrationMinLiqUSD > 0 && liq < cfg.MigrationMinLiqUSD {
+			log.Printf("[MIG][SWAP] skip %s: low liq %.0f < %.0f USD", short(mintStr), liq, cfg.MigrationMinLiqUSD)
+			return
+		}
+		if len(cfg.MigrationAllowedDexes) > 0 {
+			okDex := false
+			dd := strings.ToLower(strings.TrimSpace(dex))
+			for _, a := range cfg.MigrationAllowedDexes {
+				if dd == strings.ToLower(strings.TrimSpace(a)) {
+					okDex = true
+					break
+				}
+			}
+			if !okDex {
+				log.Printf("[MIG][SWAP] skip %s: dex=%s not allowed (%s)", short(mintStr), dex, strings.Join(cfg.MigrationAllowedDexes, ","))
+				return
+			}
+		}
+	}
 	balBefore := uint64(0)
 	rpcWait()
 	if b, err := rpcClient().GetBalance(ctx, user, rpc.CommitmentConfirmed); err == nil && b != nil {
@@ -2681,16 +2725,17 @@ func migrationLiveSwapLoop(ctx context.Context, mintStr string) {
 		return
 	}
 
-	// Price-based exit via DexScreener (simple TP/SL).
+	// Quote-based exit: смотрим реальный обратный quote в SOL, а не "картинку" dexscreener.
+	// Это резко уменьшает ложные TP на тонкой ликвидности.
 	tp := cfg.TP
 	sl := cfg.SL
 	if tp <= 0 || sl <= 0 {
 		log.Printf("[MIG][SWAP] TP/SL disabled, no auto-exit | %s", short(mintStr))
 		return
 	}
-	startPx := 0.0
-	maxPx := 0.0
-	minPx := 0.0
+	startOut := uint64(0)
+	maxOut := uint64(0)
+	minOut := uint64(0)
 	deadline := time.Now().Add(2 * time.Minute)
 	poll := 2 * time.Second
 	for time.Now().Before(deadline) {
@@ -2699,29 +2744,27 @@ func migrationLiveSwapLoop(ctx context.Context, mintStr string) {
 			return
 		default:
 		}
-		px, okPx := dexTokenPriceUSD(mintStr)
-		if okPx && px > 0 {
-			if startPx == 0 {
-				startPx = px
-				maxPx, minPx = px, px
+		outLam, okQ := jupQuoteOutLamports(ctx, mint, wsolMint, inAmt, cfg.SellSlip)
+		if okQ && outLam > 0 {
+			if startOut == 0 {
+				startOut = outLam
+				maxOut, minOut = outLam, outLam
 			} else {
-				if px > maxPx {
-					maxPx = px
+				if outLam > maxOut {
+					maxOut = outLam
 				}
-				if px < minPx {
-					minPx = px
+				if minOut == 0 || outLam < minOut {
+					minOut = outLam
 				}
 			}
-			if startPx > 0 {
-				pnl := px/startPx - 1
-				if pnl >= tp {
-					log.Printf("[MIG][SWAP] TP hit %s | pnl=+%.1f%%", short(mintStr), pnl*100)
-					break
-				}
-				if pnl <= -sl {
-					log.Printf("[MIG][SWAP] SL hit %s | pnl=%.1f%%", short(mintStr), pnl*100)
-					break
-				}
+			pnl := float64(outLam)/float64(cfg.BuyLamp) - 1
+			if pnl >= tp {
+				log.Printf("[MIG][SWAP] TP hit %s | quote_pnl=+%.1f%%", short(mintStr), pnl*100)
+				break
+			}
+			if pnl <= -sl {
+				log.Printf("[MIG][SWAP] SL hit %s | quote_pnl=%.1f%%", short(mintStr), pnl*100)
+				break
 			}
 		}
 		time.Sleep(poll)
@@ -2734,8 +2777,8 @@ func migrationLiveSwapLoop(ctx context.Context, mintStr string) {
 		return
 	}
 	migrationOpen.Add(-1)
-	log.Printf("[MIG][SWAP] SELL sent %s | tx=%s | px start=$%.6f max=$%.6f min=$%.6f",
-		short(mintStr), sigSell.String()[:12], startPx, maxPx, minPx)
+	log.Printf("[MIG][SWAP] SELL sent %s | tx=%s | out start/max/min=%.6f/%.6f/%.6f SOL",
+		short(mintStr), sigSell.String()[:12], float64(startOut)/1e9, float64(maxOut)/1e9, float64(minOut)/1e9)
 
 	// Realized wallet delta for migration cycle.
 	time.Sleep(3 * time.Second)
@@ -2763,14 +2806,15 @@ func migrationLiveSwapLoop(ctx context.Context, mintStr string) {
 	}
 }
 
-func dexTokenPriceUSD(mintStr string) (float64, bool) {
+func dexTokenBestUSD(mintStr string) (priceUSD float64, liqUSD float64, dexID string, ok bool) {
 	body, err := httpGet("https://api.dexscreener.com/latest/dex/tokens/" + mintStr)
 	if err != nil {
-		return 0, false
+		return 0, 0, "", false
 	}
 	var r struct {
 		Pairs []struct {
 			ChainID   string `json:"chainId"`
+			DexID     string `json:"dexId"`
 			PriceUSD  string `json:"priceUsd"`
 			Liquidity struct {
 				USD float64 `json:"usd"`
@@ -2778,10 +2822,11 @@ func dexTokenPriceUSD(mintStr string) (float64, bool) {
 		} `json:"pairs"`
 	}
 	if json.Unmarshal(body, &r) != nil || len(r.Pairs) == 0 {
-		return 0, false
+		return 0, 0, "", false
 	}
 	bestL := 0.0
 	bestPx := 0.0
+	bestDex := ""
 	for _, p := range r.Pairs {
 		if p.ChainID != "solana" {
 			continue
@@ -2790,13 +2835,60 @@ func dexTokenPriceUSD(mintStr string) (float64, bool) {
 			continue
 		}
 		bestL = p.Liquidity.USD
+		bestDex = p.DexID
 		px, _ := strconv.ParseFloat(p.PriceUSD, 64)
 		bestPx = px
 	}
 	if bestPx <= 0 {
+		return 0, bestL, bestDex, false
+	}
+	return bestPx, bestL, bestDex, true
+}
+
+func dexTokenPriceUSD(mintStr string) (float64, bool) {
+	px, _, _, ok := dexTokenBestUSD(mintStr)
+	return px, ok
+}
+
+func jupQuoteOutLamports(ctx context.Context, inputMint, outputMint solana.PublicKey, amount uint64, slipBps uint64) (uint64, bool) {
+	if !jupEnabled.Load() {
 		return 0, false
 	}
-	return bestPx, true
+	apiKey := strings.TrimSpace(os.Getenv("JUPITER_API_KEY"))
+	if apiKey == "" {
+		return 0, false
+	}
+	bases := jupBaseURLs()
+	for _, base := range bases {
+		quoteURL := strings.TrimRight(base, "/") + "/quote"
+		u := fmt.Sprintf("%s?inputMint=%s&outputMint=%s&amount=%d&slippageBps=%d&onlyDirectRoutes=false",
+			quoteURL, inputMint.String(), outputMint.String(), amount, slipBps)
+		qb, err := httpGetWithContextJup(ctx, u, apiKey)
+		if err != nil {
+			continue
+		}
+		var wrap struct {
+			Data []json.RawMessage `json:"data"`
+		}
+		var quote json.RawMessage
+		if json.Unmarshal(qb, &wrap) == nil && len(wrap.Data) > 0 {
+			quote = wrap.Data[0]
+		} else {
+			quote = json.RawMessage(qb)
+		}
+		var q struct {
+			OutAmount string `json:"outAmount"`
+		}
+		if json.Unmarshal(quote, &q) != nil || q.OutAmount == "" {
+			continue
+		}
+		out, err := strconv.ParseUint(q.OutAmount, 10, 64)
+		if err != nil || out == 0 {
+			continue
+		}
+		return out, true
+	}
+	return 0, false
 }
 
 func jupSwap(ctx context.Context, user solana.PublicKey, inputMint, outputMint solana.PublicKey, amount uint64, slipBps uint64, prioLam uint64) (sig solana.Signature, outAmount uint64, ok bool) {

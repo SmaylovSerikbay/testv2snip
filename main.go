@@ -197,6 +197,10 @@ type Config struct {
 	// Shadowing: если цель продала тот же mint — продаём нашу позицию сразу (copy-sell якорь).
 	CopySellExit      bool
 	CopySellMinAgeSec int
+	// COPY_SELL_MIN_EST_PNL_PCT: если задан (например -5), не копировать продажу цели при est_pnl по кривой хуже этого %%.
+	// Та же шкала, что в логе [SELL] est_pnl. Пусто = без фильтра (как раньше).
+	CopySellMinEstPnlEnabled bool
+	CopySellMinEstPnlPct     float64
 	// VSR Speed exit: выход по затуханию притока ликвидности на кривую.
 	VSRSExit           bool
 	VSRSWindowSec      int     // окно для оценки скорости VSR (сек)
@@ -1336,6 +1340,13 @@ func loadCfg() Config {
 	c.ObserveOnly = ev("OBSERVE_ONLY", "0") == "1"
 	c.CopySellExit = ev("COPY_SELL_EXIT", "0") == "1"
 	c.CopySellMinAgeSec = int(evU("COPY_SELL_MIN_AGE_SEC", uint64(c.CopySellMinAgeSec)))
+	if v := strings.TrimSpace(os.Getenv("COPY_SELL_MIN_EST_PNL_PCT")); v != "" {
+		x, err := strconv.ParseFloat(v, 64)
+		if err == nil {
+			c.CopySellMinEstPnlEnabled = true
+			c.CopySellMinEstPnlPct = x
+		}
+	}
 	c.VSRSExit = ev("VSR_SPEED_EXIT", "0") == "1"
 	c.VSRSWindowSec = int(evU("VSR_SPEED_WINDOW_SEC", uint64(c.VSRSWindowSec)))
 	c.VSRSMinUpSOLPerSec = evF("VSR_SPEED_MIN_UP_SOL_PER_SEC", c.VSRSMinUpSOLPerSec)
@@ -2340,6 +2351,34 @@ func parseSellSignal(wallet string, logs []string) {
 	tryCopySellExit(wallet, ev.Mint)
 }
 
+// copySellCurveEstPnlPct — та же оценка, что est_pnl в doSell ([SELL] … est_pnl=…%%).
+func copySellCurveEstPnlPct(ctx context.Context, p *Position) (float64, bool) {
+	state, _, err := readBC(ctx, p.Mint)
+	if err != nil || state == nil || state.Done {
+		return 0, false
+	}
+	tokProg := p.TokProg
+	if tokProg.IsZero() {
+		tokProg = solana.TokenProgramID
+	}
+	user := cfg.Key.PublicKey()
+	assocUser := findATA(user, p.Mint, tokProg)
+	realBal := getTokenBalance(ctx, assocUser)
+	sellAmt := p.Tokens
+	if realBal > 0 {
+		sellAmt = realBal
+	} else if realBal == 0 && time.Since(p.Entry) < 8*time.Second {
+		return 0, false
+	}
+	if sellAmt == 0 {
+		return 0, false
+	}
+	solOut := calcSolOut(state.VTK, state.VSR, sellAmt)
+	solNet := solOut - solOut/100
+	pnl := float64(solNet)/float64(p.Spent)*100 - 100
+	return pnl, true
+}
+
 func tryCopySellExit(wallet string, mint solana.PublicKey) {
 	mintStr := mint.String()
 	posMu.RLock()
@@ -2358,6 +2397,14 @@ func tryCopySellExit(wallet string, mint solana.PublicKey) {
 	}
 	if cfg.CopySellMinAgeSec > 0 && time.Since(p.Entry) < time.Duration(cfg.CopySellMinAgeSec)*time.Second {
 		return
+	}
+	if cfg.CopySellMinEstPnlEnabled {
+		est, ok := copySellCurveEstPnlPct(context.Background(), p)
+		if ok && est < cfg.CopySellMinEstPnlPct {
+			log.Printf("[SELL] COPYSELL skip: est_pnl=%+.1f%% < min %+.1f%% (цель продала, ждём SL/монитор) | %s",
+				est, cfg.CopySellMinEstPnlPct, short(mintStr))
+			return
+		}
 	}
 	go func(saved *Position) {
 		// Копи-селл: игнорируем текущий pnl — выходим по действию цели.

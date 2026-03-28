@@ -2997,6 +2997,55 @@ func migrationRefreshATABalance(ctx context.Context, user, mint, tokProg solana.
 	return a
 }
 
+// migrationSweepMigTokenDust — после SELL иногда остаётся сырой остаток (fallback 0.92, округление, partial).
+func migrationSweepMigTokenDust(ctx context.Context, user solana.PublicKey, mint, tokProg solana.PublicKey, mintStr string, prioSell uint64) {
+	time.Sleep(2 * time.Second)
+	dust := migrationRefreshATABalance(ctx, user, mint, tokProg)
+	if dust == 0 {
+		return
+	}
+	log.Printf("[MIG][SWAP] на ATA остались токены после SELL — пробуем добить одним свопом | %s | raw=%d", short(mintStr), dust)
+	_, _, okD := jupSwap(ctx, user, mint, wsolMint, dust, cfg.SellSlip, prioSell)
+	if !okD {
+		log.Printf("[MIG][SWAP] добивка не прошла (микроостаток/маршрут) | %s | raw=%d — остаток в кошельке или закрой ATA вручную", short(mintStr), dust)
+	}
+}
+
+// migrationNoteMigRealized — дельта SOL кошелька за цикл MIG (один раз после всех SELL, включая добивку пыли).
+func migrationNoteMigRealized(ctx context.Context, user solana.PublicKey, mintStr string, balBefore uint64, creatorStr string) {
+	if balBefore == 0 {
+		log.Printf("[MIG][REAL] %s | пропуск: не удалось запомнить баланс до BUY (balBefore=0) — статистика MIG не обновлена", short(mintStr))
+		return
+	}
+	time.Sleep(3 * time.Second)
+	rpcWait()
+	b2, err := rpcClient().GetBalance(ctx, user, rpc.CommitmentConfirmed)
+	rpcNote(err)
+	if err != nil || b2 == nil {
+		return
+	}
+	balAfter := b2.Value
+	delta := int64(balAfter) - int64(balBefore)
+	migRealTrades.Add(1)
+	migRealPnlLam.Add(delta)
+	if delta > 0 {
+		migRealWins.Add(1)
+	} else if delta < 0 {
+		migRealLosses.Add(1)
+		if creatorStr != "" {
+			migDevRugMu.Lock()
+			migDevRugN[creatorStr]++
+			migDevRugMu.Unlock()
+		}
+	}
+	pct := 0.0
+	if cfg.BuyLamp > 0 {
+		pct = 100 * float64(delta) / float64(cfg.BuyLamp)
+	}
+	log.Printf("[MIG][REAL] %s | delta=%+.6f SOL (%.1f%% of stake) | before=%.6f after=%.6f",
+		short(mintStr), float64(delta)/1e9, pct, float64(balBefore)/1e9, float64(balAfter)/1e9)
+}
+
 // rpcJSONRPC — POST JSON-RPC на cfg.RPC (для getPriorityFeeEstimate и т.п.).
 func rpcJSONRPC(ctx context.Context, method string, params []interface{}) (json.RawMessage, error) {
 	rpcWait()
@@ -3332,21 +3381,35 @@ func migrationLiveSwapLoop(ctx context.Context, mintStr string) {
 			}
 			migrationOpen.Add(-1)
 			log.Printf("[MIG][SWAP] SELL sent %s | tx=%s", short(mintStr), sigSell.String()[:12])
+			migrationSweepMigTokenDust(ctx, user, mint, tokProg, mintStr, prioSell)
+			migrationNoteMigRealized(ctx, user, mintStr, balBefore, creatorStr)
 			return
 		}
 		if outAmt > 0 {
-			// Conservative buffer from quoted out amount.
-			inAmt := uint64(float64(outAmt) * 0.92)
-			if inAmt > 0 {
-				log.Printf("[MIG][SWAP] ATA unreadable, fallback to est_out*0.92 | %s | amt=%d", short(mintStr), inAmt)
-				log.Printf("[MIG][SWAP] SELL start %s | amount=%d | slip=%dbps", short(mintStr), inAmt, cfg.SellSlip)
-				sigSell, _, okSell := jupSwap(ctx, user, mint, wsolMint, inAmt, cfg.SellSlip, prioSell)
+			// Сначала ждём RPC — часто баланс появляется после BUY; иначе сознательно продаём <100% (пыль добиваем sweep).
+			time.Sleep(3 * time.Second)
+			raw2 := getTokenBalance(ctx, ata)
+			var sellAmt uint64
+			if raw2 > 0 {
+				sellAmt = raw2
+				log.Printf("[MIG][SWAP] ATA после ожидания | %s | полный sell raw=%d", short(mintStr), sellAmt)
+			} else {
+				sellAmt = uint64(float64(outAmt) * 0.92)
+				if sellAmt > 0 {
+					log.Printf("[MIG][SWAP] ATA всё ещё без raw — fallback est_out*0.92 | %s | amt=%d (остаток добьёт sweep)", short(mintStr), sellAmt)
+				}
+			}
+			if sellAmt > 0 {
+				log.Printf("[MIG][SWAP] SELL start %s | amount=%d | slip=%dbps", short(mintStr), sellAmt, cfg.SellSlip)
+				sigSell, _, okSell := jupSwap(ctx, user, mint, wsolMint, sellAmt, cfg.SellSlip, prioSell)
 				if !okSell {
 					log.Printf("[MIG][SWAP] SELL failed %s", short(mintStr))
 					return
 				}
 				migrationOpen.Add(-1)
 				log.Printf("[MIG][SWAP] SELL sent %s | tx=%s", short(mintStr), sigSell.String()[:12])
+				migrationSweepMigTokenDust(ctx, user, mint, tokProg, mintStr, prioSell)
+				migrationNoteMigRealized(ctx, user, mintStr, balBefore, creatorStr)
 				return
 			}
 		}
@@ -3383,7 +3446,16 @@ func migrationLiveSwapLoop(ctx context.Context, mintStr string) {
 	poll := time.Duration(pollMS) * time.Millisecond
 	log.Printf("[MIG][SWAP] quote exit | TP=%.1f%% SL=%.1f%% poll=%dms (%s)", tp*100, sl*100, pollMS, tpSrc)
 	if tp <= 0 || sl <= 0 {
-		log.Printf("[MIG][SWAP] TP/SL disabled, no auto-exit | %s", short(mintStr))
+		log.Printf("[MIG][SWAP] TP/SL выкл. → одноразовый полный SELL | %s", short(mintStr))
+		sigSell, _, okSell := jupSwap(ctx, user, mint, wsolMint, inAmt, cfg.SellSlip, prioSell)
+		if !okSell {
+			log.Printf("[MIG][SWAP] SELL failed %s", short(mintStr))
+			return
+		}
+		migrationOpen.Add(-1)
+		log.Printf("[MIG][SWAP] SELL sent %s | tx=%s", short(mintStr), sigSell.String()[:12])
+		migrationSweepMigTokenDust(ctx, user, mint, tokProg, mintStr, prioSell)
+		migrationNoteMigRealized(ctx, user, mintStr, balBefore, creatorStr)
 		return
 	}
 	partialTP := cfg.MigrationPartialTPPct
@@ -3439,6 +3511,8 @@ func migrationLiveSwapLoop(ctx context.Context, mintStr string) {
 					if inAmt == 0 {
 						log.Printf("[MIG][SWAP] zero balance after partial | %s", short(mintStr))
 						migrationOpen.Add(-1)
+						migrationSweepMigTokenDust(ctx, user, mint, tokProg, mintStr, prioSell)
+						migrationNoteMigRealized(ctx, user, mintStr, balBefore, creatorStr)
 						return
 					}
 					partialDone = true
@@ -3490,35 +3564,8 @@ func migrationLiveSwapLoop(ctx context.Context, mintStr string) {
 	log.Printf("[MIG][SWAP] SELL sent %s | tx=%s | out start/max/min=%.6f/%.6f/%.6f SOL",
 		short(mintStr), sigSell.String()[:12], float64(startOut)/1e9, float64(maxOut)/1e9, float64(minOut)/1e9)
 
-	// Realized wallet delta for migration cycle.
-	time.Sleep(3 * time.Second)
-	if balBefore > 0 {
-		rpcWait()
-		b2, err := rpcClient().GetBalance(ctx, user, rpc.CommitmentConfirmed)
-		rpcNote(err)
-		if err == nil && b2 != nil {
-			balAfter := b2.Value
-			delta := int64(balAfter) - int64(balBefore)
-			migRealTrades.Add(1)
-			migRealPnlLam.Add(delta)
-			if delta > 0 {
-				migRealWins.Add(1)
-			} else if delta < 0 {
-				migRealLosses.Add(1)
-				if creatorStr != "" {
-					migDevRugMu.Lock()
-					migDevRugN[creatorStr]++
-					migDevRugMu.Unlock()
-				}
-			}
-			pct := 0.0
-			if cfg.BuyLamp > 0 {
-				pct = 100 * float64(delta) / float64(cfg.BuyLamp)
-			}
-			log.Printf("[MIG][REAL] %s | delta=%+.6f SOL (%.1f%% of stake) | before=%.6f after=%.6f",
-				short(mintStr), float64(delta)/1e9, pct, float64(balBefore)/1e9, float64(balAfter)/1e9)
-		}
-	}
+	migrationSweepMigTokenDust(ctx, user, mint, tokProg, mintStr, prioSell)
+	migrationNoteMigRealized(ctx, user, mintStr, balBefore, creatorStr)
 }
 
 func dexTokenBestUSD(mintStr string) (priceUSD float64, liqUSD float64, dexID string, ok bool) {
